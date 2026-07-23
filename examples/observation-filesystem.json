@@ -1,0 +1,26 @@
+{
+  "observation_version": 1,
+  "observed_at": "2026-07-24T20:15:30Z",
+  "target_id": "local:filesystem:2026.7.10",
+  "source_type": "controlled_corpus",
+  "sensor": {
+    "name": "mcp-native-guard",
+    "version": "0.1.0"
+  },
+  "configuration_profile": "default-no-network",
+  "inventory": {
+    "inventory_version": 1,
+    "server": {
+      "downstream_executable": "npx"
+    },
+    "tools": [
+      {
+        "name": "read_file",
+        "description": "Read a file",
+        "inputSchema": {
+          "type": "object"
+        }
+      }
+    ]
+  }
+}
