@@ -1,4 +1,5 @@
 #include "observatory/inventory.hpp"
+#include "observatory/observation.hpp"
 #include "observatory/target_manifest.hpp"
 
 #include <fstream>
@@ -12,7 +13,9 @@ void print_usage(std::ostream& out) {
         << "  mcp-observatory about\n"
         << "  mcp-observatory validate-targets PATH\n"
         << "  mcp-observatory summarize-targets PATH\n"
-        << "  mcp-observatory compare-inventories BEFORE AFTER\n";
+        << "  mcp-observatory compare-inventories BEFORE AFTER\n"
+        << "  mcp-observatory validate-observation PATH\n"
+        << "  mcp-observatory ingest-observation PATH HISTORY_JSONL\n";
 }
 
 int run_manifest_command(std::string_view command, const char* path) {
@@ -74,16 +77,57 @@ int run_compare(const char* before_path, const char* after_path) {
               << "removed=" << diff.removed.size() << '\n'
               << "modified=" << diff.modified.size() << '\n';
 
-    for (const auto& name : diff.added) {
-        std::cout << "+ " << name << '\n';
-    }
-    for (const auto& name : diff.removed) {
-        std::cout << "- " << name << '\n';
-    }
-    for (const auto& tool : diff.modified) {
-        std::cout << "~ " << tool.name << '\n';
-    }
+    for (const auto& name : diff.added) std::cout << "+ " << name << '\n';
+    for (const auto& name : diff.removed) std::cout << "- " << name << '\n';
+    for (const auto& tool : diff.modified) std::cout << "~ " << tool.name << '\n';
     return 4;
+}
+
+mcpo::ObservationResult load_observation(const char* path) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        mcpo::ObservationResult result;
+        result.error = mcpo::ObservationError{std::string("cannot open observation: ") + path};
+        return result;
+    }
+    return mcpo::read_observation(input);
+}
+
+int run_validate_observation(const char* path) {
+    const mcpo::ObservationResult result = load_observation(path);
+    if (!result.ok()) {
+        std::cerr << "invalid observation: " << result.error->message << '\n';
+        return 3;
+    }
+    std::cout << "valid observation\n"
+              << "target_id=" << result.observation.target_id << '\n'
+              << "observed_at=" << result.observation.observed_at << '\n'
+              << "tools=" << result.observation.inventory.tools.size() << '\n';
+    return 0;
+}
+
+int run_ingest_observation(const char* path, const char* history_path) {
+    const mcpo::ObservationResult result = load_observation(path);
+    if (!result.ok()) {
+        std::cerr << "invalid observation: " << result.error->message << '\n';
+        return 3;
+    }
+
+    std::ofstream output(history_path, std::ios::binary | std::ios::app);
+    if (!output) {
+        std::cerr << "cannot open history file: " << history_path << '\n';
+        return 2;
+    }
+    std::string error;
+    if (!mcpo::append_observation_jsonl(output, result.observation, error)) {
+        std::cerr << error << ": " << history_path << '\n';
+        return 2;
+    }
+    std::cout << "ingested observation\n"
+              << "target_id=" << result.observation.target_id << '\n'
+              << "observed_at=" << result.observation.observed_at << '\n'
+              << "history=" << history_path << '\n';
+    return 0;
 }
 
 }  // namespace
@@ -91,8 +135,8 @@ int run_compare(const char* before_path, const char* after_path) {
 int main(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "about") {
         std::cout
-            << "mcp-observatory 0.2.0\n"
-            << "bounded longitudinal MCP inventory comparison\n"
+            << "mcp-observatory 0.3.0\n"
+            << "bounded longitudinal MCP observation ingestion and comparison\n"
             << "network activity: disabled\n"
             << "external process execution: disabled\n";
         return 0;
@@ -100,14 +144,15 @@ int main(int argc, char** argv) {
 
     if (argc == 3) {
         const std::string_view command(argv[1]);
-        if (command == "validate-targets" || command == "summarize-targets") {
+        if (command == "validate-targets" || command == "summarize-targets")
             return run_manifest_command(command, argv[2]);
-        }
+        if (command == "validate-observation") return run_validate_observation(argv[2]);
     }
 
-    if (argc == 4 && std::string_view(argv[1]) == "compare-inventories") {
+    if (argc == 4 && std::string_view(argv[1]) == "compare-inventories")
         return run_compare(argv[2], argv[3]);
-    }
+    if (argc == 4 && std::string_view(argv[1]) == "ingest-observation")
+        return run_ingest_observation(argv[2], argv[3]);
 
     print_usage(std::cerr);
     return 1;
