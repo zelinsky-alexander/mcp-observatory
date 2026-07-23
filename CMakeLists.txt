@@ -1,9 +1,10 @@
 cmake_minimum_required(VERSION 3.24)
-project(mcp_observatory VERSION 0.1.0 LANGUAGES CXX)
+project(mcp_observatory VERSION 0.2.0 LANGUAGES CXX)
 
 option(MCPO_BUILD_TESTS "Build focused tests" ON)
 
 add_library(mcpo_core STATIC
+    src/inventory.cpp
     src/target_manifest.cpp
 )
 target_include_directories(mcpo_core PUBLIC include)
