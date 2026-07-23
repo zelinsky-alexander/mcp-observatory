@@ -2,7 +2,7 @@
 
 MCP Observatory is a longitudinal security research platform for collecting, validating, storing, and comparing security-relevant observations of Model Context Protocol servers over time.
 
-The project is a dependency-free C++20 single binary. It now accepts versioned observation documents that wrap deterministic `mcp-native-guard inspect` inventories with target identity, provenance, observation time, sensor version, and configuration profile.
+The project is a dependency-free C++20 single binary. It consumes versioned observation documents that wrap deterministic `mcp-native-guard inspect` inventories with target identity, provenance, observation time, sensor version, and configuration profile.
 
 > **Status:** early research prototype. It performs no network activity, package installation, authentication, third-party process execution, or MCP tool invocation.
 
@@ -39,9 +39,55 @@ ctest --preset dev-debug
 
 ./build/dev-debug/mcp-observatory ingest-observation \
   examples/observation-filesystem.json observations.jsonl
+
+./build/dev-debug/mcp-observatory history summarize examples/history.jsonl
+
+./build/dev-debug/mcp-observatory history latest \
+  examples/history.jsonl local:filesystem:2026.7.10
+
+./build/dev-debug/mcp-observatory history diff-latest \
+  examples/history.jsonl local:filesystem:2026.7.10
 ```
 
-`ingest-observation` validates the complete envelope and embedded inventory before appending one compact record to the JSONL history file. It does not partially append an invalid observation.
+## History analysis
+
+`history summarize` validates every JSONL record and reports the total number of observations, unique targets, and the earliest and latest timestamps.
+
+```text
+records=3
+targets=2
+earliest_observed_at=2026-07-24T20:15:30Z
+latest_observed_at=2026-07-25T20:15:30Z
+```
+
+`history latest` emits the complete compact observation with the greatest `observed_at` value for one target.
+
+`history diff-latest` selects the two most recent observations for one target even when history records are not stored chronologically. It then compares their embedded inventories and reports deterministic drift output:
+
+```text
+target_id=local:filesystem:2026.7.10
+before_observed_at=2026-07-24T20:15:30Z
+after_observed_at=2026-07-25T20:15:30Z
+verdict=material_drift
+executable_changed=false
+added=1
+removed=1
+modified=1
++ execute_command
+- search
+~ read_file
+```
+
+History analysis is bounded by maximum line size, record count, unique target count, observation size, nesting depth, inventory size, and tool limits. A malformed line invalidates the history instead of being skipped silently.
+
+Exit codes for target history commands:
+
+- `0`: success or the latest two inventories are identical
+- `1`: invalid command-line use
+- `2`: output or file-opening failure
+- `3`: invalid history
+- `4`: material drift detected by `diff-latest`
+- `5`: target not found or fewer than two observations exist
 
 ## Observation version 1
 
@@ -66,29 +112,9 @@ ctest --preset dev-debug
 
 Required identity fields reject escapes and control characters in version 1. `observed_at` must use the fixed UTC form `YYYY-MM-DDTHH:MM:SSZ`. The parser enforces bounded document size, identity length, nesting depth, inventory size, tool count, and tool-name size. Duplicate security-relevant fields and invalid embedded inventories fail closed.
 
-The history store is deliberately an append-only JSONL file in this milestone. It is suitable for a local prototype and preserves a simple inspection boundary. It does not yet provide locking between concurrent writers, duplicate suppression, indexing, transactional recovery, retention, or database migration.
+The history store remains an append-only JSONL file intended for one local writer. It does not yet provide locking between concurrent writers, duplicate suppression, indexing, transactional recovery, retention, or database migration.
 
 ## Inventory drift comparison
-
-A changed inventory produces deterministic output such as:
-
-```text
-verdict=material_drift
-executable_changed=false
-added=1
-removed=1
-modified=1
-+ execute_command
-- search
-~ read_file
-```
-
-Exit codes for `compare-inventories`:
-
-- `0`: inventories are identical
-- `1`: invalid command-line use
-- `3`: an input inventory is invalid or cannot be opened
-- `4`: material drift was detected
 
 The inventory reader accepts deterministic version-1 output from `mcp-native-guard inspect`. Tools must be sorted and unique. Each complete canonical tool object is compared byte-for-byte, so this milestone relies on the producer to canonicalize equivalent JSON definitions.
 
