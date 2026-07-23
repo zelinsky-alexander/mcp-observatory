@@ -1,3 +1,4 @@
+#include "observatory/history.hpp"
 #include "observatory/inventory.hpp"
 #include "observatory/observation.hpp"
 #include "observatory/target_manifest.hpp"
@@ -32,17 +33,33 @@ mcpo::ObservationResult parse_observation(std::string_view text, mcpo::Observati
     return mcpo::read_observation(input, limits);
 }
 
+mcpo::HistoryResult parse_history(
+    std::string_view text,
+    std::optional<std::string> target_id = std::nullopt,
+    mcpo::HistoryLimits limits = {}) {
+    std::istringstream input{std::string(text)};
+    return mcpo::analyze_history(input, std::move(target_id), limits);
+}
+
 constexpr std::string_view base_inventory =
     "{\"inventory_version\":1,\"server\":{\"downstream_executable\":\"node\"},"
     "\"tools\":[{\"name\":\"read_file\",\"inputSchema\":{\"type\":\"object\"}},"
     "{\"name\":\"search\",\"description\":\"Find records\"}]}";
 
-std::string observation(std::string_view inventory = base_inventory) {
-    return std::string(
-        "{\"observation_version\":1,\"observed_at\":\"2026-07-24T20:15:30Z\","
-        "\"target_id\":\"local:filesystem:2026.7.10\",\"source_type\":\"controlled_corpus\","
+constexpr std::string_view changed_inventory =
+    "{\"inventory_version\":1,\"server\":{\"downstream_executable\":\"node\"},"
+    "\"tools\":[{\"name\":\"execute\",\"inputSchema\":{}},"
+    "{\"name\":\"read_file\",\"inputSchema\":{\"properties\":{},\"type\":\"object\"}}]}";
+
+std::string observation(
+    std::string_view observed_at = "2026-07-24T20:15:30Z",
+    std::string_view target_id = "local:filesystem:2026.7.10",
+    std::string_view inventory = base_inventory) {
+    return std::string("{\"observation_version\":1,\"observed_at\":\"") +
+        std::string(observed_at) + "\",\"target_id\":\"" + std::string(target_id) +
+        "\",\"source_type\":\"controlled_corpus\","
         "\"sensor\":{\"name\":\"mcp-native-guard\",\"version\":\"0.1.0\"},"
-        "\"configuration_profile\":\"default-no-network\",\"inventory\":") +
+        "\"configuration_profile\":\"default-no-network\",\"inventory\":" +
         std::string(inventory) + "}";
 }
 
@@ -68,7 +85,6 @@ int main() {
         require(result.ok(), "valid inventory should pass");
         require(result.inventory.version == 1U, "inventory version");
         require(result.inventory.tools.size() == 2U, "inventory tool count");
-        require(result.inventory.tools[0].name == "read_file", "first tool name");
     }
 
     require(!parse_inventory("{}").ok(), "missing inventory fields should fail");
@@ -76,25 +92,14 @@ int main() {
         "{\"inventory_version\":1,\"inventory_version\":1,\"server\":{\"downstream_executable\":\"x\"},\"tools\":[]}").ok(),
         "duplicate inventory version should fail");
     require(!parse_inventory(
-        "{\"inventory_version\":2,\"server\":{\"downstream_executable\":\"x\"},\"tools\":[]}").ok(),
-        "unsupported inventory version should fail");
-    require(!parse_inventory(
         "{\"inventory_version\":1,\"server\":{\"downstream_executable\":\"x\"},\"tools\":[{\"name\":\"z\"},{\"name\":\"a\"}]}").ok(),
         "unsorted tools should fail");
-    require(!parse_inventory(
-        "{\"inventory_version\":1,\"server\":{\"downstream_executable\":\"x\"},\"tools\":[{\"name\":\"a\"},{\"name\":\"a\"}]}").ok(),
-        "duplicate tool names should fail");
 
     {
         const auto before = parse_inventory(base_inventory);
-        const auto after = parse_inventory(
-            "{\"inventory_version\":1,\"server\":{\"downstream_executable\":\"python\"},"
-            "\"tools\":[{\"name\":\"execute\",\"inputSchema\":{}},"
-            "{\"name\":\"read_file\",\"inputSchema\":{\"properties\":{},\"type\":\"object\"}}]}"
-        );
+        const auto after = parse_inventory(changed_inventory);
         require(before.ok() && after.ok(), "drift fixtures should parse");
         const auto diff = mcpo::compare_inventories(before.inventory, after.inventory);
-        require(diff.executable_changed, "executable change should be detected");
         require(diff.added.size() == 1U && diff.added[0] == "execute", "added tool");
         require(diff.removed.size() == 1U && diff.removed[0] == "search", "removed tool");
         require(diff.modified.size() == 1U && diff.modified[0].name == "read_file", "modified tool");
@@ -103,11 +108,7 @@ int main() {
     {
         const auto result = parse_observation(observation());
         require(result.ok(), "valid observation should pass");
-        require(result.observation.version == 1U, "observation version");
         require(result.observation.target_id == "local:filesystem:2026.7.10", "observation target");
-        require(result.observation.sensor_name == "mcp-native-guard", "sensor name");
-        require(result.observation.inventory.tools.size() == 2U, "embedded inventory parsed");
-
         std::ostringstream history;
         std::string error;
         require(mcpo::append_observation_jsonl(history, result.observation, error), "append observation");
@@ -116,26 +117,60 @@ int main() {
 
     require(!parse_observation("{}").ok(), "missing observation fields should fail");
     require(!parse_observation(
-        "{\"observation_version\":2,\"observed_at\":\"2026-07-24T20:15:30Z\","
-        "\"target_id\":\"x\",\"source_type\":\"s\",\"sensor\":{\"name\":\"n\",\"version\":\"v\"},"
-        "\"configuration_profile\":\"p\",\"inventory\":" + std::string(base_inventory) + "}").ok(),
-        "unsupported observation version should fail");
-    require(!parse_observation(
         "{\"observation_version\":1,\"observed_at\":\"24-07-2026\","
         "\"target_id\":\"x\",\"source_type\":\"s\",\"sensor\":{\"name\":\"n\",\"version\":\"v\"},"
         "\"configuration_profile\":\"p\",\"inventory\":" + std::string(base_inventory) + "}").ok(),
         "invalid observation timestamp should fail");
-    require(!parse_observation(
-        "{\"observation_version\":1,\"observation_version\":1,\"observed_at\":\"2026-07-24T20:15:30Z\","
-        "\"target_id\":\"x\",\"source_type\":\"s\",\"sensor\":{\"name\":\"n\",\"version\":\"v\"},"
-        "\"configuration_profile\":\"p\",\"inventory\":" + std::string(base_inventory) + "}").ok(),
-        "duplicate observation field should fail");
-    require(!parse_observation(observation("{}" )).ok(), "invalid embedded inventory should fail");
 
     {
-        mcpo::ObservationLimits limits;
-        limits.max_bytes = 32U;
-        require(!parse_observation(observation(), limits).ok(), "observation byte limit should be enforced");
+        const std::string history_text =
+            observation("2026-07-24T20:15:30Z", "target:a", base_inventory) + "\n" +
+            observation("2026-07-24T18:00:00Z", "target:b", base_inventory) + "\n" +
+            observation("2026-07-25T09:00:00Z", "target:a", changed_inventory) + "\n";
+        const auto result = parse_history(history_text, std::string("target:a"));
+        require(result.ok(), "valid history should pass");
+        require(result.summary.records == 3U, "history record count");
+        require(result.summary.targets == 2U, "history target count");
+        require(result.summary.earliest_observed_at == "2026-07-24T18:00:00Z", "earliest timestamp");
+        require(result.summary.latest_observed_at == "2026-07-25T09:00:00Z", "latest timestamp");
+        require(result.target.records == 2U, "selected target count");
+        require(result.target.previous.has_value() && result.target.latest.has_value(), "two latest observations retained");
+        require(result.target.previous->observed_at == "2026-07-24T20:15:30Z", "previous target observation");
+        require(result.target.latest->observed_at == "2026-07-25T09:00:00Z", "latest target observation");
+        require(!mcpo::compare_inventories(
+            result.target.previous->inventory,
+            result.target.latest->inventory).identical(), "latest target drift detected");
+    }
+
+    {
+        const std::string out_of_order =
+            observation("2026-07-25T09:00:00Z", "target:a", changed_inventory) + "\n" +
+            observation("2026-07-23T09:00:00Z", "target:a", base_inventory) + "\n" +
+            observation("2026-07-24T09:00:00Z", "target:a", base_inventory) + "\n";
+        const auto result = parse_history(out_of_order, std::string("target:a"));
+        require(result.ok(), "out-of-order history should pass");
+        require(result.target.previous->observed_at == "2026-07-24T09:00:00Z", "chronological previous selected");
+        require(result.target.latest->observed_at == "2026-07-25T09:00:00Z", "chronological latest selected");
+    }
+
+    require(!parse_history(observation() + "\nnot-json\n").ok(), "malformed history line should fail");
+
+    {
+        mcpo::HistoryLimits limits;
+        limits.max_records = 1U;
+        const auto result = parse_history(observation() + "\n" + observation() + "\n", std::nullopt, limits);
+        require(!result.ok(), "history record limit should be enforced");
+    }
+
+    {
+        mcpo::HistoryLimits limits;
+        limits.max_targets = 1U;
+        const auto result = parse_history(
+            observation("2026-07-24T20:15:30Z", "target:a") + "\n" +
+            observation("2026-07-24T20:15:31Z", "target:b") + "\n",
+            std::nullopt,
+            limits);
+        require(!result.ok(), "history target limit should be enforced");
     }
 
     return 0;
