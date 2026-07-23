@@ -1,0 +1,2 @@
+{"schema_version":1,"target_id":"example:local-filesystem:2026.7.10","source_type":"manual_research","kind":"local_package","review_status":"approved","package":{"registry":"npm","identifier":"@modelcontextprotocol/server-filesystem","version":"2026.7.10"}}
+{"schema_version":1,"target_id":"example:remote-documentation","source_type":"vendor_documentation","kind":"remote_endpoint","review_status":"unreviewed","remote":{"transport":"streamable_http","url":"https://example.invalid/mcp"}}
