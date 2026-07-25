@@ -1,15 +1,19 @@
 #include "observatory/history.hpp"
 #include "observatory/inventory.hpp"
 #include "observatory/observation.hpp"
+#include "observatory/registry.hpp"
 #include "observatory/target_manifest.hpp"
 
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <unistd.h>
 
 namespace {
 
@@ -63,6 +67,49 @@ std::string observation(
         "\"sensor\":{\"name\":\"mcp-native-guard\",\"version\":\"0.1.0\"},"
         "\"configuration_profile\":\"default-no-network\",\"inventory\":" +
         std::string(inventory) + "}";
+}
+
+std::string registry_entry(
+    std::string_view name,
+    std::string_view version,
+    std::string_view extra = "") {
+    return std::string("{\"server\":{\"name\":\"") + std::string(name) +
+        "\",\"version\":\"" + std::string(version) +
+        "\",\"description\":\"fixture\"" + std::string(extra) +
+        "},\"_meta\":{\"io.modelcontextprotocol.registry/official\":{"
+        "\"publishedAt\":\"2026-07-25T10:00:00Z\"}}}";
+}
+
+std::string registry_page(
+    std::string records,
+    std::optional<std::string_view> cursor = std::nullopt) {
+    std::string result = "{\"metadata\":{\"nextCursor\":";
+    if (cursor) result += "\"" + std::string(*cursor) + "\"";
+    else result += "null";
+    return result + "},\"servers\":[" + records + "]}";
+}
+
+mcpo::HttpTransport fixture_transport(std::vector<std::string> pages) {
+    return [pages = std::move(pages), index = std::size_t{}](
+               const std::string& url,
+               unsigned,
+               std::size_t maximum,
+               mcpo::HttpResponse& response,
+               std::string& error) mutable {
+        if (index >= pages.size()) {
+            error = "unexpected fixture request";
+            return false;
+        }
+        response.status = 200U;
+        response.content_type = "application/json";
+        response.body = pages[index++];
+        if (response.body.size() > maximum) {
+            error = "fixture page too large";
+            return false;
+        }
+        response.effective_url = url;
+        return true;
+    };
 }
 
 }  // namespace
@@ -173,6 +220,258 @@ int main() {
             std::nullopt,
             limits);
         require(!result.ok(), "history target limit should be enforced");
+    }
+
+    {
+        mcpo::RegistryUrl url;
+        std::string error;
+        require(mcpo::parse_registry_url("https://EXAMPLE.com:443/base/", url, error),
+                "HTTPS registry URL should parse");
+        require(url.normalized == "https://example.com/base", "registry URL normalized");
+        require(mcpo::registry_api_url(url, std::string_view("a b")) ==
+                    "https://example.com/base/v0.1/servers?cursor=a%20b",
+                "base path and encoded cursor preserved");
+        require(mcpo::parse_registry_url("http://localhost:8080", url, error),
+                "localhost HTTP accepted");
+        require(mcpo::parse_registry_url("http://127.0.0.1:8080", url, error),
+                "IPv4 loopback HTTP accepted");
+        require(mcpo::parse_registry_url("http://[::1]:8080", url, error),
+                "IPv6 loopback HTTP accepted");
+        require(!mcpo::parse_registry_url("http://example.com", url, error),
+                "non-local HTTP rejected");
+        require(!mcpo::parse_registry_url("https://user:pass@example.com", url, error),
+                "embedded credentials rejected");
+        require(!mcpo::parse_registry_url("https://example.com/#x", url, error),
+                "URL fragment rejected");
+        require(!mcpo::parse_registry_url("https://example.com:70000", url, error),
+                "invalid URL port rejected");
+        require(!mcpo::parse_registry_url("ftp://example.com", url, error),
+                "unsupported URL scheme rejected");
+    }
+
+    require(mcpo::valid_utc_timestamp("2026-07-25T10:00:00Z"), "UTC timestamp accepted");
+    require(!mcpo::valid_utc_timestamp("2026-13-25T10:00:00Z"), "invalid month rejected");
+    require(mcpo::official_registry_base_url ==
+                "https://registry.modelcontextprotocol.io",
+            "compiled registry default");
+
+    {
+        const std::filesystem::path parent =
+            std::filesystem::temp_directory_path() /
+            ("mcpo-registry-tests-" + std::to_string(static_cast<long>(getpid())));
+        std::error_code ec;
+        std::filesystem::remove_all(parent, ec);
+        std::filesystem::create_directory(parent);
+
+        mcpo::RegistryCollectOptions options;
+        options.output = parent / "one";
+        options.registry_base_url = "http://127.0.0.1:8080/base";
+        std::string message;
+        require(mcpo::collect_registry(
+                    options, message,
+                    fixture_transport({registry_page(registry_entry("z/server", "1.0.0") + "," +
+                        registry_entry("a/server", "2.0.0", ",\"unknown\":{\"kept\":true}"))})),
+                "one-page collection should succeed");
+        require(std::filesystem::is_regular_file(options.output / "_SUCCESS"),
+                "successful collection marker exists");
+        require(mcpo::validate_bundle(options.output, message), "created bundle validates");
+        std::ifstream canonical(options.output / "canonical/servers.jsonl");
+        std::string first;
+        std::getline(canonical, first);
+        require(first.find("\"server_identifier\":\"a/server\"") != std::string::npos,
+                "canonical records sorted");
+        require(first.find("\"unknown\":{\"kept\":true}") != std::string::npos,
+                "unknown fields preserved");
+
+        options.output = parent / "multi";
+        require(mcpo::collect_registry(
+                    options, message,
+                    fixture_transport({
+                        registry_page(registry_entry("a/server", "1"), "next"),
+                        registry_page(registry_entry("b/server", "1"))})),
+                "multi-page collection should succeed");
+
+        options.output = parent / "empty";
+        require(mcpo::collect_registry(
+                    options, message, fixture_transport({registry_page("")})),
+                "empty registry should succeed");
+
+        options.output = parent / "limits-boundary";
+        const std::string boundary_page = registry_page(registry_entry("boundary/server", "1"));
+        options.limits.maximum_pages = 1U;
+        options.limits.maximum_page_bytes = boundary_page.size();
+        options.limits.maximum_records = 1U;
+        options.limits.maximum_redirects = 0U;
+        options.limits.request_timeout_seconds = 1U;
+        options.limits.run_timeout_seconds = 1U;
+        require(mcpo::collect_registry(
+                    options, message, fixture_transport({boundary_page})),
+                "inclusive configured limit boundaries should succeed");
+        options.limits = {};
+
+        options.output = parent / "identical-duplicate";
+        const std::string duplicate = registry_entry("same/server", "1");
+        require(mcpo::collect_registry(
+                    options, message,
+                    fixture_transport({registry_page(duplicate + "," + duplicate)})),
+                "byte-equivalent duplicate should collapse");
+
+        options.output = parent / "conflicting-duplicate";
+        require(!mcpo::collect_registry(
+                    options, message,
+                    fixture_transport({registry_page(
+                        registry_entry("same/server", "1") + "," +
+                        registry_entry("same/server", "1", ",\"title\":\"different\""))})),
+                "conflicting duplicate should fail");
+        require(!std::filesystem::exists(options.output / "_SUCCESS"),
+                "failed destination has no success marker");
+
+        options.output = parent / "malformed";
+        require(!mcpo::collect_registry(options, message, fixture_transport({"{bad"})),
+                "malformed JSON should fail");
+
+        options.output = parent / "excessive-depth";
+        std::string deep = "{\"servers\":[{\"server\":{\"name\":\"deep/server\","
+            "\"version\":\"1\",\"unknown\":";
+        deep.append(66U, '[');
+        deep += "null";
+        deep.append(66U, ']');
+        deep += "}}]}";
+        require(!mcpo::collect_registry(options, message, fixture_transport({deep})),
+                "excessive JSON nesting should fail");
+
+        options.output = parent / "cursor-loop";
+        require(!mcpo::collect_registry(
+                    options, message,
+                    fixture_transport({registry_page("", "again"), registry_page("", "again")})),
+                "repeated cursor should fail");
+
+        options.output = parent / "page-limit";
+        options.limits.maximum_pages = 1U;
+        require(!mcpo::collect_registry(
+                    options, message,
+                    fixture_transport({registry_page("", "next")})),
+                "page limit enforced");
+        options.limits.maximum_pages = 1'000U;
+
+        options.output = parent / "record-limit";
+        options.limits.maximum_records = 1U;
+        require(!mcpo::collect_registry(
+                    options, message,
+                    fixture_transport({registry_page(
+                        registry_entry("a/server", "1") + "," +
+                        registry_entry("b/server", "1"))})),
+                "record limit enforced");
+        options.limits.maximum_records = 100'000U;
+
+        options.output = parent / "existing";
+        std::filesystem::create_directory(options.output);
+        require(!mcpo::collect_registry(
+                    options, message, fixture_transport({registry_page("")})),
+                "existing destination rejected");
+
+        std::ofstream tamper(parent / "one/canonical/servers.jsonl", std::ios::app);
+        tamper << "{}\n";
+        tamper.close();
+        require(!mcpo::validate_bundle(parent / "one", message),
+                "modified artifact is detected");
+
+        const auto make_legacy = [&](std::string_view name) {
+            const auto path = parent / std::string(name);
+            std::filesystem::create_directories(path / "raw");
+            return path;
+        };
+        const auto write_legacy_page = [](
+                                           const std::filesystem::path& path,
+                                           std::string_view body) {
+            std::ofstream output(path, std::ios::binary);
+            output << body;
+            output.close();
+        };
+
+        const auto legacy = make_legacy("legacy-valid");
+        write_legacy_page(
+            legacy / "raw/page-000001.json",
+            registry_page(registry_entry("legacy/one", "1"), "cursor-two"));
+        write_legacy_page(
+            legacy / "raw/page-000002.json",
+            "{\"metadata\":{\"cursor\":\"cursor-two\","
+            "\"nextCursor\":\"cursor-three\"},\"servers\":[" +
+                registry_entry("legacy/two", "1") + "]}");
+        require(mcpo::reconstruct_registry_checkpoint(
+                    legacy, "http://127.0.0.1:8080/base", {}, message),
+                "multi-page legacy checkpoint should reconstruct");
+        require(std::filesystem::is_regular_file(legacy / "checkpoint.json"),
+                "legacy checkpoint created");
+        require(std::filesystem::is_regular_file(legacy / "raw/pages.jsonl"),
+                "legacy page metadata rebuilt");
+        require(!std::filesystem::exists(legacy / "_SUCCESS"),
+                "checkpoint reconstruction must not create _SUCCESS");
+
+        options = {};
+        options.output = parent / "legacy-resumed";
+        options.resume = legacy;
+        options.registry_base_url = "http://127.0.0.1:8080/base";
+        bool saw_resume_cursor = false;
+        mcpo::HttpTransport resume_transport =
+            [&](const std::string& url, unsigned, std::size_t,
+                mcpo::HttpResponse& response, std::string&) {
+                saw_resume_cursor =
+                    url.find("cursor=cursor-three") != std::string::npos;
+                response.status = 200U;
+                response.content_type = "application/json";
+                response.body = registry_page(registry_entry("legacy/three", "1"));
+                response.effective_url = url;
+                return true;
+            };
+        require(mcpo::collect_registry(
+                    options, message, std::move(resume_transport)),
+                "collection should resume from reconstructed cursor");
+        require(saw_resume_cursor, "resume request used derived next cursor");
+        require(mcpo::validate_bundle(options.output, message),
+                "resumed legacy bundle validates");
+
+        const auto gap = make_legacy("legacy-gap");
+        write_legacy_page(
+            gap / "raw/page-000001.json",
+            registry_page("", "cursor-two"));
+        write_legacy_page(
+            gap / "raw/page-000003.json",
+            registry_page(""));
+        require(!mcpo::reconstruct_registry_checkpoint(
+                    gap, "http://127.0.0.1:8080", {}, message),
+                "legacy page-number gap rejected");
+
+        const auto malformed = make_legacy("legacy-malformed");
+        write_legacy_page(malformed / "raw/page-000001.json", "{bad");
+        require(!mcpo::reconstruct_registry_checkpoint(
+                    malformed, "http://127.0.0.1:8080", {}, message),
+                "malformed legacy page rejected");
+
+        const auto duplicate_number = make_legacy("legacy-duplicate");
+        write_legacy_page(
+            duplicate_number / "raw/page-1.json",
+            registry_page(""));
+        write_legacy_page(
+            duplicate_number / "raw/page-000001.json",
+            registry_page(""));
+        require(!mcpo::reconstruct_registry_checkpoint(
+                    duplicate_number, "http://127.0.0.1:8080", {}, message),
+                "duplicate legacy page number rejected");
+
+        const auto broken_cursor = make_legacy("legacy-broken-cursor");
+        write_legacy_page(
+            broken_cursor / "raw/page-000001.json",
+            registry_page("", "cursor-two"));
+        write_legacy_page(
+            broken_cursor / "raw/page-000002.json",
+            "{\"metadata\":{\"cursor\":\"wrong-cursor\",\"nextCursor\":null},"
+            "\"servers\":[]}");
+        require(!mcpo::reconstruct_registry_checkpoint(
+                    broken_cursor, "http://127.0.0.1:8080", {}, message),
+                "broken legacy cursor continuity rejected");
+
+        std::filesystem::remove_all(parent, ec);
     }
 
     return 0;

@@ -6,3 +6,8 @@ compile_commands.json
 *.swp
 *.tmp
 *.log
+*/raw/page-*.json
+*.jsonl
+checkpoint.json
+examples/systemd/mcp-observatory-registry.service
+examples/systemd/mcp-observatory-registry.timer

@@ -2,9 +2,9 @@
 
 MCP Observatory is a longitudinal security research platform for collecting, validating, storing, and comparing security-relevant observations of Model Context Protocol servers over time.
 
-The project is a dependency-free C++20 single binary. It consumes versioned observation documents that wrap deterministic `mcp-native-guard inspect` inventories with target identity, provenance, observation time, sensor version, and configuration profile.
+The project is a dependency-minimal C++20 single binary. It consumes versioned observation documents and can produce a bounded, deterministic filesystem bundle of public Official MCP Registry metadata.
 
-> **Status:** early research prototype. It performs no network activity, package installation, authentication, third-party process execution, or MCP tool invocation.
+> **Status:** early research prototype. Network activity is limited to the explicit registry collector. It performs no package installation, authentication, MCP server execution, or MCP tool invocation.
 
 ## Why it exists
 
@@ -17,6 +17,8 @@ Requirements:
 - CMake 3.24 or newer
 - Ninja
 - A C++20 compiler such as Clang 17+ or GCC 13+
+- `/usr/bin/curl` and `/usr/bin/openssl` for registry collection and hashing
+- Python 3 for the offline loopback HTTP tests
 
 ```bash
 cmake --preset dev-debug
@@ -47,7 +49,95 @@ ctest --preset dev-debug
 
 ./build/dev-debug/mcp-observatory history diff-latest \
   examples/history.jsonl local:filesystem:2026.7.10
+
+./build/dev-debug/mcp-observatory registry collect \
+  --output ./official-run
+
+./build/dev-debug/mcp-observatory bundle validate ./official-run
 ```
+
+## Portable registry collection
+
+Production collection uses the compiled Official MCP Registry default:
+
+```bash
+./build/dev-debug/mcp-observatory registry collect \
+  --output ./official-run
+```
+
+For a local fixture or compatible registry, including one mounted into a
+Docker or Lambda container:
+
+```bash
+./build/dev-debug/mcp-observatory registry collect \
+  --registry-base-url http://127.0.0.1:8080 \
+  --output ./test-run \
+  --maximum-pages 100 \
+  --maximum-page-bytes 8388608 \
+  --maximum-records 10000 \
+  --request-timeout-seconds 30 \
+  --run-timeout-seconds 600
+```
+
+`--registry-base-url` overrides `MCPO_REGISTRY_BASE_URL`, which overrides
+`https://registry.modelcontextprotocol.io`. `--maximum-redirects` is also
+supported. Raw pages are mandatory evidence in bundle version 1;
+`--retain-raw` is accepted explicitly for forward-compatible scripts.
+
+### Legacy partial checkpoints and resume
+
+A legacy interrupted directory containing only `raw/page-*.json` can be
+reconstructed without contacting the Registry:
+
+```bash
+./build/dev-debug/mcp-observatory registry checkpoint reconstruct \
+  ./legacy-partial \
+  --registry-base-url http://127.0.0.1:8080
+```
+
+This verifies strict contiguous numbering, response shape, cursor chaining,
+configured limits, page size, and SHA-256; then atomically creates
+`checkpoint.json` and rebuilds `raw/pages.jsonl`. It never creates `_SUCCESS`.
+
+Continue into a new immutable output bundle with:
+
+```bash
+./build/dev-debug/mcp-observatory registry collect \
+  --registry-base-url http://127.0.0.1:8080 \
+  --resume ./legacy-partial \
+  --output ./completed-run
+```
+
+The resume directory remains partial evidence and is not promoted or
+overwritten. When the final reconstructed page has no next cursor, resume
+performs no HTTP request and finalizes the new bundle from the validated raw
+pages.
+
+The same build commands work in Ubuntu and WSL. In Docker, CI, or an AWS Lambda
+Linux container, install the build toolchain for compilation and ensure the
+runtime image provides curl and OpenSSL at `/usr/bin`. Mount or select a
+writable parent for `--output`; the destination itself must not exist.
+
+Offline tests use only a loopback fixture server:
+
+```bash
+ctest --preset dev-debug
+```
+
+The live Registry check is opt-in, disabled from CTest, and requires network
+access and a new destination:
+
+```bash
+tests/live_registry.sh \
+  ./build/dev-debug/mcp-observatory \
+  /tmp/mcpo-live-registry
+```
+
+Example systemd user unit files are in [`examples/systemd`](examples/systemd).
+They are examples only and are never installed or enabled automatically.
+Because bundle destinations are immutable, production scheduling should use a
+fresh output path per run; safe path allocation belongs to the future
+publisher/retention milestone.
 
 ## History analysis
 
@@ -127,6 +217,8 @@ Reviewed version-1 JSONL target manifests describe future collection candidates 
 `mcp-native-guard` remains the bounded local MCP sensor and enforcement boundary. MCP Observatory consumes versioned observations and performs historical comparison. No shared library or shared object is introduced yet; stable file formats are the integration boundary.
 
 See [`docs/research-boundaries.md`](docs/research-boundaries.md) for the safety posture.
+See [`docs/registry-bundle-v1.md`](docs/registry-bundle-v1.md) for the bundle,
+identity, hashing, URL, redirect, privacy, provenance, and validation rules.
 
 ## Licensing
 

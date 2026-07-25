@@ -1,8 +1,11 @@
 #include "observatory/history.hpp"
 #include "observatory/inventory.hpp"
 #include "observatory/observation.hpp"
+#include "observatory/registry.hpp"
 #include "observatory/target_manifest.hpp"
 
+#include <charconv>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <optional>
@@ -21,7 +24,130 @@ void print_usage(std::ostream& out) {
         << "  mcp-observatory ingest-observation PATH HISTORY_JSONL\n"
         << "  mcp-observatory history summarize HISTORY_JSONL\n"
         << "  mcp-observatory history latest HISTORY_JSONL TARGET_ID\n"
-        << "  mcp-observatory history diff-latest HISTORY_JSONL TARGET_ID\n";
+        << "  mcp-observatory history diff-latest HISTORY_JSONL TARGET_ID\n"
+        << "  mcp-observatory registry collect --output DIRECTORY [OPTIONS]\n"
+        << "  mcp-observatory registry checkpoint reconstruct PARTIAL_DIRECTORY [OPTIONS]\n"
+        << "  mcp-observatory bundle validate DIRECTORY\n";
+}
+
+bool parse_size(std::string_view text, std::size_t& value) {
+    if (text.empty() || text.front() == '-') return false;
+    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
+    return parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size();
+}
+
+bool parse_unsigned(std::string_view text, unsigned& value) {
+    if (text.empty() || text.front() == '-') return false;
+    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
+    return parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size();
+}
+
+int run_registry_collect(int argc, char** argv) {
+    mcpo::RegistryCollectOptions options;
+    if (const char* environment = std::getenv("MCPO_REGISTRY_BASE_URL");
+        environment != nullptr && *environment != '\0') {
+        options.registry_base_url = environment;
+    }
+    bool have_output = false;
+    for (int index = 3; index < argc; ++index) {
+        const std::string_view argument(argv[index]);
+        if (argument == "--retain-raw") {
+            options.retain_raw = true;
+            continue;
+        }
+        if (argument == "--verbose") {
+            options.verbose = true;
+            continue;
+        }
+        if (index + 1 >= argc) {
+            std::cerr << "missing value for " << argument << '\n';
+            return 1;
+        }
+        const std::string_view value(argv[++index]);
+        if (argument == "--output") {
+            options.output = std::string(value);
+            have_output = true;
+        } else if (argument == "--resume") {
+            options.resume = std::filesystem::path(std::string(value));
+        } else if (argument == "--registry-base-url") {
+            options.registry_base_url = value;
+        } else if (argument == "--maximum-pages") {
+            if (!parse_size(value, options.limits.maximum_pages)) return 1;
+        } else if (argument == "--maximum-page-bytes") {
+            if (!parse_size(value, options.limits.maximum_page_bytes)) return 1;
+        } else if (argument == "--maximum-records") {
+            if (!parse_size(value, options.limits.maximum_records)) return 1;
+        } else if (argument == "--maximum-redirects") {
+            if (!parse_size(value, options.limits.maximum_redirects)) return 1;
+        } else if (argument == "--request-timeout-seconds") {
+            if (!parse_unsigned(value, options.limits.request_timeout_seconds)) return 1;
+        } else if (argument == "--run-timeout-seconds") {
+            if (!parse_unsigned(value, options.limits.run_timeout_seconds)) return 1;
+        } else {
+            std::cerr << "unknown registry collect option: " << argument << '\n';
+            return 1;
+        }
+    }
+    if (!have_output) {
+        std::cerr << "registry collect requires --output\n";
+        return 1;
+    }
+    std::string message;
+    if (!mcpo::collect_registry(options, message)) {
+        std::cerr << "registry collection failed: " << message << '\n';
+        return 3;
+    }
+    std::cout << message << '\n';
+    return 0;
+}
+
+int run_checkpoint_reconstruct(int argc, char** argv) {
+    if (argc < 5) return 1;
+    const std::filesystem::path partial(argv[4]);
+    std::string base_url = std::string(mcpo::official_registry_base_url);
+    if (const char* environment = std::getenv("MCPO_REGISTRY_BASE_URL");
+        environment != nullptr && *environment != '\0') {
+        base_url = environment;
+    }
+    mcpo::RegistryLimits limits;
+    for (int index = 5; index < argc; ++index) {
+        const std::string_view argument(argv[index]);
+        if (index + 1 >= argc) {
+            std::cerr << "missing value for " << argument << '\n';
+            return 1;
+        }
+        const std::string_view value(argv[++index]);
+        if (argument == "--registry-base-url") {
+            base_url = value;
+        } else if (argument == "--maximum-pages") {
+            if (!parse_size(value, limits.maximum_pages)) return 1;
+        } else if (argument == "--maximum-page-bytes") {
+            if (!parse_size(value, limits.maximum_page_bytes)) return 1;
+        } else if (argument == "--maximum-records") {
+            if (!parse_size(value, limits.maximum_records)) return 1;
+        } else {
+            std::cerr << "unknown checkpoint option: " << argument << '\n';
+            return 1;
+        }
+    }
+    std::string message;
+    if (!mcpo::reconstruct_registry_checkpoint(
+            partial, base_url, limits, message)) {
+        std::cerr << "checkpoint reconstruction failed: " << message << '\n';
+        return 3;
+    }
+    std::cout << message << '\n';
+    return 0;
+}
+
+int run_bundle_validate(const char* path) {
+    std::string message;
+    if (!mcpo::validate_bundle(path, message)) {
+        std::cerr << "bundle validation failed: " << message << '\n';
+        return 3;
+    }
+    std::cout << message << '\n';
+    return 0;
 }
 
 int run_manifest_command(std::string_view command, const char* path) {
@@ -209,12 +335,23 @@ int run_history_diff_latest(const char* path, const char* target_id) {
 int main(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "about") {
         std::cout
-            << "mcp-observatory 0.4.0\n"
+            << "mcp-observatory 0.5.0\n"
             << "bounded longitudinal MCP history analysis\n"
-            << "network activity: disabled\n"
-            << "external process execution: disabled\n";
+            << "network activity: registry collect only\n"
+            << "external process execution: explicit curl and OpenSSL only\n";
         return 0;
     }
+
+    if (argc >= 3 && std::string_view(argv[1]) == "registry" &&
+        std::string_view(argv[2]) == "collect")
+        return run_registry_collect(argc, argv);
+    if (argc >= 5 && std::string_view(argv[1]) == "registry" &&
+        std::string_view(argv[2]) == "checkpoint" &&
+        std::string_view(argv[3]) == "reconstruct")
+        return run_checkpoint_reconstruct(argc, argv);
+    if (argc == 4 && std::string_view(argv[1]) == "bundle" &&
+        std::string_view(argv[2]) == "validate")
+        return run_bundle_validate(argv[3]);
 
     if (argc == 3) {
         const std::string_view command(argv[1]);
