@@ -11,3 +11,4 @@ compile_commands.json
 checkpoint.json
 examples/systemd/mcp-observatory-registry.service
 examples/systemd/mcp-observatory-registry.timer
+mcp-registry-partial-*
