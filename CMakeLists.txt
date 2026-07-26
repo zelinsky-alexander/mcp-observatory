@@ -31,7 +31,13 @@ target_compile_options(mcpo_core PRIVATE
     $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall;-Wextra;-Wpedantic;-Wconversion;-Wshadow>
 )
 
-add_executable(mcp-observatory src/main.cpp)
+add_executable(mcp-observatory
+    src/main.cpp
+    src/verbose_main.cpp
+)
+set_source_files_properties(src/main.cpp PROPERTIES
+    COMPILE_DEFINITIONS "main=mcpo_original_main"
+)
 target_link_libraries(mcp-observatory PRIVATE mcpo_core)
 target_compile_features(mcp-observatory PRIVATE cxx_std_20)
 
