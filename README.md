@@ -84,6 +84,31 @@ Docker or Lambda container:
 supported. Raw pages are mandatory evidence in bundle version 1;
 `--retain-raw` is accepted explicitly for forward-compatible scripts.
 
+Add `--verbose` for continuous human-readable progress on standard error.
+Progress includes the bounded startup configuration, resume validation and
+copy stages, each request start, a waiting heartbeat about every five seconds,
+validated page counters, finalization stages, and a final success or structured
+failure summary. Cursor values, paths, URLs, and diagnostics are escaped and
+bounded. Standard output remains reserved for the concise command result, and
+bundle artifacts are unaffected.
+
+Example progress:
+
+```text
+[registry] mode=resume registry=https://registry.modelcontextprotocol.io output=official-run resume_source=legacy-partial
+[registry] completed_pages=280 completed_records=8400 next_page=281 next_cursor=yes cursor_prefix=abc... cursor_length=96
+[registry] page=281 attempt=1 request_start elapsed=12.4s remaining=1727.6s timeout=90.0s cursor_prefix=abc... cursor_length=96
+[registry] page=281 attempt=1 waiting=5s remaining=1722.6s
+[registry] page=281 status=200 bytes=24821 duration=6.1s records=30 total_records=8430 completed_pages=281 next_cursor=yes saved=raw/page-000281.json checkpoint=not_applicable
+```
+
+To retain progress separately from machine-readable output:
+
+```bash
+mcp-observatory registry collect ... \
+  --verbose 2>registry-progress.log
+```
+
 ### Legacy partial checkpoints and resume
 
 A legacy interrupted directory containing only `raw/page-*.json` can be

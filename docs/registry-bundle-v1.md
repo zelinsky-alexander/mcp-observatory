@@ -58,6 +58,20 @@ last. A no-replace rename promotes the directory. Failed directories retain a
 bounded diagnostic and successfully retrieved raw pages when safe, but never
 appear at the requested successful destination.
 
+With `registry collect --verbose`, the collector writes continuous progress to
+standard error and flushes every complete line immediately. The bounded output
+reports startup limits, resume validation and periodic copy counts, each page
+request, a waiting heartbeat approximately every five seconds, successful page
+and cumulative counters, canonicalization and validation stages, promotion,
+and a final success or categorized failure summary. It does not include
+response bodies, complete cursors, secrets, or environment values. Standard
+output and the versioned bundle formats do not change.
+
+```bash
+mcp-observatory registry collect --output ./official-run \
+  --verbose 2>registry-progress.log
+```
+
 `raw/pages.jsonl` records the page number, normalized request and effective
 URLs, UTC retrieval time, status, content type, byte count, SHA-256, input and
 output cursors, redirect count, record count, and raw relative path. It never

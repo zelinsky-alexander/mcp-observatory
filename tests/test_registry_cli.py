@@ -5,6 +5,7 @@ import http.server
 import json
 import os
 import pathlib
+import select
 import shutil
 import subprocess
 import sys
@@ -66,6 +67,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif path == "/slow/v0.1/servers":
             time.sleep(2)
             self.reply(200, self.registry([]))
+        elif path == "/progress-slow/v0.1/servers":
+            time.sleep(0.5)
+            self.reply(200, self.registry([ENTRY]))
         elif path == "/partial/v0.1/servers" and "cursor" not in query:
             self.reply(200, self.registry([ENTRY], "next"))
         elif path == "/partial/v0.1/servers":
@@ -134,6 +138,70 @@ def main():
 
         validated = run(binary, "bundle", "validate", str(one))
         require(validated.returncode == 0, "bundle validate failed", validated)
+
+        progress_bundle = root / "progress-slow"
+        progress_process = subprocess.Popen(
+            [
+                binary,
+                "registry",
+                "collect",
+                "--registry-base-url",
+                base + "/progress-slow",
+                "--output",
+                str(progress_bundle),
+                "--verbose",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        observed_progress = []
+        progress_deadline = time.monotonic() + 2.0
+        saw_request_start = False
+        while time.monotonic() < progress_deadline and not saw_request_start:
+            readable, _, _ = select.select(
+                [progress_process.stderr],
+                [],
+                [],
+                max(0.0, progress_deadline - time.monotonic()),
+            )
+            if not readable:
+                break
+            chunk = os.read(progress_process.stderr.fileno(), 4096).decode()
+            if not chunk:
+                break
+            observed_progress.append(chunk)
+            saw_request_start = "request_start" in chunk
+        require(saw_request_start, "request_start was not observable before completion")
+        require(
+            progress_process.poll() is None,
+            "progress was only observable after collection completed",
+        )
+        progress_stdout, progress_stderr = progress_process.communicate(timeout=15)
+        observed_progress.append(progress_stderr)
+        progress_result = subprocess.CompletedProcess(
+            progress_process.args,
+            progress_process.returncode,
+            progress_stdout,
+            "".join(observed_progress),
+        )
+        require(
+            progress_result.returncode == 0,
+            "verbose progress fixture collection failed",
+            progress_result,
+        )
+        require(
+            "[registry]" not in progress_stdout
+            and progress_stdout.startswith("registry collection complete:"),
+            "verbose progress contaminated stdout",
+            progress_result,
+        )
+        require(
+            "[registry] success output=" in progress_result.stderr,
+            "verbose success summary missing from stderr",
+            progress_result,
+        )
 
         same = root / "same"
         result = run(

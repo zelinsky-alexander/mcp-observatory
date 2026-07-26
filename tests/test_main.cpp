@@ -95,7 +95,9 @@ mcpo::HttpTransport fixture_transport(std::vector<std::string> pages) {
                unsigned,
                std::size_t maximum,
                mcpo::HttpResponse& response,
-               std::string& error) mutable {
+               std::string& error,
+               const mcpo::HttpHeartbeat&,
+               std::chrono::milliseconds) mutable {
         if (index >= pages.size()) {
             error = "unexpected fixture request";
             return false;
@@ -415,7 +417,8 @@ int main() {
         bool saw_resume_cursor = false;
         mcpo::HttpTransport resume_transport =
             [&](const std::string& url, unsigned, std::size_t,
-                mcpo::HttpResponse& response, std::string&) {
+                mcpo::HttpResponse& response, std::string&,
+                const mcpo::HttpHeartbeat&, std::chrono::milliseconds) {
                 saw_resume_cursor =
                     url.find("cursor=cursor-three") != std::string::npos;
                 response.status = 200U;
@@ -470,6 +473,219 @@ int main() {
         require(!mcpo::reconstruct_registry_checkpoint(
                     broken_cursor, "http://127.0.0.1:8080", {}, message),
                 "broken legacy cursor continuity rejected");
+
+        options = {};
+        options.output = parent / "progress-new";
+        options.registry_base_url = "http://127.0.0.1:8080/base";
+        options.verbose = true;
+        options.heartbeat_interval = std::chrono::seconds(1);
+        const std::string long_cursor = "abc\n" + std::string(200U, 'x');
+        const std::string first_progress_page =
+            "{\"metadata\":{\"nextCursor\":\"abc\\n" + std::string(200U, 'x') +
+            "\"},\"servers\":[" + registry_entry("progress/one", "1") + "]}";
+        const std::string second_progress_page =
+            registry_page(registry_entry("progress/two", "1"));
+        std::ostringstream progress_error;
+        std::ostringstream progress_output;
+        std::streambuf* saved_error = std::cerr.rdbuf(progress_error.rdbuf());
+        std::streambuf* saved_output = std::cout.rdbuf(progress_output.rdbuf());
+        bool request_start_visible = false;
+        std::size_t progress_requests = 0U;
+        mcpo::HttpTransport progress_transport =
+            [&](const std::string& url, unsigned, std::size_t,
+                mcpo::HttpResponse& response, std::string&,
+                const mcpo::HttpHeartbeat&, std::chrono::milliseconds) {
+                request_start_visible =
+                    request_start_visible ||
+                    progress_error.str().find("request_start") != std::string::npos;
+                response.status = 200U;
+                response.content_type = "application/json";
+                response.body = progress_requests++ == 0U ?
+                    first_progress_page : second_progress_page;
+                response.effective_url = url;
+                return true;
+            };
+        const bool progress_success = mcpo::collect_registry(
+            options, message, std::move(progress_transport));
+        std::cerr.rdbuf(saved_error);
+        std::cout.rdbuf(saved_output);
+        const std::string progress_log = progress_error.str();
+        require(progress_success, "verbose collection should succeed");
+        require(request_start_visible,
+                "request_start should be flushed before transport runs");
+        require(progress_output.str().empty(),
+                "library progress must not use stdout");
+        require(progress_log.find("[registry] mode=new") != std::string::npos,
+                "new collection startup progress");
+        require(progress_log.find("request_timeout=30s run_timeout=900s") !=
+                    std::string::npos,
+                "startup timeout summary");
+        require(progress_log.find("page=1 attempt=1 request_start") !=
+                    std::string::npos,
+                "first request progress");
+        require(progress_log.find("page=2 attempt=1 request_start") !=
+                    std::string::npos,
+                "second request progress");
+        require(progress_log.find("cursor_prefix=abc\\x0a") != std::string::npos,
+                "cursor control characters escaped");
+        require(progress_log.find(
+                    "cursor_length=" + std::to_string(long_cursor.size())) !=
+                    std::string::npos,
+                "long cursor length reported");
+        require(progress_log.find(long_cursor) == std::string::npos,
+                "full cursor must not be logged");
+        require(progress_log.find("page=2 status=200") != std::string::npos &&
+                    progress_log.find("total_records=2 completed_pages=2") !=
+                        std::string::npos,
+                "page completion counters");
+        require(progress_log.find(" waiting=") == std::string::npos,
+                "fast responses should not emit heartbeat");
+        require(progress_log.find("pagination_complete pages=2 records=2") !=
+                    std::string::npos &&
+                    progress_log.find("canonicalization_start") !=
+                        std::string::npos &&
+                    progress_log.find("canonicalization_complete") !=
+                        std::string::npos &&
+                    progress_log.find("manifest_generation") !=
+                        std::string::npos &&
+                    progress_log.find("validation_complete") !=
+                        std::string::npos &&
+                    progress_log.find("success_marker_create") !=
+                        std::string::npos &&
+                    progress_log.find("atomic_promotion") != std::string::npos,
+                "finalization stages reported");
+        require(progress_log.find("[registry] success output=") !=
+                    std::string::npos,
+                "success summary reported");
+
+        options.output = parent / "progress-heartbeat";
+        std::ostringstream heartbeat_error;
+        saved_error = std::cerr.rdbuf(heartbeat_error.rdbuf());
+        mcpo::HttpTransport heartbeat_transport =
+            [&](const std::string& url, unsigned, std::size_t,
+                mcpo::HttpResponse& response, std::string&,
+                const mcpo::HttpHeartbeat& heartbeat,
+                std::chrono::milliseconds interval) {
+                require(interval >= std::chrono::seconds(1),
+                        "heartbeat interval must be at least one second");
+                heartbeat(std::chrono::seconds(1));
+                response.status = 200U;
+                response.content_type = "application/json";
+                response.body = registry_page("");
+                response.effective_url = url;
+                return true;
+            };
+        const bool heartbeat_success = mcpo::collect_registry(
+            options, message, std::move(heartbeat_transport));
+        std::cerr.rdbuf(saved_error);
+        require(heartbeat_success, "heartbeat fixture should succeed");
+        require(heartbeat_error.str().find(
+                    "page=1 attempt=1 waiting=1s remaining=") !=
+                    std::string::npos,
+                "delayed response heartbeat");
+
+        options.output = parent / "progress-resume";
+        options.resume = legacy;
+        std::ostringstream resume_error;
+        saved_error = std::cerr.rdbuf(resume_error.rdbuf());
+        mcpo::HttpTransport verbose_resume_transport =
+            [](const std::string& url, unsigned, std::size_t,
+               mcpo::HttpResponse& response, std::string&,
+               const mcpo::HttpHeartbeat&, std::chrono::milliseconds) {
+                response.status = 200U;
+                response.content_type = "application/json";
+                response.body = registry_page(registry_entry("legacy/three", "1"));
+                response.effective_url = url;
+                return true;
+            };
+        const bool resume_success = mcpo::collect_registry(
+            options, message, std::move(verbose_resume_transport));
+        std::cerr.rdbuf(saved_error);
+        const std::string resume_log = resume_error.str();
+        require(resume_success, "verbose resume should succeed");
+        require(resume_log.find("[registry] mode=resume") != std::string::npos &&
+                    resume_log.find("resume_source=") != std::string::npos,
+                "resume startup summary");
+        require(resume_log.find("resume checkpoint_load") != std::string::npos &&
+                    resume_log.find("resume checkpoint_validation") !=
+                        std::string::npos &&
+                    resume_log.find("resume raw_artifact_validation") !=
+                        std::string::npos &&
+                    resume_log.find("resume copy_start pages=2") !=
+                        std::string::npos &&
+                    resume_log.find("resume copy_complete pages=2") !=
+                        std::string::npos &&
+                    resume_log.find("resume continuation_page=3") !=
+                        std::string::npos,
+                "resume stages reported");
+        require(resume_log.find("completed_pages=2 completed_records=2 next_page=3") !=
+                    std::string::npos &&
+                    resume_log.find("page=3 attempt=1 request_start") !=
+                        std::string::npos &&
+                    resume_log.find("page=3 status=200") != std::string::npos,
+                "resumed numbering and counters");
+
+        options = {};
+        options.output = parent / "progress-request-timeout";
+        options.registry_base_url = "http://127.0.0.1:8080/base";
+        options.verbose = true;
+        options.limits.request_timeout_seconds = 1U;
+        options.limits.run_timeout_seconds = 30U;
+        std::ostringstream request_timeout_error;
+        saved_error = std::cerr.rdbuf(request_timeout_error.rdbuf());
+        mcpo::HttpTransport timeout_transport =
+            [](const std::string&, unsigned, std::size_t,
+               mcpo::HttpResponse&, std::string& error,
+               const mcpo::HttpHeartbeat&, std::chrono::milliseconds) {
+                error = "child process timed out";
+                return false;
+            };
+        const bool timeout_success = mcpo::collect_registry(
+            options, message, timeout_transport);
+        std::cerr.rdbuf(saved_error);
+        require(!timeout_success, "request timeout fixture should fail");
+        require(request_timeout_error.str().find(
+                    "failure stage=http_request category=request_timeout page=1") !=
+                    std::string::npos,
+                "request timeout failure summary");
+
+        options.output = parent / "progress-run-deadline";
+        options.limits.request_timeout_seconds = 90U;
+        options.limits.run_timeout_seconds = 1U;
+        std::ostringstream deadline_error;
+        saved_error = std::cerr.rdbuf(deadline_error.rdbuf());
+        const bool deadline_success = mcpo::collect_registry(
+            options, message, timeout_transport);
+        std::cerr.rdbuf(saved_error);
+        require(!deadline_success, "run deadline fixture should fail");
+        require(deadline_error.str().find(
+                    "category=total_run_deadline_exhausted page=1") !=
+                    std::string::npos,
+                "deadline-limited curl timeout classification");
+
+        options = {};
+        options.output = parent / "progress-quiet";
+        options.registry_base_url = "http://127.0.0.1:8080/base";
+        std::ostringstream quiet_error;
+        saved_error = std::cerr.rdbuf(quiet_error.rdbuf());
+        const bool quiet_success = mcpo::collect_registry(
+            options, message, fixture_transport({first_progress_page, second_progress_page}));
+        std::cerr.rdbuf(saved_error);
+        require(quiet_success, "quiet comparison collection should succeed");
+        require(quiet_error.str().empty(), "non-verbose collection emitted progress");
+        const auto read_bytes = [](const std::filesystem::path& path) {
+            std::ifstream input(path, std::ios::binary);
+            return std::string(
+                std::istreambuf_iterator<char>(input),
+                std::istreambuf_iterator<char>());
+        };
+        require(read_bytes(parent / "progress-new/raw/page-000001.json") ==
+                    read_bytes(parent / "progress-quiet/raw/page-000001.json") &&
+                    read_bytes(parent / "progress-new/raw/page-000002.json") ==
+                        read_bytes(parent / "progress-quiet/raw/page-000002.json") &&
+                    read_bytes(parent / "progress-new/canonical/servers.jsonl") ==
+                        read_bytes(parent / "progress-quiet/canonical/servers.jsonl"),
+                "verbose mode changed generated evidence artifacts");
 
         std::filesystem::remove_all(parent, ec);
     }

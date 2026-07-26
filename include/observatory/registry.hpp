@@ -38,6 +38,7 @@ struct RegistryCollectOptions {
     RegistryLimits limits{};
     bool retain_raw{true};
     bool verbose{};
+    std::chrono::milliseconds heartbeat_interval{std::chrono::seconds(5)};
 };
 
 struct HttpResponse {
@@ -48,12 +49,16 @@ struct HttpResponse {
     std::optional<std::string> location;
 };
 
+using HttpHeartbeat = std::function<void(std::chrono::milliseconds waiting)>;
+
 using HttpTransport = std::function<bool(
     const std::string& url,
     unsigned timeout_seconds,
     std::size_t maximum_bytes,
     HttpResponse& response,
-    std::string& error)>;
+    std::string& error,
+    const HttpHeartbeat& heartbeat,
+    std::chrono::milliseconds heartbeat_interval)>;
 
 [[nodiscard]] bool parse_registry_url(
     std::string_view text,
