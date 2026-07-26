@@ -1,6 +1,8 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <iostream>
 #include <optional>
@@ -20,6 +22,15 @@ struct CollectArguments {
     std::optional<std::filesystem::path> resume;
 };
 
+bool option_has_value(std::string_view argument) {
+    return argument == "--output" || argument == "--resume" ||
+        argument == "--registry-base-url" || argument == "--maximum-pages" ||
+        argument == "--maximum-page-bytes" || argument == "--maximum-records" ||
+        argument == "--maximum-redirects" ||
+        argument == "--request-timeout-seconds" ||
+        argument == "--run-timeout-seconds";
+}
+
 CollectArguments parse_collect_arguments(int argc, char** argv) {
     CollectArguments result;
     if (argc < 3 || std::string_view(argv[1]) != "registry" ||
@@ -33,16 +44,13 @@ CollectArguments parse_collect_arguments(int argc, char** argv) {
             result.enabled = true;
             continue;
         }
-        if (index + 1 >= argc) continue;
-        const std::string_view value(argv[index + 1]);
+        if (!option_has_value(argument) || index + 1 >= argc) continue;
+
+        const std::string_view value(argv[++index]);
         if (argument == "--output") {
             result.output = std::filesystem::path(std::string(value));
-            ++index;
         } else if (argument == "--resume") {
             result.resume = std::filesystem::path(std::string(value));
-            ++index;
-        } else if (argument.starts_with("--")) {
-            ++index;
         }
     }
     return result;
