@@ -70,10 +70,18 @@ schema-version-1 tables, and never modifies the evidence bundle. Explorer
 commands perform no network activity. Future derived analysis remains
 separate from the official imported metadata tables.
 
-Legacy checkpoint reconstruction remains inside the collection boundary. It
-derives bounded continuation state only from preserved raw Registry responses,
-creates no successful-bundle marker, and resumes into a separate immutable
-output directory.
+The collector has no fixed total deadline by default. Each HTTP attempt is
+bounded, while a separate durable-progress watchdog detects a lack of committed
+pages. Transient transport and selected HTTP failures use bounded retries.
+After every page, the raw page, authoritative `raw/pages.jsonl` history, and
+compact checkpoint resume head are committed in that order. Heartbeats show
+process liveness but do not count as progress.
+
+Checkpoint reconstruction and resume remain inside the collection boundary.
+Resume validates the durable head against preserved raw evidence, ignores
+uncheckpointed page files, restarts at the first uncommitted page, creates no
+successful-bundle marker in the source partial, and completes into a separate
+immutable output directory.
 
 ## Local catalog boundary
 

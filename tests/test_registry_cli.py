@@ -203,6 +203,63 @@ def main():
             progress_result,
         )
 
+        unlimited = root / "unlimited"
+        result = run(
+            binary,
+            "registry",
+            "collect",
+            "--registry-base-url",
+            base + "/same",
+            "--run-timeout-seconds",
+            "0",
+            "--output",
+            str(unlimited),
+        )
+        require(
+            result.returncode == 0,
+            "explicit unlimited total runtime was rejected",
+            result,
+        )
+
+        invalid_runtime_options = [
+            ("--request-timeout-seconds", "0"),
+            ("--stall-timeout-seconds", "0"),
+            ("--maximum-attempts-per-page", "0"),
+            ("--retry-initial-seconds", "0"),
+            ("--request-timeout-seconds", "4294967296"),
+        ]
+        for index, (flag, value) in enumerate(invalid_runtime_options):
+            result = run(
+                binary,
+                "registry",
+                "collect",
+                "--registry-base-url",
+                base + "/same",
+                flag,
+                value,
+                "--output",
+                str(root / f"invalid-runtime-{index}"),
+            )
+            require(
+                result.returncode != 0,
+                f"invalid runtime value accepted: {flag}={value}",
+                result,
+            )
+        result = run(
+            binary,
+            "registry",
+            "collect",
+            "--registry-base-url",
+            base + "/same",
+            "--retry-initial-seconds",
+            "10",
+            "--retry-maximum-seconds",
+            "9",
+            "--output",
+            str(root / "invalid-retry-range"),
+        )
+        require(result.returncode != 0, "invalid retry range accepted", result)
+
         same = root / "same"
         result = run(
             binary,
@@ -265,6 +322,8 @@ def main():
             "collect",
             "--registry-base-url",
             base + "/partial",
+            "--maximum-attempts-per-page",
+            "1",
             "--output",
             str(partial),
         )

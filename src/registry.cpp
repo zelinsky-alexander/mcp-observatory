@@ -13,6 +13,7 @@
 #include <iomanip>
 #include <iostream>
 #include <linux/fs.h>
+#include <limits>
 #include <map>
 #include <optional>
 #include <poll.h>
@@ -486,7 +487,9 @@ bool write_file(const std::filesystem::path& path, std::string_view bytes, std::
         }
         written += static_cast<std::size_t>(count);
     }
-    if (fsync(descriptor) != 0 || close(descriptor) != 0) {
+    const bool flush_failed = fsync(descriptor) != 0;
+    const bool close_failed = close(descriptor) != 0;
+    if (flush_failed || close_failed) {
         error = "cannot flush " + path.string();
         return false;
     }
@@ -496,7 +499,9 @@ bool write_file(const std::filesystem::path& path, std::string_view bytes, std::
 bool sync_directory(const std::filesystem::path& path, std::string& error) {
     const int descriptor = open(path.c_str(), O_RDONLY | O_DIRECTORY);
     if (descriptor < 0) return (error = "cannot open bundle directory for flush", false);
-    if (fsync(descriptor) != 0 || close(descriptor) != 0)
+    const bool flush_failed = fsync(descriptor) != 0;
+    const bool close_failed = close(descriptor) != 0;
+    if (flush_failed || close_failed)
         return (error = "cannot flush bundle directory", false);
     return true;
 }
@@ -516,20 +521,36 @@ bool read_file(
     return true;
 }
 
+enum class ProcessFailureKind {
+    none,
+    timeout,
+    cancelled,
+    output_limit,
+    local_io,
+};
+
 bool run_process(
     const std::vector<std::string>& arguments,
-    unsigned timeout_seconds,
+    std::chrono::steady_clock::duration timeout,
     std::size_t maximum_output,
     std::string& output,
     int& exit_status,
     std::string& error,
     const HttpHeartbeat& heartbeat = {},
-    std::chrono::milliseconds heartbeat_interval = std::chrono::seconds(5)) {
+    std::chrono::steady_clock::duration initial_wake =
+        std::chrono::seconds(5),
+    ProcessFailureKind* failure_kind = nullptr) {
+    if (failure_kind != nullptr) *failure_kind = ProcessFailureKind::none;
     int pipe_fds[2]{};
-    if (pipe(pipe_fds) != 0) { error = "cannot create process pipe"; return false; }
+    if (pipe(pipe_fds) != 0) {
+        if (failure_kind != nullptr) *failure_kind = ProcessFailureKind::local_io;
+        error = "cannot create process pipe";
+        return false;
+    }
     const pid_t child = fork();
     if (child < 0) {
         close(pipe_fds[0]); close(pipe_fds[1]);
+        if (failure_kind != nullptr) *failure_kind = ProcessFailureKind::local_io;
         error = "cannot create child process";
         return false;
     }
@@ -547,8 +568,8 @@ bool run_process(
     close(pipe_fds[1]);
     fcntl(pipe_fds[0], F_SETFL, fcntl(pipe_fds[0], F_GETFL) | O_NONBLOCK);
     const auto started = std::chrono::steady_clock::now();
-    const auto deadline = started + std::chrono::seconds(timeout_seconds);
-    auto next_heartbeat = started + heartbeat_interval;
+    const auto deadline = started + timeout;
+    auto next_observation = started + initial_wake;
     bool done = false;
     int status{};
     while (!done) {
@@ -559,6 +580,8 @@ bool run_process(
                 kill(child, SIGKILL);
                 waitpid(child, &status, 0);
                 close(pipe_fds[0]);
+                if (failure_kind != nullptr)
+                    *failure_kind = ProcessFailureKind::output_limit;
                 error = "child process output limit exceeded";
                 return false;
             }
@@ -566,25 +589,67 @@ bool run_process(
         }
         const pid_t waited = waitpid(child, &status, WNOHANG);
         if (waited == child) done = true;
-        else if (waited < 0) { close(pipe_fds[0]); error = "cannot wait for child process"; return false; }
+        else if (waited < 0) {
+            close(pipe_fds[0]);
+            if (failure_kind != nullptr) *failure_kind = ProcessFailureKind::local_io;
+            error = "cannot wait for child process";
+            return false;
+        }
         else if (std::chrono::steady_clock::now() >= deadline) {
             kill(child, SIGKILL);
             waitpid(child, &status, 0);
             close(pipe_fds[0]);
+            if (failure_kind != nullptr) *failure_kind = ProcessFailureKind::timeout;
             error = "child process timed out";
             return false;
         } else {
             const auto now = std::chrono::steady_clock::now();
-            if (heartbeat && heartbeat_interval >= std::chrono::seconds(1) &&
-                now >= next_heartbeat) {
-                heartbeat(std::chrono::duration_cast<std::chrono::milliseconds>(
-                    now - started));
-                do {
-                    next_heartbeat += heartbeat_interval;
-                } while (next_heartbeat <= now);
+            if (heartbeat && initial_wake >
+                    std::chrono::steady_clock::duration::zero() &&
+                now >= next_observation) {
+                const HttpWaitDecision decision = heartbeat(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        now - started));
+                if (!decision.continue_waiting) {
+                    kill(child, SIGKILL);
+                    waitpid(child, &status, 0);
+                    close(pipe_fds[0]);
+                    if (failure_kind != nullptr)
+                        *failure_kind = ProcessFailureKind::cancelled;
+                    error = "child process cancelled";
+                    return false;
+                }
+                if (decision.next_wake <=
+                    std::chrono::steady_clock::duration::zero()) {
+                    kill(child, SIGKILL);
+                    waitpid(child, &status, 0);
+                    close(pipe_fds[0]);
+                    if (failure_kind != nullptr)
+                        *failure_kind = ProcessFailureKind::cancelled;
+                    error = "child process wait callback returned a zero wake interval";
+                    return false;
+                }
+                next_observation = now + decision.next_wake;
             }
             pollfd descriptor{pipe_fds[0], POLLIN, 0};
-            poll(&descriptor, 1, 10);
+            auto wake_at = deadline;
+            if (heartbeat && initial_wake >
+                    std::chrono::steady_clock::duration::zero())
+                wake_at = std::min(wake_at, next_observation);
+            const auto before_poll = std::chrono::steady_clock::now();
+            int poll_timeout{};
+            if (wake_at > before_poll) {
+                const auto remaining = wake_at - before_poll;
+                const auto whole_milliseconds =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        remaining);
+                auto milliseconds = whole_milliseconds.count();
+                if (whole_milliseconds < remaining) ++milliseconds;
+                poll_timeout = static_cast<int>(std::min<std::int64_t>(
+                    milliseconds,
+                    std::numeric_limits<int>::max()));
+            }
+            poll(&descriptor, 1, poll_timeout);
         }
     }
     while (true) {
@@ -592,7 +657,11 @@ bool run_process(
         const ssize_t count = read(pipe_fds[0], buffer.data(), buffer.size());
         if (count <= 0) break;
         if (output.size() + static_cast<std::size_t>(count) > maximum_output) {
-            close(pipe_fds[0]); error = "child process output limit exceeded"; return false;
+            close(pipe_fds[0]);
+            if (failure_kind != nullptr)
+                *failure_kind = ProcessFailureKind::output_limit;
+            error = "child process output limit exceeded";
+            return false;
         }
         output.append(buffer.data(), static_cast<std::size_t>(count));
     }
@@ -606,7 +675,7 @@ bool sha256_file(const std::filesystem::path& path, std::string& digest, std::st
     int status{};
     if (!run_process(
             {"/usr/bin/openssl", "dgst", "-sha256", "-r", path.string()},
-            30U, 4096U, output, status, error)) return false;
+            std::chrono::seconds(30), 4096U, output, status, error)) return false;
     if (status != 0 || output.size() < 64U) {
         error = "OpenSSL SHA-256 failed for " + path.string();
         return false;
@@ -765,12 +834,13 @@ std::optional<std::string> header_value(std::string_view headers, std::string_vi
 
 bool curl_transport(
     const std::string& url,
-    unsigned timeout_seconds,
+    std::chrono::steady_clock::duration timeout,
     std::size_t maximum_bytes,
     HttpResponse& response,
     std::string& error,
     const HttpHeartbeat& heartbeat,
-    std::chrono::milliseconds heartbeat_interval) {
+    std::chrono::steady_clock::duration initial_wake) {
+    response.failure_kind = HttpFailureKind::none;
     std::array<char, 64U> body_template{};
     std::array<char, 64U> header_template{};
     std::snprintf(body_template.data(), body_template.size(), "/tmp/mcpo-body-%ld-XXXXXX",
@@ -788,29 +858,76 @@ bool curl_transport(
     close(body_fd); close(header_fd);
     std::string output;
     int status{};
-    const std::string seconds = std::to_string(timeout_seconds);
+    ProcessFailureKind process_failure{};
+    const auto timeout_nanoseconds =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(timeout);
+    std::ostringstream timeout_text;
+    timeout_text << std::fixed << std::setprecision(9)
+                 << static_cast<double>(timeout_nanoseconds.count()) /
+                        1'000'000'000.0;
+    const std::string seconds = timeout_text.str();
     const std::string bytes = std::to_string(maximum_bytes);
     const bool ran = run_process(
         {"/usr/bin/curl", "--silent", "--show-error", "--request", "GET",
          "--proto", "=http,https", "--max-time", seconds, "--connect-timeout", seconds,
          "--max-filesize", bytes, "--output", body_template.data(), "--dump-header",
          header_template.data(), "--write-out", "%{http_code}\\n%{content_type}\\n%{url_effective}",
-         url},
-        timeout_seconds + 2U, maximum_diagnostic_bytes, output, status, error,
-        heartbeat, heartbeat_interval);
+        url},
+        timeout, maximum_diagnostic_bytes, output, status, error,
+        heartbeat, initial_wake, &process_failure);
     std::string body;
     std::string headers;
     if (ran) {
         std::string read_error;
         if (!read_file(body_template.data(), maximum_bytes, body, read_error) ||
             !read_file(header_template.data(), 64U * 1024U, headers, read_error)) {
+            response.failure_kind = HttpFailureKind::local_io;
             error = read_error;
         }
     }
     unlink(body_template.data()); unlink(header_template.data());
-    if (!ran) return false;
+    if (!ran) {
+        response.failure_kind =
+            process_failure == ProcessFailureKind::timeout ?
+                HttpFailureKind::timeout :
+            process_failure == ProcessFailureKind::cancelled ?
+                HttpFailureKind::cancelled :
+                HttpFailureKind::local_io;
+        return false;
+    }
     if (!error.empty()) return false;
     if (status != 0) {
+        switch (status) {
+            case 5:
+            case 6:
+            case 7:
+            case 18:
+            case 52:
+            case 55:
+            case 56:
+                response.failure_kind = HttpFailureKind::temporary_network;
+                break;
+            case 28:
+                response.failure_kind = HttpFailureKind::timeout;
+                break;
+            case 35:
+            case 51:
+            case 58:
+            case 59:
+            case 60:
+            case 77:
+            case 80:
+            case 90:
+            case 91:
+                response.failure_kind = HttpFailureKind::tls;
+                break;
+            case 63:
+                response.failure_kind = HttpFailureKind::response_too_large;
+                break;
+            default:
+                response.failure_kind = HttpFailureKind::other;
+                break;
+        }
         error = output.empty() ? "curl request failed" : output.substr(0U, maximum_diagnostic_bytes);
         return false;
     }
@@ -825,6 +942,7 @@ bool curl_transport(
     response.content_type = output.substr(first + 1U, second - first - 1U);
     response.effective_url = output.substr(second + 1U);
     response.location = header_value(headers, "location");
+    response.retry_after = header_value(headers, "retry-after");
     response.body = std::move(body);
     return true;
 }
@@ -1051,6 +1169,11 @@ struct ReconstructedState {
     std::string pages_jsonl;
 };
 
+bool json_count(
+    const Json::Object& object,
+    std::string_view key,
+    std::uintmax_t& value);
+
 bool promote_without_replace(
     const std::filesystem::path& source,
     const std::filesystem::path& destination,
@@ -1116,7 +1239,8 @@ bool reconstruct_state(
     const RegistryUrl& origin,
     RegistryLimits limits,
     ReconstructedState& state,
-    std::string& error) {
+    std::string& error,
+    std::optional<std::size_t> committed_page_limit = std::nullopt) {
     state = {};
     const auto raw_directory = partial / "raw";
     std::error_code ec;
@@ -1128,14 +1252,29 @@ bool reconstruct_state(
         if (!iterator->is_regular_file(ec)) continue;
         const std::string filename = iterator->path().filename().string();
         if (!filename.starts_with("page-") || !filename.ends_with(".json")) continue;
+        if (iterator->is_symlink(ec) || ec)
+            return (error = "raw page symbolic links are rejected", false);
         std::size_t number{};
         if (!parse_page_number(filename, number, error)) return false;
+        if (committed_page_limit &&
+            number > *committed_page_limit)
+            continue;
         if (!numbered.emplace(number, iterator->path()).second)
             return (error = "duplicate legacy raw page number: " +
                 std::to_string(number), false);
     }
     if (ec) return (error = "cannot enumerate legacy raw pages", false);
-    if (numbered.empty()) return (error = "legacy partial bundle contains no raw pages", false);
+    if (committed_page_limit) {
+        if (numbered.size() < *committed_page_limit)
+            return (error = "partial bundle is missing a checkpointed raw page", false);
+        if (*committed_page_limit == 0U) {
+            state.completed_pages = 0U;
+            state.records_received = 0U;
+            return true;
+        }
+    } else if (numbered.empty()) {
+        return (error = "legacy partial bundle contains no raw pages", false);
+    }
     if (numbered.size() > limits.maximum_pages)
         return (error = "legacy page count exceeds configured limit", false);
     std::size_t expected_number = 1U;
@@ -1205,29 +1344,219 @@ bool reconstruct_state(
     return true;
 }
 
+bool checkpoint_head(
+    const std::filesystem::path& path,
+    std::uintmax_t& version,
+    std::size_t& completed_pages,
+    std::string& error) {
+    std::error_code status_error;
+    if (std::filesystem::is_symlink(
+            std::filesystem::symlink_status(path, status_error)) ||
+        status_error)
+        return (error = "checkpoint must not be a symbolic link", false);
+    std::string bytes;
+    if (!read_file(path, 4U * 1024U * 1024U, bytes, error)) return false;
+    Json root;
+    JsonParser parser(bytes);
+    if (!parser.parse(root, error)) return false;
+    const Json::Object* object = object_value(root);
+    std::uintmax_t pages{};
+    if (object == nullptr ||
+        !json_count(*object, "checkpoint_version", version) ||
+        !json_count(*object, "completed_pages", pages) ||
+        pages > std::numeric_limits<std::size_t>::max())
+        return (error = "checkpoint head is invalid", false);
+    if (version != 1U && version != 2U)
+        return (error = "unsupported checkpoint version " +
+            std::to_string(version), false);
+    completed_pages = static_cast<std::size_t>(pages);
+    return true;
+}
+
+std::string compact_checkpoint_json(
+    const RegistryUrl& origin,
+    std::size_t completed_pages,
+    std::size_t completed_records,
+    const std::optional<std::string>& next_cursor,
+    const Artifact* last,
+    const Artifact& pages_artifact) {
+    std::string result = "{\"checkpoint_version\":2,\"completed_pages\":" +
+        std::to_string(completed_pages) + ",\"completed_records\":" +
+        std::to_string(completed_records) + ",\"last_completed_page\":" +
+        std::to_string(completed_pages) + ",\"last_page_path\":";
+    if (last != nullptr) append_json_string(result, last->path);
+    else result += "null";
+    result += ",\"last_page_sha256\":";
+    if (last != nullptr) append_json_string(result, last->sha256);
+    else result += "null";
+    result += ",\"last_page_size\":" +
+        std::to_string(last == nullptr ? 0U : last->size) +
+        ",\"next_cursor\":";
+    if (next_cursor) append_json_string(result, *next_cursor);
+    else result += "null";
+    result += ",\"pages_metadata_path\":\"raw/pages.jsonl\","
+        "\"pages_metadata_sha256\":";
+    append_json_string(result, pages_artifact.sha256);
+    result += ",\"pages_metadata_size\":" +
+        std::to_string(pages_artifact.size) + ",\"records_received\":" +
+        std::to_string(completed_records) +
+        ",\"registry\":\"official-mcp\",\"registry_base_url\":";
+    append_json_string(result, origin.normalized);
+    result += ",\"status\":\"partial\",\"updated_at\":";
+    append_json_string(result, utc_now());
+    result += "}\n";
+    return result;
+}
+
 std::string checkpoint_json(
     const RegistryUrl& origin,
     const ReconstructedState& state,
     const Artifact& pages_artifact) {
-    std::string result = "{\"artifacts\":[";
-    for (std::size_t index = 0U; index < state.artifacts.size(); ++index) {
-        if (index != 0U) result.push_back(',');
-        result += artifact_json(state.artifacts[index]);
+    const Artifact* last =
+        state.artifacts.empty() ? nullptr : &state.artifacts.back();
+    return compact_checkpoint_json(
+        origin, state.completed_pages, state.records_received,
+        state.next_cursor, last, pages_artifact);
+}
+
+bool json_count(
+    const Json::Object& object,
+    std::string_view key,
+    std::uintmax_t& value) {
+    const auto found = object.find(std::string(key));
+    if (found == object.end() || !found->second.number) return false;
+    const auto* text = std::get_if<std::string>(&found->second.value);
+    if (text == nullptr || text->empty() || text->front() == '-') return false;
+    const auto parsed =
+        std::from_chars(text->data(), text->data() + text->size(), value);
+    return parsed.ec == std::errc{} &&
+        parsed.ptr == text->data() + text->size();
+}
+
+bool checkpoint_v2_matches(
+    const std::filesystem::path& path,
+    const Json::Object& object,
+    const RegistryUrl& origin,
+    const ReconstructedState& state,
+    std::string& error) {
+    const std::string* base_url = string_member(object, "registry_base_url");
+    const std::string* registry = string_member(object, "registry");
+    const std::string* status = string_member(object, "status");
+    const std::string* updated_at = string_member(object, "updated_at");
+    const std::string* pages_path =
+        string_member(object, "pages_metadata_path");
+    const std::string* pages_digest =
+        string_member(object, "pages_metadata_sha256");
+    std::uintmax_t completed_pages{};
+    std::uintmax_t completed_records{};
+    std::uintmax_t last_completed_page{};
+    std::uintmax_t last_page_size{};
+    std::uintmax_t pages_size{};
+    if (base_url == nullptr || *base_url != origin.normalized ||
+        registry == nullptr || *registry != registry_name ||
+        status == nullptr || *status != "partial" ||
+        updated_at == nullptr || !valid_utc_timestamp(*updated_at) ||
+        pages_path == nullptr || *pages_path != "raw/pages.jsonl" ||
+        pages_digest == nullptr ||
+        !json_count(object, "completed_pages", completed_pages) ||
+        !json_count(object, "completed_records", completed_records) ||
+        !json_count(object, "last_completed_page", last_completed_page) ||
+        !json_count(object, "last_page_size", last_page_size) ||
+        !json_count(object, "pages_metadata_size", pages_size))
+        return (error = "invalid compact checkpoint fields", false);
+    if (completed_pages != state.completed_pages ||
+        completed_records != state.records_received ||
+        last_completed_page != completed_pages)
+        return (error = "compact checkpoint counts do not match raw pages", false);
+    const std::string* cursor = string_member(object, "next_cursor");
+    if ((state.next_cursor && (cursor == nullptr || *cursor != *state.next_cursor)) ||
+        (!state.next_cursor && cursor != nullptr))
+        return (error = "compact checkpoint next_cursor mismatch", false);
+
+    const std::string* last_path = string_member(object, "last_page_path");
+    const std::string* last_digest =
+        string_member(object, "last_page_sha256");
+    if (completed_pages == 0U) {
+        if (last_path != nullptr || last_digest != nullptr ||
+            last_page_size != 0U)
+            return (error = "empty compact checkpoint has last-page metadata", false);
+    } else {
+        std::ostringstream expected_name;
+        expected_name << "raw/page-" << std::setw(6) << std::setfill('0')
+                      << completed_pages << ".json";
+        if (last_path == nullptr || *last_path != expected_name.str() ||
+            !validate_artifact_path(*last_path) || last_digest == nullptr)
+            return (error = "invalid compact checkpoint last-page path", false);
+        std::error_code status_error;
+        if (std::filesystem::is_symlink(
+                std::filesystem::symlink_status(
+                    path.parent_path() / *last_path, status_error)) ||
+            status_error)
+            return (error = "compact checkpoint last page must not be a symbolic link", false);
+        Artifact actual;
+        if (!artifact_for(path.parent_path(), *last_path, actual, error))
+            return false;
+        if (actual.size != last_page_size ||
+            actual.sha256 != *last_digest)
+            return (error = "compact checkpoint last-page artifact mismatch", false);
     }
-    if (!state.artifacts.empty()) result.push_back(',');
-    result += artifact_json(pages_artifact);
-    result += "],\"checkpoint_version\":1,\"completed_pages\":" +
-        std::to_string(state.completed_pages) + ",\"next_cursor\":";
-    if (state.next_cursor) append_json_string(result, *state.next_cursor);
-    else result += "null";
-    result += ",\"records_received\":" +
-        std::to_string(state.records_received) +
-        ",\"reconstructed_at\":";
-    append_json_string(result, utc_now());
-    result += ",\"registry\":\"official-mcp\",\"registry_base_url\":";
-    append_json_string(result, origin.normalized);
-    result += ",\"status\":\"partial\"}\n";
-    return result;
+
+    Artifact pages_artifact;
+    std::error_code status_error;
+    if (std::filesystem::is_symlink(
+            std::filesystem::symlink_status(
+                path.parent_path() / "raw/pages.jsonl", status_error)) ||
+        status_error)
+        return (error = "checkpoint page metadata must not be a symbolic link", false);
+    if (!artifact_for(
+            path.parent_path(), "raw/pages.jsonl", pages_artifact, error))
+        return false;
+    if (pages_artifact.size != pages_size ||
+        pages_artifact.sha256 != *pages_digest)
+        return (error = "compact checkpoint pages metadata mismatch", false);
+    std::string pages_bytes;
+    if (!read_file(
+            path.parent_path() / "raw/pages.jsonl",
+            128U * 1024U * 1024U, pages_bytes, error))
+        return false;
+    std::istringstream lines(pages_bytes);
+    std::string line;
+    std::size_t line_count{};
+    std::optional<std::string> final_output;
+    while (std::getline(lines, line)) {
+        ++line_count;
+        Json metadata_json;
+        JsonParser parser(line);
+        if (!parser.parse(metadata_json, error))
+            return (error = "invalid checkpoint page metadata", false);
+        const Json::Object* metadata = object_value(metadata_json);
+        std::uintmax_t page_number{};
+        const std::string* raw_path =
+            metadata == nullptr ? nullptr : string_member(*metadata, "path");
+        if (metadata == nullptr ||
+            !json_count(*metadata, "page_number", page_number) ||
+            page_number != line_count || raw_path == nullptr)
+            return (error = "checkpoint page metadata sequence mismatch", false);
+        std::ostringstream expected_path;
+        expected_path << "raw/page-" << std::setw(6) << std::setfill('0')
+                      << line_count << ".json";
+        if (*raw_path != expected_path.str())
+            return (error = "checkpoint page metadata path mismatch", false);
+        const auto output = metadata->find("pagination_output");
+        if (output == metadata->end())
+            return (error = "checkpoint page metadata cursor missing", false);
+        if (std::holds_alternative<std::nullptr_t>(output->second.value)) {
+            final_output.reset();
+        } else {
+            const auto* value = std::get_if<std::string>(&output->second.value);
+            if (value == nullptr || output->second.number)
+                return (error = "checkpoint page metadata cursor invalid", false);
+            final_output = *value;
+        }
+    }
+    if (line_count != completed_pages || final_output != state.next_cursor)
+        return (error = "checkpoint page metadata does not end at durable head", false);
+    return true;
 }
 
 bool checkpoint_matches(
@@ -1242,6 +1571,14 @@ bool checkpoint_matches(
     if (!parser.parse(root, error)) return false;
     const Json::Object* object = object_value(root);
     if (object == nullptr) return (error = "checkpoint must be an object", false);
+    std::uintmax_t checkpoint_version{};
+    if (!json_count(*object, "checkpoint_version", checkpoint_version))
+        return (error = "checkpoint version is missing", false);
+    if (checkpoint_version == 2U)
+        return checkpoint_v2_matches(path, *object, origin, state, error);
+    if (checkpoint_version != 1U)
+        return (error = "unsupported checkpoint version " +
+            std::to_string(checkpoint_version), false);
     const std::string* base_url = string_member(*object, "registry_base_url");
     const std::string* registry = string_member(*object, "registry");
     if (base_url == nullptr || *base_url != origin.normalized ||
@@ -1313,6 +1650,192 @@ bool promote_without_replace(
     if (result == 0) return true;
     error = "cannot promote completed bundle without replacing a destination";
     return false;
+}
+
+using SteadyTime = std::chrono::steady_clock::time_point;
+
+struct CollectionDeadlines {
+    SteadyTime last_durable_progress;
+    std::optional<SteadyTime> total_deadline;
+};
+
+enum class DeadlineFailure {
+    none,
+    stalled,
+    total
+};
+
+struct DeadlineStatus {
+    DeadlineFailure failure{DeadlineFailure::none};
+    std::chrono::steady_clock::duration since_last_durable_progress{};
+    std::chrono::steady_clock::duration until_next_deadline{};
+    std::optional<std::chrono::steady_clock::duration> remaining_total;
+};
+
+constexpr std::uint64_t maximum_request_timeout_seconds = 86'400U;
+constexpr std::uint64_t maximum_stall_timeout_seconds = 2'592'000U;
+constexpr std::uint64_t maximum_run_timeout_seconds = 31'536'000U;
+constexpr std::uint64_t maximum_retry_delay_seconds = 86'400U;
+constexpr std::size_t maximum_attempt_count = 1'000U;
+
+bool validate_runtime_policy(
+    const RegistryRuntimePolicy& policy,
+    std::string& error) {
+    const auto request = policy.request_timeout.count();
+    const auto stall = policy.stall_timeout.count();
+    const auto initial = policy.retry_initial.count();
+    const auto maximum = policy.retry_maximum.count();
+    if (request <= 0 || stall <= 0 || policy.maximum_attempts_per_page == 0U ||
+        initial <= 0)
+        return (error =
+            "request timeout, stall timeout, attempts, and retry initial delay "
+            "must be greater than zero", false);
+    if (maximum < initial)
+        return (error = "retry maximum delay must not be less than retry initial delay", false);
+    if (static_cast<std::uint64_t>(request) > maximum_request_timeout_seconds ||
+        static_cast<std::uint64_t>(stall) > maximum_stall_timeout_seconds ||
+        static_cast<std::uint64_t>(maximum) > maximum_retry_delay_seconds ||
+        policy.maximum_attempts_per_page > maximum_attempt_count)
+        return (error = "runtime policy value exceeds the supported implementation bound", false);
+    if (policy.run_timeout &&
+        (policy.run_timeout->count() <= 0 ||
+         static_cast<std::uint64_t>(policy.run_timeout->count()) >
+             maximum_run_timeout_seconds))
+        return (error = "total run timeout exceeds the supported implementation bound", false);
+    return true;
+}
+
+std::chrono::milliseconds nonnegative_duration(
+    SteadyTime later,
+    SteadyTime earlier) {
+    if (later <= earlier) return std::chrono::milliseconds::zero();
+    return std::chrono::duration_cast<std::chrono::milliseconds>(later - earlier);
+}
+
+DeadlineStatus classify_deadlines(
+    const CollectionDeadlines& deadlines,
+    const RegistryRuntimePolicy& policy,
+    SteadyTime now) {
+    DeadlineStatus status;
+    if (now > deadlines.last_durable_progress)
+        status.since_last_durable_progress =
+            now - deadlines.last_durable_progress;
+    const auto stall_timeout =
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            policy.stall_timeout);
+    const auto remaining_stall =
+        status.since_last_durable_progress >= stall_timeout ?
+            std::chrono::steady_clock::duration::zero() :
+            stall_timeout - status.since_last_durable_progress;
+    status.until_next_deadline = remaining_stall;
+    if (deadlines.total_deadline) {
+        const auto remaining =
+            now >= *deadlines.total_deadline ?
+                std::chrono::steady_clock::duration::zero() :
+                *deadlines.total_deadline - now;
+        status.remaining_total = remaining;
+        status.until_next_deadline =
+            std::min(status.until_next_deadline, remaining);
+        if (now >= *deadlines.total_deadline) {
+            status.failure = DeadlineFailure::total;
+            return status;
+        }
+    }
+    if (status.since_last_durable_progress >= stall_timeout)
+        status.failure = DeadlineFailure::stalled;
+    return status;
+}
+
+bool retryable_http_status(unsigned status) noexcept {
+    return status == 408U || status == 425U || status == 429U ||
+        status == 500U || status == 502U || status == 503U ||
+        status == 504U;
+}
+
+bool retryable_transport_failure(HttpFailureKind kind) noexcept {
+    return kind == HttpFailureKind::timeout ||
+        kind == HttpFailureKind::temporary_network;
+}
+
+std::string transport_failure_category(HttpFailureKind kind) {
+    switch (kind) {
+        case HttpFailureKind::timeout: return "request_timeout";
+        case HttpFailureKind::temporary_network: return "temporary_network";
+        case HttpFailureKind::tls: return "tls_failure";
+        case HttpFailureKind::protocol: return "protocol_failure";
+        case HttpFailureKind::cancelled: return "cancelled";
+        case HttpFailureKind::response_too_large: return "oversized_response";
+        case HttpFailureKind::local_io: return "local_io_failure";
+        case HttpFailureKind::other: return "http_error";
+        case HttpFailureKind::none: return "http_error";
+    }
+    return "http_error";
+}
+
+std::chrono::seconds exponential_retry_delay(
+    const RegistryRuntimePolicy& policy,
+    std::size_t failed_attempt) {
+    std::uint64_t delay =
+        static_cast<std::uint64_t>(policy.retry_initial.count());
+    const std::uint64_t cap =
+        static_cast<std::uint64_t>(policy.retry_maximum.count());
+    for (std::size_t index = 1U; index < failed_attempt && delay < cap; ++index) {
+        if (delay > cap / 2U) {
+            delay = cap;
+            break;
+        }
+        delay *= 2U;
+    }
+    return std::chrono::seconds(std::min(delay, cap));
+}
+
+std::optional<std::chrono::seconds> integer_retry_after(
+    const HttpResponse& response,
+    const RegistryRuntimePolicy& policy) {
+    if ((response.status != 429U && response.status != 503U) ||
+        !response.retry_after)
+        return std::nullopt;
+    const std::string_view text = *response.retry_after;
+    if (text.empty() ||
+        !std::all_of(text.begin(), text.end(), [](char c) {
+            return c >= '0' && c <= '9';
+        }))
+        return std::nullopt;
+    std::uint64_t seconds{};
+    const auto parsed =
+        std::from_chars(text.data(), text.data() + text.size(), seconds);
+    if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size())
+        return std::nullopt;
+    return std::chrono::seconds(std::min<std::uint64_t>(
+        seconds, static_cast<std::uint64_t>(policy.retry_maximum.count())));
+}
+
+bool persist_pages_metadata(
+    const std::filesystem::path& bundle,
+    std::string_view pages_jsonl,
+    Artifact& artifact,
+    std::string& error) {
+    if (!atomic_replace_file(
+            bundle / "raw/pages.jsonl", pages_jsonl, false, error))
+        return false;
+    return artifact_for(bundle, "raw/pages.jsonl", artifact, error);
+}
+
+bool persist_compact_checkpoint(
+    const std::filesystem::path& bundle,
+    const RegistryUrl& origin,
+    std::size_t completed_pages,
+    std::size_t completed_records,
+    const std::optional<std::string>& next_cursor,
+    const Artifact* last_page,
+    const Artifact& pages_artifact,
+    std::string& error) {
+    return atomic_replace_file(
+        bundle / "checkpoint.json",
+        compact_checkpoint_json(
+            origin, completed_pages, completed_records, next_cursor,
+            last_page, pages_artifact),
+        false, error);
 }
 
 }  // namespace
@@ -1447,480 +1970,798 @@ bool reconstruct_registry_checkpoint(
     return true;
 }
 
+
 bool collect_registry(
     const RegistryCollectOptions& options,
     std::string& message,
     HttpTransport transport) {
-    const auto run_started = std::chrono::steady_clock::now();
-    const auto preflight_fail = [&](std::string stage, std::string category,
-                                    std::string reason) {
-        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - run_started);
-        const auto budget = std::chrono::seconds(
-            options.limits.run_timeout_seconds);
+    const auto now = options.now ? options.now : [] {
+        return std::chrono::steady_clock::now();
+    };
+    const auto wait = options.wait ? options.wait :
+        [](std::chrono::steady_clock::duration duration) {
+        std::this_thread::sleep_for(duration);
+    };
+    const SteadyTime run_started = now();
+    const auto elapsed = [&] {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            now() - run_started);
+    };
+    const auto preflight_fail = [&](std::string reason) {
         registry_progress(
             options.verbose,
-            "failure stage=" + std::move(stage) +
-                " category=" + std::move(category) +
-                " page=1 completed_pages=0 completed_records=0 elapsed=" +
-                seconds_text(elapsed) +
-                " remaining=" + seconds_text(
-                    std::max(
-                        std::chrono::duration_cast<std::chrono::milliseconds>(
-                            budget - elapsed),
-                        std::chrono::milliseconds::zero())) +
-                " retained=none detail=" + progress_value(reason));
+            "failure stage=startup category=invalid_configuration page=1"
+            " completed_pages=0 completed_records=0 elapsed=" +
+                seconds_text(elapsed()) + " retained=none detail=" +
+                progress_value(reason));
         message = std::move(reason);
         return false;
     };
+
     RegistryUrl origin;
     if (!parse_registry_url(options.registry_base_url, origin, message))
-        return preflight_fail("startup", "invalid_configuration", message);
+        return preflight_fail(message);
     if (options.output.empty())
+        return preflight_fail("output bundle path is required");
+    if (options.limits.maximum_pages == 0U ||
+        options.limits.maximum_page_bytes == 0U ||
+        options.limits.maximum_records == 0U)
         return preflight_fail(
-            "startup", "invalid_configuration", "output bundle path is required");
-    if (options.limits.maximum_pages == 0U || options.limits.maximum_page_bytes == 0U ||
-        options.limits.maximum_records == 0U || options.limits.request_timeout_seconds == 0U ||
-        options.limits.run_timeout_seconds == 0U)
+            "page, byte, and record limits must be greater than zero");
+    if (!validate_runtime_policy(options.runtime, message))
+        return preflight_fail(message);
+
+    std::error_code filesystem_error;
+    if (std::filesystem::exists(options.output, filesystem_error))
         return preflight_fail(
-            "startup", "invalid_configuration",
-            "all configured limits except maximum redirects must be greater than zero");
-    std::error_code ec;
-    if (std::filesystem::exists(options.output, ec))
-        return preflight_fail(
-            "startup", "persistence_failure",
             "destination already exists: " + options.output.string());
     const std::filesystem::path parent =
         options.output.parent_path().empty() ? "." : options.output.parent_path();
-    if (!std::filesystem::exists(parent, ec))
-        return preflight_fail(
-            "startup", "persistence_failure",
-            "output parent directory does not exist");
+    if (!std::filesystem::exists(parent, filesystem_error))
+        return preflight_fail("output parent directory does not exist");
     const std::filesystem::path temporary =
-        parent / (options.output.filename().string() + ".partial-" + random_run_id());
-    if (!std::filesystem::create_directory(temporary, ec) || ec)
-        return preflight_fail(
-            "startup", "persistence_failure",
-            "cannot create temporary bundle directory");
-    std::filesystem::create_directories(temporary / "raw", ec);
-    std::filesystem::create_directories(temporary / "canonical", ec);
-    std::filesystem::create_directories(temporary / "diagnostics", ec);
-    const std::string started_at = utc_now();
-    const std::string run_id = random_run_id();
-    const auto run_deadline = run_started +
-        std::chrono::seconds(options.limits.run_timeout_seconds);
+        parent / (options.output.filename().string() + ".partial-" +
+                  random_run_id());
+    if (!std::filesystem::create_directory(temporary, filesystem_error) ||
+        filesystem_error)
+        return preflight_fail("cannot create temporary bundle directory");
+    for (const std::string_view directory :
+         {"raw", "canonical", "diagnostics"})
+        std::filesystem::create_directories(
+            temporary / directory, filesystem_error);
+    if (filesystem_error) {
+        message = "cannot create temporary bundle subdirectories; failed bundle retained at " +
+            temporary.string();
+        return false;
+    }
+
+    if (!transport) transport = curl_transport;
     const auto heartbeat_interval = std::max(
         options.heartbeat_interval, std::chrono::milliseconds(1'000));
-    if (!transport) transport = curl_transport;
-
+    const std::optional<SteadyTime> total_deadline =
+        options.runtime.run_timeout ?
+            std::optional<SteadyTime>(run_started + *options.runtime.run_timeout) :
+            std::nullopt;
+    std::optional<CollectionDeadlines> deadlines;
     std::vector<std::pair<std::string, std::string>> records;
+    std::map<std::string, std::string> identities;
     std::set<std::string> cursors;
-    std::string pages_jsonl;
     std::vector<std::string> raw_paths;
+    std::vector<Artifact> raw_artifacts;
+    std::string pages_jsonl;
     std::optional<std::string> cursor;
-    std::size_t pages = 0U;
-    bool collection_complete = false;
-    std::string failure_stage = "startup";
-    std::string failure_category = "persistence_failure";
-    std::size_t failure_page = 1U;
-    const auto elapsed = [&]() {
-        return std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - run_started);
-    };
-    const auto remaining = [&]() {
-        const auto value = std::chrono::duration_cast<std::chrono::milliseconds>(
-            run_deadline - std::chrono::steady_clock::now());
-        return std::max(value, std::chrono::milliseconds::zero());
-    };
+    std::size_t pages{};
+    std::size_t failure_page{1U};
+    std::size_t failure_attempt{};
+    std::string failure_stage{"startup"};
+    std::string failure_category{"persistence_failure"};
+    const std::string started_at = utc_now();
+    const std::string run_id = random_run_id();
+
     auto fail = [&](std::string reason) {
-        if (reason.size() > maximum_diagnostic_bytes) reason.resize(maximum_diagnostic_bytes);
+        if (reason.size() > maximum_diagnostic_bytes)
+            reason.resize(maximum_diagnostic_bytes);
         std::string diagnostic = "{\"error\":";
         append_json_string(diagnostic, reason);
         diagnostic += ",\"status\":\"failed\"}\n";
         std::string ignored;
-        write_file(temporary / "diagnostics/errors.jsonl", diagnostic, ignored);
-        const std::filesystem::path retained =
-            std::filesystem::exists(temporary) ? temporary : options.output;
-        registry_progress(
-            options.verbose,
-            "failure stage=" + failure_stage +
-                " category=" + failure_category +
-                " page=" + std::to_string(failure_page) +
-                " completed_pages=" + std::to_string(pages) +
-                " completed_records=" + std::to_string(records.size()) +
-                " elapsed=" + seconds_text(elapsed()) +
-                " remaining=" + seconds_text(remaining()) +
-                " retained=" + progress_value(retained.string()) +
-                " detail=" + progress_value(reason));
+        write_file(
+            temporary / "diagnostics/errors.jsonl", diagnostic, ignored);
+        std::string event =
+            "failure stage=" + failure_stage + " category=" + failure_category +
+            " page=" + std::to_string(failure_page);
+        if (failure_attempt != 0U)
+            event +=
+                (failure_category == "retry_budget_exhausted" ?
+                    " attempts=" : " attempt=") +
+                std::to_string(failure_attempt);
+        event += " completed_pages=" + std::to_string(pages) +
+            " completed_records=" + std::to_string(records.size());
+        if (deadlines)
+            event += " seconds_since_last_completed_page=" +
+                std::to_string(
+                    std::chrono::duration_cast<std::chrono::seconds>(
+                        nonnegative_duration(
+                            now(), deadlines->last_durable_progress)).count());
+        event += " elapsed=" + seconds_text(elapsed());
+        if (total_deadline)
+            event += " remaining_total=" +
+                seconds_text(nonnegative_duration(*total_deadline, now()));
+        event += " retained=" + progress_value(temporary.string()) +
+            " detail=" + progress_value(reason);
+        registry_progress(options.verbose, event);
         message = reason + "; failed bundle retained at " + temporary.string();
         return false;
+    };
+    const auto fail_deadline = [&](const DeadlineStatus& status) {
+        if (status.failure == DeadlineFailure::stalled) {
+            failure_stage = "progress_watchdog";
+            failure_category = "collection_stalled";
+            return fail(
+                "no registry page was durably committed before the stall deadline");
+        }
+        if (status.failure == DeadlineFailure::total) {
+            failure_stage = "runtime_policy";
+            failure_category = "total_run_deadline_exhausted";
+            return fail("total run deadline exhausted");
+        }
+        failure_stage = "runtime_policy";
+        failure_category = "deadline_state_error";
+        return fail("deadline wait reached zero without an expired deadline");
+    };
+    const auto deadline_status = [&] {
+        if (deadlines)
+            return classify_deadlines(*deadlines, options.runtime, now());
+        const auto observed_at = now();
+        return classify_deadlines(
+            CollectionDeadlines{observed_at, total_deadline},
+            options.runtime, observed_at);
     };
 
     registry_progress(
         options.verbose,
-        "mode=" + std::string(options.resume ? "resume" : "new") +
+        "mode=" + std::string(options.resume ? "resume" : "fresh") +
             " registry=" + progress_value(origin.normalized) +
             " output=" + progress_value(options.output.string()) +
             (options.resume ?
-                " resume_source=" + progress_value(options.resume->string()) : ""));
+                " resume_source=" + progress_value(options.resume->string()) :
+                ""));
     registry_progress(
         options.verbose,
         "request_timeout=" +
-            std::to_string(options.limits.request_timeout_seconds) +
-            "s run_timeout=" + std::to_string(options.limits.run_timeout_seconds) +
-            "s maximum_pages=" + std::to_string(options.limits.maximum_pages) +
-            " maximum_records=" + std::to_string(options.limits.maximum_records));
+            std::to_string(options.runtime.request_timeout.count()) +
+            "s stall_timeout=" +
+            std::to_string(options.runtime.stall_timeout.count()) +
+            "s run_timeout=" +
+            (options.runtime.run_timeout ?
+                std::to_string(options.runtime.run_timeout->count()) + "s" :
+                "unlimited") +
+            " maximum_attempts_per_page=" +
+            std::to_string(options.runtime.maximum_attempts_per_page) +
+            " retry_initial=" +
+            std::to_string(options.runtime.retry_initial.count()) +
+            "s retry_maximum=" +
+            std::to_string(options.runtime.retry_maximum.count()) + "s");
 
-    if (options.resume.has_value()) {
-        const std::filesystem::path& resume = *options.resume;
-        failure_stage = "checkpoint_loading";
-        failure_category = "checkpoint_validation_failure";
-        registry_progress(options.verbose, "resume checkpoint_load");
-        if (std::filesystem::equivalent(resume, options.output, ec) && !ec)
-            return fail("resume directory and output destination must differ");
-        if (!std::filesystem::exists(resume / "checkpoint.json", ec)) {
-            registry_progress(options.verbose, "resume checkpoint_reconstruct_start");
-            std::string checkpoint_message;
-            if (!reconstruct_registry_checkpoint(
-                    resume, origin.normalized, options.limits, checkpoint_message))
-                return fail("cannot reconstruct resume checkpoint: " + checkpoint_message);
-            registry_progress(options.verbose, "resume checkpoint_reconstruct_complete");
-        }
-        ReconstructedState state;
-        std::string resume_error;
-        registry_progress(options.verbose, "resume raw_artifact_validation_start");
-        if (!reconstruct_state(resume, origin, options.limits, state, resume_error))
-            return fail("invalid resume bundle: " + resume_error);
-        registry_progress(
-            options.verbose,
-            "resume raw_artifact_validation_complete pages=" +
-                std::to_string(state.completed_pages) +
-                " artifacts=" + std::to_string(state.artifacts.size() + 1U));
+    Artifact pages_artifact;
+    std::string error;
+    if (!persist_pages_metadata(temporary, "", pages_artifact, error) ||
+        !persist_compact_checkpoint(
+            temporary, origin, 0U, 0U, std::nullopt, nullptr,
+            pages_artifact, error))
+        return fail("cannot initialize compact checkpoint: " + error);
+
+    if (options.resume) {
         failure_stage = "checkpoint_validation";
+        failure_category = "checkpoint_validation_failure";
+        registry_progress(
+            options.verbose, "resume checkpoint_validation_start");
+        const auto& source = *options.resume;
+        if (!std::filesystem::is_directory(source, filesystem_error) ||
+            filesystem_error)
+            return fail("resume partial directory does not exist");
+        if (std::filesystem::exists(source / "_SUCCESS", filesystem_error))
+            return fail("cannot resume a completed bundle");
+        if (!std::filesystem::exists(
+                source / "checkpoint.json", filesystem_error)) {
+            registry_progress(
+                options.verbose, "resume checkpoint_reconstruct_start");
+            std::string reconstruction;
+            if (!reconstruct_registry_checkpoint(
+                    source, origin.normalized, options.limits, reconstruction))
+                return fail(
+                    "cannot reconstruct resume checkpoint: " + reconstruction);
+            registry_progress(
+                options.verbose, "resume checkpoint_reconstruct_complete");
+        }
+        std::uintmax_t checkpoint_version{};
+        std::size_t committed_pages{};
+        if (!checkpoint_head(
+                source / "checkpoint.json", checkpoint_version,
+                committed_pages, error))
+            return fail("invalid resume checkpoint: " + error);
+        ReconstructedState state;
+        if (!reconstruct_state(
+                source, origin, options.limits, state, error,
+                checkpoint_version == 2U ?
+                    std::optional<std::size_t>(committed_pages) :
+                    std::nullopt))
+            return fail("invalid resume bundle: " + error);
+        if (!checkpoint_matches(
+                source / "checkpoint.json", origin, state, error))
+            return fail("invalid resume checkpoint: " + error);
+        if (checkpoint_version == 2U &&
+            !read_file(
+                source / "raw/pages.jsonl", 128U * 1024U * 1024U,
+                state.pages_jsonl, error))
+            return fail("cannot read resume page metadata: " + error);
         registry_progress(
             options.verbose,
-            "resume checkpoint_validation pages=" +
+            "resume checkpoint_validation_complete completed_pages=" +
                 std::to_string(state.completed_pages) +
-                " artifacts=" + std::to_string(state.artifacts.size() + 1U));
-        if (!checkpoint_matches(
-                resume / "checkpoint.json", origin, state, resume_error))
-            return fail("invalid resume checkpoint: " + resume_error);
-        registry_progress(options.verbose, "resume checkpoint_validation_complete");
+                " completed_records=" +
+                std::to_string(state.records_received) +
+                " next_page=" +
+                std::to_string(state.completed_pages + 1U));
         failure_stage = "resume_copy";
         failure_category = "persistence_failure";
-        std::uintmax_t copied_bytes = 0U;
-        registry_progress(
-            options.verbose,
-            "resume copy_start pages=" + std::to_string(state.raw_paths.size()));
-        std::size_t copied_pages = 0U;
         for (const std::string& relative : state.raw_paths) {
             std::string body;
             if (!read_file(
-                    resume / relative, options.limits.maximum_page_bytes,
-                    body, resume_error) ||
-                !write_file(temporary / relative, body, resume_error))
-                return fail("cannot copy resume page: " + resume_error);
-            copied_bytes += body.size();
-            ++copied_pages;
-            if (copied_pages % 50U == 0U && copied_pages < state.raw_paths.size())
-                registry_progress(
-                    options.verbose,
-                    "resume copy pages=" + std::to_string(copied_pages) + "/" +
-                        std::to_string(state.raw_paths.size()) +
-                        " bytes=" + std::to_string(copied_bytes));
+                    source / relative, options.limits.maximum_page_bytes,
+                    body, error) ||
+                !atomic_replace_file(
+                    temporary / relative, body, true, error))
+                return fail("cannot copy resume page: " + error);
         }
-        registry_progress(
-            options.verbose,
-            "resume copy_complete pages=" + std::to_string(copied_pages) +
-                " bytes=" + std::to_string(copied_bytes));
         records = std::move(state.records);
         cursors = std::move(state.cursors);
-        pages_jsonl = std::move(state.pages_jsonl);
         raw_paths = std::move(state.raw_paths);
+        raw_artifacts = std::move(state.artifacts);
+        pages_jsonl = std::move(state.pages_jsonl);
         cursor = std::move(state.next_cursor);
         pages = state.completed_pages;
-        collection_complete = !cursor.has_value();
-        registry_progress(
-            options.verbose,
-            "resume continuation_page=" + std::to_string(pages + 1U) +
-                " " + cursor_progress(cursor));
+        if (!persist_pages_metadata(
+                temporary, pages_jsonl, pages_artifact, error) ||
+            !persist_compact_checkpoint(
+                temporary, origin, pages, records.size(), cursor,
+                raw_artifacts.empty() ? nullptr : &raw_artifacts.back(),
+                pages_artifact, error))
+            return fail("cannot persist resumed durable head: " + error);
+        for (const auto& [identity, canonical] : records) {
+            const auto [position, inserted] =
+                identities.emplace(identity, canonical);
+            if (!inserted && position->second != canonical)
+                return fail(
+                    "resume pages contain conflicting canonical identity");
+        }
     }
 
+    bool collection_complete = pages != 0U && !cursor;
     registry_progress(
         options.verbose,
         "completed_pages=" + std::to_string(pages) +
             " completed_records=" + std::to_string(records.size()) +
-            " next_page=" + std::to_string(pages + 1U) +
-            " next_cursor=" + std::string(cursor ? "yes" : "no") +
-            " " + cursor_progress(cursor));
+            " next_page=" + std::to_string(pages + 1U) + " " +
+            cursor_progress(cursor));
+    const SteadyTime pagination_started = now();
+    if (!collection_complete)
+        deadlines = CollectionDeadlines{now(), total_deadline};
 
     while (!collection_complete) {
         failure_page = pages + 1U;
-        failure_stage = "pagination";
-        failure_category = "persistence_failure";
-        if (pages >= options.limits.maximum_pages) return fail("maximum page count exceeded");
-        if (std::chrono::steady_clock::now() >= run_deadline) {
-            failure_category = "total_run_deadline_exhausted";
-            return fail("total run timeout exceeded");
+        failure_attempt = 1U;
+        if (pages >= options.limits.maximum_pages) {
+            failure_stage = "response_validation";
+            failure_category = "configured_page_limit_exceeded";
+            return fail("maximum page count exceeded");
         }
+        if (const auto status = deadline_status();
+            status.failure != DeadlineFailure::none)
+            return fail_deadline(status);
         const std::string request_url = registry_api_url(
-            origin, cursor ? std::optional<std::string_view>(*cursor) : std::nullopt);
-        std::string current_url = request_url;
+            origin, cursor ?
+                std::optional<std::string_view>(*cursor) : std::nullopt);
+        const SteadyTime page_started = now();
         HttpResponse response;
-        std::size_t redirects = 0U;
-        const auto page_started = std::chrono::steady_clock::now();
-        while (true) {
-            const auto remaining_duration =
-                run_deadline - std::chrono::steady_clock::now();
-            const auto remaining_milliseconds =
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    remaining_duration).count();
-            if (remaining_milliseconds <= 0) {
-                failure_category = "total_run_deadline_exhausted";
-                return fail("total run timeout exceeded");
+        std::size_t redirects{};
+        bool response_accepted{};
+
+        for (std::size_t attempt = 1U;
+             attempt <= options.runtime.maximum_attempts_per_page; ++attempt) {
+            failure_attempt = attempt;
+            std::string current_url = request_url;
+            redirects = 0U;
+            bool retryable{};
+            std::string retry_category;
+            std::string transport_error;
+            while (true) {
+                const auto request_deadlines = deadline_status();
+                if (request_deadlines.failure != DeadlineFailure::none)
+                    return fail_deadline(request_deadlines);
+                auto request_timeout =
+                    std::chrono::duration_cast<
+                        std::chrono::steady_clock::duration>(
+                        options.runtime.request_timeout);
+                if (request_deadlines.remaining_total)
+                    request_timeout = std::min(
+                        request_timeout,
+                        *request_deadlines.remaining_total);
+                std::string request_event =
+                    "page=" + std::to_string(failure_page) +
+                    " attempt=" + std::to_string(attempt) + "/" +
+                    std::to_string(
+                        options.runtime.maximum_attempts_per_page) +
+                    " request_start elapsed=" + seconds_text(elapsed());
+                if (total_deadline)
+                    request_event += " remaining_total=" +
+                        seconds_text(
+                            std::chrono::duration_cast<
+                                std::chrono::milliseconds>(
+                                *request_deadlines.remaining_total));
+                request_event += " request_timeout=" +
+                    seconds_text(
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            request_timeout)) +
+                    " since_last_page=" +
+                    seconds_text(
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            request_deadlines
+                                .since_last_durable_progress)) +
+                    " " + cursor_progress(cursor);
+                registry_progress(options.verbose, request_event);
+                const HttpHeartbeat heartbeat =
+                    [&](std::chrono::milliseconds request_wait) {
+                        const auto heartbeat_deadlines =
+                            deadline_status();
+                        if (heartbeat_deadlines.failure !=
+                            DeadlineFailure::none)
+                            return HttpWaitDecision{
+                                false,
+                                std::chrono::steady_clock::duration::zero()};
+                        registry_progress(
+                            options.verbose,
+                            "heartbeat state=request_wait page=" +
+                                std::to_string(failure_page) +
+                                " attempt=" + std::to_string(attempt) + "/" +
+                                std::to_string(
+                                    options.runtime.maximum_attempts_per_page) +
+                                " request_wait=" +
+                                std::to_string(
+                                    std::chrono::duration_cast<
+                                        std::chrono::seconds>(
+                                        request_wait).count()) +
+                                "s since_last_page=" +
+                                std::to_string(
+                                    std::chrono::duration_cast<
+                                        std::chrono::seconds>(
+                                        heartbeat_deadlines
+                                            .since_last_durable_progress)
+                                        .count()) +
+                                "s completed_pages=" +
+                                std::to_string(pages) +
+                                " completed_records=" +
+                                std::to_string(records.size()) +
+                                " elapsed=" +
+                                std::to_string(
+                                    std::chrono::duration_cast<
+                                        std::chrono::seconds>(
+                                        elapsed()).count()) + "s");
+                        return HttpWaitDecision{
+                            true,
+                            std::min(
+                                std::chrono::duration_cast<
+                                    std::chrono::steady_clock::duration>(
+                                    heartbeat_interval),
+                                heartbeat_deadlines.until_next_deadline)};
+                    };
+                const auto request_heartbeat_interval = std::min(
+                    std::chrono::duration_cast<
+                        std::chrono::steady_clock::duration>(
+                        heartbeat_interval),
+                    request_deadlines.until_next_deadline);
+                if (request_heartbeat_interval <=
+                    std::chrono::steady_clock::duration::zero())
+                    return fail_deadline(deadline_status());
+                failure_stage = "http_request";
+                response = {};
+                if (!transport(
+                        current_url,
+                        request_timeout,
+                        options.limits.maximum_page_bytes, response,
+                        transport_error, heartbeat,
+                        request_heartbeat_interval)) {
+                    if (const auto status = deadline_status();
+                        status.failure != DeadlineFailure::none)
+                        return fail_deadline(status);
+                    retryable =
+                        retryable_transport_failure(response.failure_kind);
+                    retry_category =
+                        transport_failure_category(response.failure_kind);
+                    if (!retryable) {
+                        failure_category = retry_category;
+                        return fail("HTTP request failed: " + transport_error);
+                    }
+                    break;
+                }
+                RegistryUrl effective;
+                const std::size_t query = response.effective_url.find('?');
+                failure_stage = "response_validation";
+                failure_category = "malformed_response";
+                if (!parse_registry_url(
+                        std::string_view(response.effective_url).substr(
+                            0U, query),
+                        effective, transport_error) ||
+                    !registry_same_origin(origin, effective))
+                    return fail(
+                        "HTTP response effective URL is outside configured origin");
+                if (query != std::string::npos)
+                    effective.normalized +=
+                        response.effective_url.substr(query);
+                response.effective_url = effective.normalized;
+                if (response.status < 300U || response.status >= 400U) {
+                    retryable = retryable_http_status(response.status);
+                    retry_category =
+                        "http_" + std::to_string(response.status);
+                    break;
+                }
+                if (!response.location) {
+                    failure_category = "redirect_policy_failure";
+                    return fail("redirect response is missing Location");
+                }
+                if (redirects >= options.limits.maximum_redirects) {
+                    failure_category = "redirect_policy_failure";
+                    return fail("maximum redirect count exceeded");
+                }
+                if (!resolve_redirect(
+                        origin, current_url, *response.location,
+                        current_url, transport_error)) {
+                    failure_category = "redirect_policy_failure";
+                    return fail(transport_error);
+                }
+                ++redirects;
             }
-            const auto remaining_seconds =
-                (remaining_milliseconds + 999LL) / 1000LL;
-            const unsigned timeout = std::min(
-                options.limits.request_timeout_seconds,
-                static_cast<unsigned>(remaining_seconds));
+            if (!retryable) {
+                if (response.status != 200U) {
+                    failure_category = "http_error";
+                    return fail(
+                        "registry returned HTTP " +
+                        std::to_string(response.status));
+                }
+                response_accepted = true;
+                break;
+            }
+            if (attempt == options.runtime.maximum_attempts_per_page) {
+                failure_stage = "http_request";
+                failure_category = "retry_budget_exhausted";
+                return fail(
+                    "retry budget exhausted after " +
+                    std::to_string(attempt) + " attempts");
+            }
+            const auto retry_delay =
+                integer_retry_after(response, options.runtime).value_or(
+                    exponential_retry_delay(options.runtime, attempt));
             registry_progress(
                 options.verbose,
-                "page=" + std::to_string(pages + 1U) +
-                    " attempt=1 request_start elapsed=" + seconds_text(elapsed()) +
-                    " remaining=" + seconds_text(
-                        std::chrono::milliseconds(remaining_milliseconds)) +
-                    " timeout=" + std::to_string(timeout) + ".0s " +
-                    cursor_progress(cursor));
-            std::string transport_error;
-            const HttpHeartbeat heartbeat = [&](std::chrono::milliseconds waiting) {
+                "page=" + std::to_string(failure_page) +
+                    " attempt=" + std::to_string(attempt) + "/" +
+                    std::to_string(
+                        options.runtime.maximum_attempts_per_page) +
+                    (response.status != 0U ?
+                        " retryable_http_status=" +
+                            std::to_string(response.status) :
+                        " retryable_failure category=" + retry_category) +
+                    " retry_in=" +
+                    std::to_string(retry_delay.count()) + "s");
+            auto retry_remaining =
+                std::chrono::duration_cast<
+                    std::chrono::steady_clock::duration>(
+                    retry_delay);
+            while (retry_remaining >
+                   std::chrono::steady_clock::duration::zero()) {
+                const auto before_wait = deadline_status();
+                if (before_wait.failure != DeadlineFailure::none)
+                    return fail_deadline(before_wait);
+                auto chunk = std::min(
+                    retry_remaining,
+                    std::chrono::duration_cast<
+                        std::chrono::steady_clock::duration>(
+                        heartbeat_interval));
+                chunk = std::min(
+                    chunk, before_wait.until_next_deadline);
+                if (chunk <=
+                    std::chrono::steady_clock::duration::zero())
+                    return fail_deadline(deadline_status());
+                wait(chunk);
+                retry_remaining -= chunk;
+                const auto after_wait = deadline_status();
+                if (after_wait.failure != DeadlineFailure::none)
+                    return fail_deadline(after_wait);
                 registry_progress(
                     options.verbose,
-                    "page=" + std::to_string(pages + 1U) +
-                        " attempt=1 waiting=" +
+                    "heartbeat state=retry_backoff page=" +
+                        std::to_string(failure_page) +
+                        " next_attempt=" +
+                        std::to_string(attempt + 1U) + "/" +
+                        std::to_string(
+                            options.runtime.maximum_attempts_per_page) +
+                        " retry_remaining=" +
                         std::to_string(
                             std::chrono::duration_cast<std::chrono::seconds>(
-                                waiting).count()) +
-                        "s remaining=" + seconds_text(remaining()));
-            };
+                                std::max(
+                                    retry_remaining,
+                                    std::chrono::steady_clock::duration::zero()))
+                                .count()) +
+                        "s since_last_page=" +
+                        std::to_string(
+                            std::chrono::duration_cast<std::chrono::seconds>(
+                                after_wait.since_last_durable_progress)
+                                .count()) +
+                        "s completed_pages=" + std::to_string(pages) +
+                        " completed_records=" +
+                        std::to_string(records.size()) +
+                        " elapsed=" +
+                        std::to_string(
+                            std::chrono::duration_cast<std::chrono::seconds>(
+                                elapsed()).count()) + "s");
+            }
+            if (const auto status = deadline_status();
+                status.failure != DeadlineFailure::none)
+                return fail_deadline(status);
+        }
+        if (!response_accepted) {
             failure_stage = "http_request";
-            if (!transport(current_url, timeout, options.limits.maximum_page_bytes,
-                           response, transport_error, heartbeat, heartbeat_interval)) {
-                const bool deadline_limited =
-                    timeout < options.limits.request_timeout_seconds;
-                const bool deadline_reached =
-                    std::chrono::steady_clock::now() >= run_deadline;
-                if (deadline_limited || deadline_reached) {
-                    failure_category = "total_run_deadline_exhausted";
-                    return fail("total run deadline exhausted during HTTP request: " +
-                        transport_error);
-                }
-                const std::string lowered = lower_ascii(transport_error);
-                failure_category =
-                    lowered.find("connect") != std::string::npos &&
-                            lowered.find("tim") != std::string::npos ?
-                        "connect_timeout" :
-                        (lowered.find("tim") != std::string::npos ?
-                            "request_timeout" : "http_error");
-                return fail("HTTP request failed: " + transport_error);
-            }
-            RegistryUrl effective;
-            const std::size_t effective_query = response.effective_url.find('?');
-            failure_stage = "response_validation";
-            failure_category = "malformed_response";
-            if (!parse_registry_url(
-                    std::string_view(response.effective_url).substr(0U, effective_query),
-                    effective, transport_error) ||
-                !registry_same_origin(origin, effective))
-                return fail("HTTP response effective URL is outside configured origin");
-            if (effective_query != std::string::npos)
-                effective.normalized += response.effective_url.substr(effective_query);
-            response.effective_url = effective.normalized;
-            if (response.status < 300U || response.status >= 400U) break;
-            if (!response.location.has_value()) {
-                failure_category = "http_error";
-                return fail("redirect response is missing Location");
-            }
-            if (redirects >= options.limits.maximum_redirects) {
-                failure_category = "http_error";
-                return fail("maximum redirect count exceeded");
-            }
-            if (!resolve_redirect(origin, current_url, *response.location, current_url, transport_error)) {
-                failure_category = "http_error";
-                return fail(transport_error);
-            }
-            ++redirects;
+            failure_category = "retry_budget_exhausted";
+            return fail("retry budget exhausted");
         }
-        if (response.status != 200U) {
-            failure_category = "http_error";
-            return fail("registry returned HTTP " + std::to_string(response.status));
-        }
+
+        failure_stage = "response_validation";
+        failure_category = "malformed_response";
         if (response.body.size() > options.limits.maximum_page_bytes)
             return fail("registry page exceeds configured byte limit");
-        const std::string content_type = lower_ascii(response.content_type);
-        if (!content_type.starts_with("application/json"))
-            return fail("registry response content type is not application/json");
-        const std::size_t page_number = pages + 1U;
-        failure_page = page_number;
-        failure_stage = "page_persistence";
-        failure_category = "persistence_failure";
-        std::ostringstream page_name;
-        page_name << "raw/page-" << std::setw(6) << std::setfill('0')
-                  << page_number << ".json";
-        const std::string raw_path = page_name.str();
-        std::string error;
-        if (!write_file(temporary / raw_path, response.body, error)) return fail(error);
-        raw_paths.push_back(raw_path);
-        std::string raw_sha;
-        if (!sha256_file(temporary / raw_path, raw_sha, error)) return fail(error);
+        if (!lower_ascii(response.content_type).starts_with(
+                "application/json"))
+            return fail(
+                "registry response content type is not application/json");
+        std::vector<std::pair<std::string, std::string>> page_records;
         std::optional<std::string> next_cursor;
-        const std::size_t before = records.size();
-        if (!parse_page(response.body, temporary, records, next_cursor, error)) {
-            records.resize(before);
-            failure_stage = "response_validation";
-            failure_category = "malformed_response";
+        if (!parse_page(
+                response.body, temporary, page_records, next_cursor, error))
             return fail("invalid registry JSON: " + error);
-        }
-        if (std::chrono::steady_clock::now() >= run_deadline) {
-            records.resize(before);
-            failure_category = "total_run_deadline_exhausted";
-            return fail("total run timeout exceeded");
-        }
-        if (records.size() > options.limits.maximum_records) {
-            records.resize(before);
+        const std::size_t page_record_count = page_records.size();
+        if (page_records.size() >
+            options.limits.maximum_records - records.size()) {
+            failure_category = "configured_record_limit_exceeded";
             return fail("maximum record count exceeded");
         }
-        ++pages;
-        const std::string retrieved_at = utc_now();
+        if (next_cursor && cursors.contains(*next_cursor))
+            return fail("repeated pagination cursor detected");
+        std::map<std::string, std::string> page_identities;
+        for (const auto& [identity, canonical] : page_records) {
+            const auto committed = identities.find(identity);
+            if (committed != identities.end() &&
+                committed->second != canonical)
+                return fail(
+                    "duplicate canonical identity has conflicting content");
+            const auto [position, inserted] =
+                page_identities.emplace(identity, canonical);
+            if (!inserted && position->second != canonical)
+                return fail(
+                    "duplicate canonical identity has conflicting content");
+        }
+        if (const auto status = deadline_status();
+            status.failure != DeadlineFailure::none)
+            return fail_deadline(status);
+
+        const std::size_t page_number = pages + 1U;
+        std::ostringstream name;
+        name << "raw/page-" << std::setw(6) << std::setfill('0')
+             << page_number << ".json";
+        const std::string raw_path = name.str();
+        failure_stage = "page_persistence";
+        failure_category = "persistence_failure";
+        if (!atomic_replace_file(
+                temporary / raw_path, response.body, true, error))
+            return fail(error);
+        Artifact raw_artifact;
+        if (!artifact_for(
+                temporary, raw_path, raw_artifact, error))
+            return fail(error);
         std::string metadata = "{\"content_type\":";
         append_json_string(metadata, response.content_type);
         metadata += ",\"effective_response_url\":";
         append_json_string(metadata, response.effective_url);
-        metadata += ",\"http_status\":" + std::to_string(response.status) +
-            ",\"page_number\":" + std::to_string(pages) + ",\"pagination_input\":";
-        if (cursor) append_json_string(metadata, *cursor); else metadata += "null";
+        metadata += ",\"http_status\":" +
+            std::to_string(response.status) +
+            ",\"page_number\":" + std::to_string(page_number) +
+            ",\"pagination_input\":";
+        if (cursor) append_json_string(metadata, *cursor);
+        else metadata += "null";
         metadata += ",\"pagination_output\":";
-        if (next_cursor) append_json_string(metadata, *next_cursor); else metadata += "null";
+        if (next_cursor) append_json_string(metadata, *next_cursor);
+        else metadata += "null";
         metadata += ",\"path\":";
         append_json_string(metadata, raw_path);
-        metadata += ",\"records\":" + std::to_string(records.size() - before) +
-            ",\"redirect_count\":" + std::to_string(redirects) + ",\"request_url\":";
+        metadata += ",\"records\":" +
+            std::to_string(page_records.size()) +
+            ",\"redirect_count\":" + std::to_string(redirects) +
+            ",\"request_url\":";
         append_json_string(metadata, request_url);
-        metadata += ",\"response_bytes\":" + std::to_string(response.body.size()) +
+        metadata += ",\"response_bytes\":" +
+            std::to_string(response.body.size()) +
             ",\"retrieved_at\":";
-        append_json_string(metadata, retrieved_at);
+        append_json_string(metadata, utc_now());
         metadata += ",\"sha256\":";
-        append_json_string(metadata, raw_sha);
+        append_json_string(metadata, raw_artifact.sha256);
         metadata += "}\n";
-        pages_jsonl += metadata;
+
+        const std::string previous_metadata = pages_jsonl;
+        const std::string candidate_metadata = pages_jsonl + metadata;
+        failure_stage = "checkpoint_persistence";
+        failure_category = "checkpoint_persistence_failure";
+        if (!persist_pages_metadata(
+                temporary, candidate_metadata, pages_artifact, error))
+            return fail(error);
+        if (!persist_compact_checkpoint(
+                temporary, origin, page_number,
+                records.size() + page_records.size(), next_cursor,
+                &raw_artifact, pages_artifact, error)) {
+            Artifact ignored_artifact;
+            std::string ignored_error;
+            persist_pages_metadata(
+                temporary, previous_metadata,
+                ignored_artifact, ignored_error);
+            return fail("cannot persist compact checkpoint: " + error);
+        }
+
+        pages = page_number;
+        pages_jsonl = candidate_metadata;
+        raw_paths.push_back(raw_path);
+        raw_artifacts.push_back(raw_artifact);
+        records.insert(
+            records.end(),
+            std::make_move_iterator(page_records.begin()),
+            std::make_move_iterator(page_records.end()));
+        for (auto& [identity, canonical] : page_identities)
+            identities.emplace(
+                std::move(identity), std::move(canonical));
+        if (next_cursor) cursors.insert(*next_cursor);
+        cursor = next_cursor;
+        deadlines->last_durable_progress = now();
         registry_progress(
             options.verbose,
             "page=" + std::to_string(pages) +
                 " status=" + std::to_string(response.status) +
                 " bytes=" + std::to_string(response.body.size()) +
-                " duration=" + seconds_text(
+                " duration=" +
+                seconds_text(
                     std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::steady_clock::now() - page_started)) +
-                " records=" + std::to_string(records.size() - before) +
+                        now() - page_started)) +
+                " records=" + std::to_string(page_record_count) +
                 " total_records=" + std::to_string(records.size()) +
                 " completed_pages=" + std::to_string(pages) +
-                " next_cursor=" + std::string(next_cursor ? "yes" : "no") +
-                " saved=" + raw_path + " checkpoint=not_applicable");
-        if (!next_cursor.has_value()) {
-            collection_complete = true;
-            break;
-        }
-        if (!cursors.insert(*next_cursor).second) return fail("repeated pagination cursor detected");
-        cursor = std::move(next_cursor);
+                " next_cursor=" +
+                std::string(next_cursor ? "yes" : "no") +
+                " saved=" + raw_path + " checkpoint=committed");
+        collection_complete = !next_cursor;
     }
 
+    const SteadyTime pagination_finished = now();
     registry_progress(
         options.verbose,
-        "pagination_complete pages=" + std::to_string(pages) +
+        "timing phase=pagination duration=" +
+            seconds_text(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    pagination_finished - pagination_started)) +
+            " pages=" + std::to_string(pages) +
             " records=" + std::to_string(records.size()));
+    if (const auto status = deadline_status();
+        status.failure == DeadlineFailure::total)
+        return fail_deadline(status);
+
+    failure_attempt = 0U;
     failure_stage = "canonicalization";
     failure_category = "canonicalization_failure";
-    registry_progress(options.verbose, "canonicalization_start");
-    std::sort(records.begin(), records.end(), [](const auto& left, const auto& right) {
-        return left.first < right.first || (left.first == right.first && left.second < right.second);
-    });
+    const SteadyTime canonicalization_started = now();
+    std::sort(
+        records.begin(), records.end(),
+        [](const auto& left, const auto& right) {
+            return left.first < right.first ||
+                (left.first == right.first &&
+                 left.second < right.second);
+        });
     std::string canonical;
-    std::size_t unique = 0U;
-    for (std::size_t i = 0U; i < records.size();) {
-        std::size_t end = i + 1U;
-        while (end < records.size() && records[end].first == records[i].first) {
-            if (records[end].second != records[i].second)
-                return fail("duplicate canonical identity has conflicting content");
+    std::size_t unique{};
+    for (std::size_t index = 0U; index < records.size();) {
+        std::size_t end = index + 1U;
+        while (end < records.size() &&
+               records[end].first == records[index].first) {
+            if (records[end].second != records[index].second)
+                return fail(
+                    "duplicate canonical identity has conflicting content");
             ++end;
         }
-        canonical += records[i].second;
+        canonical += records[index].second;
         ++unique;
-        i = end;
-        if (unique % 10'000U == 0U)
-            registry_progress(
-                options.verbose,
-                "canonicalization progress_records=" + std::to_string(i) + "/" +
-                    std::to_string(records.size()) +
-                    " unique_versions=" + std::to_string(unique));
+        index = end;
     }
     registry_progress(
         options.verbose,
-        "canonicalization_complete unique_versions=" + std::to_string(unique));
-    std::string error;
-    if (std::chrono::steady_clock::now() >= run_deadline) {
-        failure_category = "total_run_deadline_exhausted";
-        return fail("total run timeout exceeded");
-    }
+        "timing phase=canonicalization duration=" +
+            seconds_text(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now() - canonicalization_started)) +
+            " records=" + std::to_string(records.size()));
+    if (const auto status = deadline_status();
+        status.failure == DeadlineFailure::total)
+        return fail_deadline(status);
+
     failure_stage = "artifact_persistence";
     failure_category = "persistence_failure";
-    if (!write_file(temporary / "raw/pages.jsonl", pages_jsonl, error) ||
-        !write_file(temporary / "canonical/servers.jsonl", canonical, error) ||
-        !write_file(temporary / "diagnostics/errors.jsonl", "", error)) return fail(error);
+    if (!write_file(
+            temporary / "canonical/servers.jsonl", canonical, error) ||
+        !write_file(
+            temporary / "diagnostics/errors.jsonl", "", error))
+        return fail(error);
+    const SteadyTime manifest_started = now();
     failure_stage = "manifest_generation";
-    registry_progress(options.verbose, "manifest_generation");
     std::vector<Artifact> artifacts;
     for (const std::string& raw : raw_paths) {
         Artifact artifact;
-        if (!artifact_for(temporary, raw, artifact, error)) return fail(error);
+        if (!artifact_for(temporary, raw, artifact, error))
+            return fail(error);
         artifacts.push_back(std::move(artifact));
-        if (artifacts.size() % 50U == 0U && artifacts.size() < raw_paths.size())
-            registry_progress(
-                options.verbose,
-                "manifest_generation artifacts=" +
-                    std::to_string(artifacts.size()) + "/" +
-                    std::to_string(raw_paths.size() + 3U));
     }
-    for (const std::string relative :
-         {"raw/pages.jsonl", "canonical/servers.jsonl", "diagnostics/errors.jsonl"}) {
+    for (const std::string_view relative :
+         {"raw/pages.jsonl", "canonical/servers.jsonl",
+          "diagnostics/errors.jsonl"}) {
         Artifact artifact;
-        if (!artifact_for(temporary, relative, artifact, error)) return fail(error);
+        if (!artifact_for(
+                temporary, std::string(relative), artifact, error))
+            return fail(error);
         artifacts.push_back(std::move(artifact));
     }
     std::string snapshot_sha;
-    if (!sha256_file(temporary / "canonical/servers.jsonl", snapshot_sha, error)) return fail(error);
-    const std::string completed_at = utc_now();
+    if (!sha256_file(
+            temporary / "canonical/servers.jsonl", snapshot_sha, error))
+        return fail(error);
     std::string manifest = "{\"artifacts\":[";
-    for (std::size_t i = 0U; i < artifacts.size(); ++i) {
-        if (i != 0U) manifest.push_back(',');
-        manifest += artifact_json(artifacts[i]);
+    for (std::size_t index = 0U; index < artifacts.size(); ++index) {
+        if (index != 0U) manifest.push_back(',');
+        manifest += artifact_json(artifacts[index]);
     }
     manifest += "],\"bundle_version\":1,\"collector\":{\"git_commit\":";
     append_json_string(manifest, MCPO_GIT_COMMIT);
     manifest += ",\"name\":\"mcp-observatory\",\"version\":";
     append_json_string(manifest, MCPO_VERSION);
     manifest += "},\"completed_at\":";
-    append_json_string(manifest, completed_at);
+    append_json_string(manifest, utc_now());
     manifest += ",\"counts\":{\"pages\":" + std::to_string(pages) +
         ",\"records_received\":" + std::to_string(records.size()) +
         ",\"unique_server_versions\":" + std::to_string(unique) +
-        "},\"limits\":{\"maximum_page_bytes\":" +
-        std::to_string(options.limits.maximum_page_bytes) + ",\"maximum_pages\":" +
-        std::to_string(options.limits.maximum_pages) + ",\"maximum_records\":" +
-        std::to_string(options.limits.maximum_records) + ",\"maximum_redirects\":" +
-        std::to_string(options.limits.maximum_redirects) + ",\"request_timeout_seconds\":" +
-        std::to_string(options.limits.request_timeout_seconds) + ",\"run_timeout_seconds\":" +
-        std::to_string(options.limits.run_timeout_seconds) + "},\"registry\":\"official-mcp\","
-        "\"registry_base_url\":";
+        "},\"limits\":{\"maximum_attempts_per_page\":" +
+        std::to_string(options.runtime.maximum_attempts_per_page) +
+        ",\"maximum_page_bytes\":" +
+        std::to_string(options.limits.maximum_page_bytes) +
+        ",\"maximum_pages\":" +
+        std::to_string(options.limits.maximum_pages) +
+        ",\"maximum_records\":" +
+        std::to_string(options.limits.maximum_records) +
+        ",\"maximum_redirects\":" +
+        std::to_string(options.limits.maximum_redirects) +
+        ",\"request_timeout_seconds\":" +
+        std::to_string(options.runtime.request_timeout.count()) +
+        ",\"retry_initial_seconds\":" +
+        std::to_string(options.runtime.retry_initial.count()) +
+        ",\"retry_maximum_seconds\":" +
+        std::to_string(options.runtime.retry_maximum.count()) +
+        ",\"run_timeout_seconds\":" +
+        std::to_string(
+            options.runtime.run_timeout ?
+                options.runtime.run_timeout->count() : 0) +
+        ",\"stall_timeout_seconds\":" +
+        std::to_string(options.runtime.stall_timeout.count()) +
+        "},\"registry\":\"official-mcp\",\"registry_base_url\":";
     append_json_string(manifest, origin.normalized);
     manifest += ",\"run_id\":";
     append_json_string(manifest, run_id);
@@ -1929,52 +2770,74 @@ bool collect_registry(
     manifest += ",\"started_at\":";
     append_json_string(manifest, started_at);
     manifest += ",\"status\":\"complete\"}\n";
-    if (!write_file(temporary / "manifest.json", manifest, error)) return fail(error);
+    if (!write_file(temporary / "manifest.json", manifest, error))
+        return fail(error);
+    registry_progress(
+        options.verbose,
+        "timing phase=manifest_generation duration=" +
+            seconds_text(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                now() - manifest_started)) +
+            " artifacts=" + std::to_string(artifacts.size()));
+    if (const auto status = deadline_status();
+        status.failure == DeadlineFailure::total)
+        return fail_deadline(status);
+
+    const SteadyTime validation_started = now();
     failure_stage = "final_validation";
     failure_category = "final_validation_failure";
-    registry_progress(options.verbose, "final_bundle_validation");
     std::string validation;
     if (!validate_bundle_impl(temporary, false, validation))
         return fail("bundle self-validation failed: " + validation);
-    registry_progress(options.verbose, "validation_complete");
-    failure_stage = "success_marker";
-    failure_category = "persistence_failure";
-    registry_progress(options.verbose, "success_marker_create path=_SUCCESS");
-    if (!write_file(temporary / "_SUCCESS", "", error)) return fail(error);
-    if (!sync_directory(temporary / "raw", error) ||
-        !sync_directory(temporary / "canonical", error) ||
-        !sync_directory(temporary / "diagnostics", error) ||
-        !sync_directory(temporary, error)) return fail(error);
-    failure_stage = "atomic_promotion";
     registry_progress(
         options.verbose,
-        "atomic_promotion from=" + progress_value(temporary.string()) +
-            " to=" + progress_value(options.output.string()));
-    if (!promote_without_replace(temporary, options.output, error)) return fail(error);
+        "timing phase=final_validation duration=" +
+            seconds_text(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now() - validation_started)) +
+            " artifacts=" + std::to_string(artifacts.size()));
+    if (const auto status = deadline_status();
+        status.failure == DeadlineFailure::total)
+        return fail_deadline(status);
+
+    failure_stage = "success_marker";
+    failure_category = "persistence_failure";
+    if (!write_file(temporary / "_SUCCESS", "", error) ||
+        !sync_directory(temporary / "raw", error) ||
+        !sync_directory(temporary / "canonical", error) ||
+        !sync_directory(temporary / "diagnostics", error) ||
+        !sync_directory(temporary, error))
+        return fail(error);
+    const SteadyTime promotion_started = now();
+    failure_stage = "atomic_promotion";
+    if (!promote_without_replace(temporary, options.output, error))
+        return fail(error);
     if (!sync_directory(parent, error)) {
-        registry_progress(
-            options.verbose,
-            "failure stage=atomic_promotion category=persistence_failure"
-                " page=" + std::to_string(failure_page) +
-                " completed_pages=" + std::to_string(pages) +
-                " completed_records=" + std::to_string(records.size()) +
-                " elapsed=" + seconds_text(elapsed()) +
-                " remaining=" + seconds_text(remaining()) +
-                " retained=" + progress_value(options.output.string()) +
-                " detail=" + progress_value(error));
-        message = "bundle promoted but parent-directory flush failed: " + error;
+        message =
+            "bundle promoted but parent-directory flush failed: " + error;
         return false;
     }
-    message = "registry collection complete: pages=" + std::to_string(pages) +
-        " records=" + std::to_string(records.size()) + " unique=" + std::to_string(unique) +
-        " snapshot_sha256=" + snapshot_sha;
+    registry_progress(
+        options.verbose,
+        "timing phase=atomic_promotion duration=" +
+            seconds_text(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now() - promotion_started)));
+    registry_progress(
+        options.verbose,
+        "timing phase=total duration=" + seconds_text(elapsed()) +
+            " pages=" + std::to_string(pages) +
+            " records=" + std::to_string(records.size()));
     registry_progress(
         options.verbose,
         "success output=" + progress_value(options.output.string()) +
             " pages=" + std::to_string(pages) +
             " records=" + std::to_string(records.size()) +
-            " unique_versions=" + std::to_string(unique) +
-            " duration=" + seconds_text(elapsed()));
+            " unique_versions=" + std::to_string(unique));
+    message = "registry collection complete: pages=" +
+        std::to_string(pages) + " records=" +
+        std::to_string(records.size()) + " unique=" +
+        std::to_string(unique) + " snapshot_sha256=" + snapshot_sha;
     return true;
 }
 

@@ -33,7 +33,14 @@ void print_usage(std::ostream& out) {
         << "  mcp-observatory registry search DATABASE QUERY [OPTIONS]\n"
         << "  mcp-observatory registry show DATABASE SERVER_NAME [OPTIONS]\n"
         << "  mcp-observatory registry list DATABASE [OPTIONS]\n"
-        << "  mcp-observatory bundle validate DIRECTORY\n";
+        << "  mcp-observatory bundle validate DIRECTORY\n"
+        << "\nregistry collect runtime options:\n"
+        << "  --request-timeout-seconds N   one HTTP attempt (default 60)\n"
+        << "  --stall-timeout-seconds N     no durable page completion (default 300)\n"
+        << "  --run-timeout-seconds N       total runtime; 0 is unlimited (default 0)\n"
+        << "  --maximum-attempts-per-page N attempts including first (default 8)\n"
+        << "  --retry-initial-seconds N     initial backoff (default 2)\n"
+        << "  --retry-maximum-seconds N     maximum backoff (default 120)\n";
 }
 
 bool parse_size(std::string_view text, std::size_t& value) {
@@ -377,9 +384,31 @@ int run_registry_collect(int argc, char** argv) {
         } else if (argument == "--maximum-redirects") {
             if (!parse_size(value, options.limits.maximum_redirects)) return 1;
         } else if (argument == "--request-timeout-seconds") {
-            if (!parse_unsigned(value, options.limits.request_timeout_seconds)) return 1;
+            unsigned parsed{};
+            if (!parse_unsigned(value, parsed)) return 1;
+            options.runtime.request_timeout = std::chrono::seconds(parsed);
+        } else if (argument == "--stall-timeout-seconds") {
+            unsigned parsed{};
+            if (!parse_unsigned(value, parsed)) return 1;
+            options.runtime.stall_timeout = std::chrono::seconds(parsed);
         } else if (argument == "--run-timeout-seconds") {
-            if (!parse_unsigned(value, options.limits.run_timeout_seconds)) return 1;
+            unsigned parsed{};
+            if (!parse_unsigned(value, parsed)) return 1;
+            options.runtime.run_timeout =
+                parsed == 0U ? std::nullopt :
+                    std::optional<std::chrono::seconds>(
+                        std::chrono::seconds(parsed));
+        } else if (argument == "--maximum-attempts-per-page") {
+            if (!parse_size(
+                    value, options.runtime.maximum_attempts_per_page)) return 1;
+        } else if (argument == "--retry-initial-seconds") {
+            unsigned parsed{};
+            if (!parse_unsigned(value, parsed)) return 1;
+            options.runtime.retry_initial = std::chrono::seconds(parsed);
+        } else if (argument == "--retry-maximum-seconds") {
+            unsigned parsed{};
+            if (!parse_unsigned(value, parsed)) return 1;
+            options.runtime.retry_maximum = std::chrono::seconds(parsed);
         } else {
             std::cerr << "unknown registry collect option: " << argument << '\n';
             return 1;

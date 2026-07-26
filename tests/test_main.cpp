@@ -92,12 +92,12 @@ std::string registry_page(
 mcpo::HttpTransport fixture_transport(std::vector<std::string> pages) {
     return [pages = std::move(pages), index = std::size_t{}](
                const std::string& url,
-               unsigned,
+               std::chrono::steady_clock::duration,
                std::size_t maximum,
                mcpo::HttpResponse& response,
                std::string& error,
                const mcpo::HttpHeartbeat&,
-               std::chrono::milliseconds) mutable {
+               std::chrono::steady_clock::duration) mutable {
         if (index >= pages.size()) {
             error = "unexpected fixture request";
             return false;
@@ -304,8 +304,8 @@ int main() {
         options.limits.maximum_page_bytes = boundary_page.size();
         options.limits.maximum_records = 1U;
         options.limits.maximum_redirects = 0U;
-        options.limits.request_timeout_seconds = 1U;
-        options.limits.run_timeout_seconds = 1U;
+        options.runtime.request_timeout = std::chrono::seconds(1);
+        options.runtime.run_timeout = std::chrono::seconds(2);
         require(mcpo::collect_registry(
                     options, message, fixture_transport({boundary_page})),
                 "inclusive configured limit boundaries should succeed");
@@ -416,9 +416,9 @@ int main() {
         options.registry_base_url = "http://127.0.0.1:8080/base";
         bool saw_resume_cursor = false;
         mcpo::HttpTransport resume_transport =
-            [&](const std::string& url, unsigned, std::size_t,
+            [&](const std::string& url, std::chrono::steady_clock::duration, std::size_t,
                 mcpo::HttpResponse& response, std::string&,
-                const mcpo::HttpHeartbeat&, std::chrono::milliseconds) {
+                const mcpo::HttpHeartbeat&, std::chrono::steady_clock::duration) {
                 saw_resume_cursor =
                     url.find("cursor=cursor-three") != std::string::npos;
                 response.status = 200U;
@@ -492,9 +492,9 @@ int main() {
         bool request_start_visible = false;
         std::size_t progress_requests = 0U;
         mcpo::HttpTransport progress_transport =
-            [&](const std::string& url, unsigned, std::size_t,
+            [&](const std::string& url, std::chrono::steady_clock::duration, std::size_t,
                 mcpo::HttpResponse& response, std::string&,
-                const mcpo::HttpHeartbeat&, std::chrono::milliseconds) {
+                const mcpo::HttpHeartbeat&, std::chrono::steady_clock::duration) {
                 request_start_visible =
                     request_start_visible ||
                     progress_error.str().find("request_start") != std::string::npos;
@@ -515,15 +515,16 @@ int main() {
                 "request_start should be flushed before transport runs");
         require(progress_output.str().empty(),
                 "library progress must not use stdout");
-        require(progress_log.find("[registry] mode=new") != std::string::npos,
+        require(progress_log.find("[registry] mode=fresh") != std::string::npos,
                 "new collection startup progress");
-        require(progress_log.find("request_timeout=30s run_timeout=900s") !=
+        require(progress_log.find(
+                    "request_timeout=60s stall_timeout=300s run_timeout=unlimited") !=
                     std::string::npos,
                 "startup timeout summary");
-        require(progress_log.find("page=1 attempt=1 request_start") !=
+        require(progress_log.find("page=1 attempt=1/8 request_start") !=
                     std::string::npos,
                 "first request progress");
-        require(progress_log.find("page=2 attempt=1 request_start") !=
+        require(progress_log.find("page=2 attempt=1/8 request_start") !=
                     std::string::npos,
                 "second request progress");
         require(progress_log.find("cursor_prefix=abc\\x0a") != std::string::npos,
@@ -538,21 +539,20 @@ int main() {
                     progress_log.find("total_records=2 completed_pages=2") !=
                         std::string::npos,
                 "page completion counters");
-        require(progress_log.find(" waiting=") == std::string::npos,
+        require(progress_log.find("heartbeat state=request_wait") == std::string::npos,
                 "fast responses should not emit heartbeat");
-        require(progress_log.find("pagination_complete pages=2 records=2") !=
+        require(progress_log.find("timing phase=pagination") !=
                     std::string::npos &&
-                    progress_log.find("canonicalization_start") !=
+                    progress_log.find("timing phase=canonicalization") !=
                         std::string::npos &&
-                    progress_log.find("canonicalization_complete") !=
+                    progress_log.find("timing phase=manifest_generation") !=
                         std::string::npos &&
-                    progress_log.find("manifest_generation") !=
+                    progress_log.find("timing phase=final_validation") !=
                         std::string::npos &&
-                    progress_log.find("validation_complete") !=
+                    progress_log.find("timing phase=atomic_promotion") !=
                         std::string::npos &&
-                    progress_log.find("success_marker_create") !=
-                        std::string::npos &&
-                    progress_log.find("atomic_promotion") != std::string::npos,
+                    progress_log.find("timing phase=total") !=
+                        std::string::npos,
                 "finalization stages reported");
         require(progress_log.find("[registry] success output=") !=
                     std::string::npos,
@@ -562,10 +562,10 @@ int main() {
         std::ostringstream heartbeat_error;
         saved_error = std::cerr.rdbuf(heartbeat_error.rdbuf());
         mcpo::HttpTransport heartbeat_transport =
-            [&](const std::string& url, unsigned, std::size_t,
+            [&](const std::string& url, std::chrono::steady_clock::duration, std::size_t,
                 mcpo::HttpResponse& response, std::string&,
                 const mcpo::HttpHeartbeat& heartbeat,
-                std::chrono::milliseconds interval) {
+                std::chrono::steady_clock::duration interval) {
                 require(interval >= std::chrono::seconds(1),
                         "heartbeat interval must be at least one second");
                 heartbeat(std::chrono::seconds(1));
@@ -580,7 +580,7 @@ int main() {
         std::cerr.rdbuf(saved_error);
         require(heartbeat_success, "heartbeat fixture should succeed");
         require(heartbeat_error.str().find(
-                    "page=1 attempt=1 waiting=1s remaining=") !=
+                    "heartbeat state=request_wait page=1 attempt=1/8 request_wait=1s") !=
                     std::string::npos,
                 "delayed response heartbeat");
 
@@ -589,9 +589,9 @@ int main() {
         std::ostringstream resume_error;
         saved_error = std::cerr.rdbuf(resume_error.rdbuf());
         mcpo::HttpTransport verbose_resume_transport =
-            [](const std::string& url, unsigned, std::size_t,
+            [](const std::string& url, std::chrono::steady_clock::duration, std::size_t,
                mcpo::HttpResponse& response, std::string&,
-               const mcpo::HttpHeartbeat&, std::chrono::milliseconds) {
+               const mcpo::HttpHeartbeat&, std::chrono::steady_clock::duration) {
                 response.status = 200U;
                 response.content_type = "application/json";
                 response.body = registry_page(registry_entry("legacy/three", "1"));
@@ -606,21 +606,15 @@ int main() {
         require(resume_log.find("[registry] mode=resume") != std::string::npos &&
                     resume_log.find("resume_source=") != std::string::npos,
                 "resume startup summary");
-        require(resume_log.find("resume checkpoint_load") != std::string::npos &&
-                    resume_log.find("resume checkpoint_validation") !=
-                        std::string::npos &&
-                    resume_log.find("resume raw_artifact_validation") !=
-                        std::string::npos &&
-                    resume_log.find("resume copy_start pages=2") !=
-                        std::string::npos &&
-                    resume_log.find("resume copy_complete pages=2") !=
-                        std::string::npos &&
-                    resume_log.find("resume continuation_page=3") !=
-                        std::string::npos,
+        require(resume_log.find("resume checkpoint_validation_start") !=
+                    std::string::npos &&
+                    resume_log.find(
+                        "resume checkpoint_validation_complete completed_pages=2") !=
+                    std::string::npos,
                 "resume stages reported");
         require(resume_log.find("completed_pages=2 completed_records=2 next_page=3") !=
                     std::string::npos &&
-                    resume_log.find("page=3 attempt=1 request_start") !=
+                    resume_log.find("page=3 attempt=1/8 request_start") !=
                         std::string::npos &&
                     resume_log.find("page=3 status=200") != std::string::npos,
                 "resumed numbering and counters");
@@ -629,14 +623,16 @@ int main() {
         options.output = parent / "progress-request-timeout";
         options.registry_base_url = "http://127.0.0.1:8080/base";
         options.verbose = true;
-        options.limits.request_timeout_seconds = 1U;
-        options.limits.run_timeout_seconds = 30U;
+        options.runtime.request_timeout = std::chrono::seconds(1);
+        options.runtime.run_timeout = std::chrono::seconds(30);
+        options.runtime.maximum_attempts_per_page = 1U;
         std::ostringstream request_timeout_error;
         saved_error = std::cerr.rdbuf(request_timeout_error.rdbuf());
         mcpo::HttpTransport timeout_transport =
-            [](const std::string&, unsigned, std::size_t,
-               mcpo::HttpResponse&, std::string& error,
-               const mcpo::HttpHeartbeat&, std::chrono::milliseconds) {
+            [](const std::string&, std::chrono::steady_clock::duration, std::size_t,
+               mcpo::HttpResponse& response, std::string& error,
+               const mcpo::HttpHeartbeat&, std::chrono::steady_clock::duration) {
+                response.failure_kind = mcpo::HttpFailureKind::timeout;
                 error = "child process timed out";
                 return false;
             };
@@ -645,23 +641,755 @@ int main() {
         std::cerr.rdbuf(saved_error);
         require(!timeout_success, "request timeout fixture should fail");
         require(request_timeout_error.str().find(
-                    "failure stage=http_request category=request_timeout page=1") !=
+                    "failure stage=http_request category=retry_budget_exhausted page=1") !=
                     std::string::npos,
-                "request timeout failure summary");
+                "request retry exhaustion summary");
 
         options.output = parent / "progress-run-deadline";
-        options.limits.request_timeout_seconds = 90U;
-        options.limits.run_timeout_seconds = 1U;
+        options.runtime.request_timeout = std::chrono::seconds(90);
+        options.runtime.run_timeout = std::chrono::seconds(1);
+        auto fake_now = std::chrono::steady_clock::time_point{};
+        options.now = [&] { return fake_now; };
+        mcpo::HttpTransport deadline_transport =
+            [&](const std::string&, std::chrono::steady_clock::duration timeout, std::size_t,
+                mcpo::HttpResponse& response, std::string& error,
+                const mcpo::HttpHeartbeat&, std::chrono::steady_clock::duration) {
+                require(timeout == std::chrono::seconds(1),
+                        "request timeout capped by remaining total runtime");
+                fake_now += std::chrono::seconds(1);
+                response.failure_kind = mcpo::HttpFailureKind::timeout;
+                error = "child process timed out";
+                return false;
+            };
         std::ostringstream deadline_error;
         saved_error = std::cerr.rdbuf(deadline_error.rdbuf());
         const bool deadline_success = mcpo::collect_registry(
-            options, message, timeout_transport);
+            options, message, deadline_transport);
         std::cerr.rdbuf(saved_error);
         require(!deadline_success, "run deadline fixture should fail");
         require(deadline_error.str().find(
                     "category=total_run_deadline_exhausted page=1") !=
                     std::string::npos,
                 "deadline-limited curl timeout classification");
+
+        struct DeadlineCaseResult {
+            std::string log;
+            std::chrono::steady_clock::duration elapsed{};
+            std::vector<std::chrono::steady_clock::duration> wakes;
+        };
+        const auto deadline_case =
+            [&](std::string_view name,
+                std::chrono::seconds stall_timeout,
+                std::optional<std::chrono::seconds> run_timeout) {
+                mcpo::RegistryCollectOptions deadline_options;
+                deadline_options.output = parent / std::string(name);
+                deadline_options.registry_base_url =
+                    "http://127.0.0.1:8080/base";
+                deadline_options.verbose = true;
+                deadline_options.runtime.request_timeout =
+                    std::chrono::seconds(30);
+                deadline_options.runtime.stall_timeout = stall_timeout;
+                deadline_options.runtime.run_timeout = run_timeout;
+                auto clock = std::chrono::steady_clock::time_point{};
+                deadline_options.now = [&] { return clock; };
+                std::ostringstream captured;
+                std::streambuf* previous =
+                    std::cerr.rdbuf(captured.rdbuf());
+                std::vector<std::chrono::steady_clock::duration>
+                    scheduled_wakes;
+                mcpo::HttpTransport transport =
+                    [&](const std::string&,
+                        std::chrono::steady_clock::duration,
+                        std::size_t,
+                        mcpo::HttpResponse& response,
+                        std::string& transport_error,
+                        const mcpo::HttpHeartbeat& heartbeat,
+                        std::chrono::steady_clock::duration initial_wake) {
+                        auto waited =
+                            std::chrono::steady_clock::duration::zero();
+                        auto wake = initial_wake;
+                        bool stopped{};
+                        for (std::size_t count = 0U; count < 10U; ++count) {
+                            require(
+                                wake >
+                                    std::chrono::steady_clock::duration::zero(),
+                                "HTTP wait must not schedule a zero wake");
+                            scheduled_wakes.push_back(wake);
+                            clock += wake;
+                            waited += wake;
+                            const mcpo::HttpWaitDecision decision =
+                                heartbeat(
+                                    std::chrono::duration_cast<
+                                        std::chrono::milliseconds>(
+                                        waited));
+                            if (!decision.continue_waiting) {
+                                stopped = true;
+                                break;
+                            }
+                            wake = decision.next_wake;
+                        }
+                        require(stopped,
+                                "HTTP wait callback must not busy-loop");
+                        response.failure_kind =
+                            mcpo::HttpFailureKind::cancelled;
+                        transport_error = "deadline fixture cancelled";
+                        return false;
+                    };
+                require(
+                    !mcpo::collect_registry(
+                        deadline_options, message, transport),
+                    "deadline classification fixture should fail");
+                std::cerr.rdbuf(previous);
+                DeadlineCaseResult result;
+                result.log = captured.str();
+                result.elapsed =
+                    clock.time_since_epoch();
+                result.wakes = std::move(scheduled_wakes);
+                return result;
+            };
+
+        const DeadlineCaseResult bounded_smoke = deadline_case(
+            "deadline-total-before-stall", std::chrono::seconds(120),
+            std::chrono::seconds(2));
+        require(
+            bounded_smoke.log.find(
+                "category=total_run_deadline_exhausted") !=
+                std::string::npos &&
+                bounded_smoke.log.find("category=collection_stalled") ==
+                    std::string::npos &&
+                bounded_smoke.elapsed == std::chrono::seconds(2),
+            "two-second total deadline wins while 120-second stall is healthy");
+
+        const DeadlineCaseResult unlimited_stall = deadline_case(
+            "deadline-stall-unlimited", std::chrono::seconds(5),
+            std::nullopt);
+        require(
+            unlimited_stall.log.find("category=collection_stalled") !=
+                std::string::npos &&
+                unlimited_stall.log.find(
+                    "category=total_run_deadline_exhausted") ==
+                    std::string::npos &&
+                unlimited_stall.elapsed == std::chrono::seconds(5) &&
+                unlimited_stall.wakes.size() == 1U &&
+                unlimited_stall.log.find("heartbeat state=request_wait") ==
+                    std::string::npos,
+            "stall deadline expires in unlimited mode");
+
+        const DeadlineCaseResult three_second_stall = deadline_case(
+            "deadline-three-second-stall", std::chrono::seconds(3),
+            std::nullopt);
+        require(
+            three_second_stall.elapsed == std::chrono::seconds(3) &&
+                three_second_stall.log.find(
+                    "category=collection_stalled") != std::string::npos,
+            "stall deadline wakes before five-second heartbeat");
+
+        const DeadlineCaseResult twelve_second_stall = deadline_case(
+            "deadline-twelve-second-stall", std::chrono::seconds(12),
+            std::nullopt);
+        require(
+            twelve_second_stall.elapsed == std::chrono::seconds(12) &&
+                twelve_second_stall.wakes.size() == 3U &&
+                twelve_second_stall.log.find("request_wait=5s") !=
+                    std::string::npos &&
+                twelve_second_stall.log.find("request_wait=10s") !=
+                    std::string::npos &&
+                twelve_second_stall.log.find("request_wait=12s") ==
+                    std::string::npos,
+            "heartbeat cadence yields to a non-aligned stall deadline");
+
+        const DeadlineCaseResult simultaneous_deadlines = deadline_case(
+            "deadline-simultaneous", std::chrono::seconds(5),
+            std::chrono::seconds(5));
+        require(
+            simultaneous_deadlines.log.find(
+                "category=total_run_deadline_exhausted") !=
+                std::string::npos &&
+                simultaneous_deadlines.log.find(
+                    "category=collection_stalled") ==
+                    std::string::npos,
+            "explicit total deadline has deterministic precedence");
+
+        const DeadlineCaseResult stall_first = deadline_case(
+            "deadline-stall-first", std::chrono::seconds(5),
+            std::chrono::seconds(10));
+        require(
+            stall_first.log.find("category=collection_stalled") !=
+                std::string::npos,
+            "stall is reported when it expires before total runtime");
+
+        options = {};
+        options.output = parent / "deadline-below-stall";
+        options.registry_base_url = "http://127.0.0.1:8080/base";
+        options.verbose = true;
+        options.runtime.stall_timeout = std::chrono::seconds(120);
+        auto below_stall_clock =
+            std::chrono::steady_clock::time_point{};
+        options.now = [&] { return below_stall_clock; };
+        std::ostringstream below_stall_output;
+        saved_error = std::cerr.rdbuf(below_stall_output.rdbuf());
+        require(!mcpo::collect_registry(
+                    options, message,
+                    [&](const std::string&,
+                        std::chrono::steady_clock::duration,
+                        std::size_t,
+                        mcpo::HttpResponse& response,
+                        std::string& transport_error,
+                        const mcpo::HttpHeartbeat&,
+                        std::chrono::steady_clock::duration) {
+                        below_stall_clock += std::chrono::seconds(1);
+                        response.failure_kind =
+                            mcpo::HttpFailureKind::other;
+                        transport_error = "sub-stall fixture stopped";
+                        return false;
+                    }),
+                "sub-stall fixture should stop");
+        std::cerr.rdbuf(saved_error);
+        const std::string below_stall = below_stall_output.str();
+        require(
+            below_stall.find("seconds_since_last_completed_page=1") !=
+                std::string::npos &&
+                below_stall.find("category=collection_stalled") ==
+                    std::string::npos &&
+                below_stall.find(
+                    "category=total_run_deadline_exhausted") ==
+                    std::string::npos,
+            "sub-stall elapsed time cannot classify as a stall");
+
+        options = {};
+        options.output = parent / "deadline-reset-after-page";
+        options.registry_base_url = "http://127.0.0.1:8080/base";
+        options.verbose = true;
+        options.runtime.stall_timeout = std::chrono::seconds(5);
+        auto reset_clock = std::chrono::steady_clock::time_point{};
+        options.now = [&] { return reset_clock; };
+        std::size_t reset_requests{};
+        std::ostringstream reset_output;
+        saved_error = std::cerr.rdbuf(reset_output.rdbuf());
+        require(!mcpo::collect_registry(
+                    options, message,
+                    [&](const std::string& url,
+                        std::chrono::steady_clock::duration,
+                        std::size_t,
+                        mcpo::HttpResponse& response,
+                        std::string& transport_error,
+                        const mcpo::HttpHeartbeat& heartbeat,
+                        std::chrono::steady_clock::duration initial_wake) {
+                        if (reset_requests++ == 0U) {
+                            reset_clock += std::chrono::seconds(4);
+                            response.status = 200U;
+                            response.content_type = "application/json";
+                            response.body = registry_page(
+                                registry_entry("reset/one", "1"),
+                                "reset-cursor");
+                            response.effective_url = url;
+                            return true;
+                        }
+                        require(initial_wake == std::chrono::seconds(5),
+                                "durable page reset full stall interval");
+                        reset_clock += initial_wake;
+                        const auto decision = heartbeat(
+                            std::chrono::duration_cast<
+                                std::chrono::milliseconds>(initial_wake));
+                        require(!decision.continue_waiting,
+                                "reset stall deadline cancels second request");
+                        response.failure_kind =
+                            mcpo::HttpFailureKind::cancelled;
+                        transport_error = "reset fixture cancelled";
+                        return false;
+                    }),
+                "reset deadline fixture should stall on second page");
+        std::cerr.rdbuf(saved_error);
+        require(
+            reset_output.str().find("completed_pages=1") !=
+                std::string::npos &&
+                reset_output.str().find(
+                    "seconds_since_last_completed_page=5") !=
+                    std::string::npos &&
+                std::chrono::duration_cast<std::chrono::seconds>(
+                    reset_clock.time_since_epoch()) ==
+                    std::chrono::seconds(9),
+            "durable completion resets stall deadline from commit time");
+
+        options = {};
+        options.output = parent / "millisecond-request-cap";
+        options.registry_base_url = "http://127.0.0.1:8080/base";
+        options.runtime.request_timeout = std::chrono::seconds(30);
+        options.runtime.run_timeout = std::chrono::seconds(2);
+        std::size_t clock_reads{};
+        options.now = [&] {
+            return std::chrono::steady_clock::time_point{} +
+                (clock_reads++ == 0U ?
+                    std::chrono::milliseconds::zero() :
+                    std::chrono::milliseconds(250));
+        };
+        std::chrono::steady_clock::duration observed_request_timeout{};
+        require(!mcpo::collect_registry(
+                    options, message,
+                    [&](const std::string&,
+                        std::chrono::steady_clock::duration timeout,
+                        std::size_t,
+                        mcpo::HttpResponse& response,
+                        std::string& transport_error,
+                        const mcpo::HttpHeartbeat&,
+                        std::chrono::steady_clock::duration) {
+                        observed_request_timeout = timeout;
+                        response.failure_kind =
+                            mcpo::HttpFailureKind::other;
+                        transport_error = "rounding fixture stopped";
+                        return false;
+                    }),
+                "millisecond request-timeout fixture should stop");
+        require(
+            observed_request_timeout ==
+                std::chrono::milliseconds(1'750),
+            "effective request timeout preserves fractional remaining runtime");
+
+        options = {};
+        options.output = parent / "unlimited-long-run";
+        options.registry_base_url = "http://127.0.0.1:8080/base";
+        options.runtime.stall_timeout = std::chrono::seconds(700);
+        fake_now = std::chrono::steady_clock::time_point{};
+        options.now = [&] { return fake_now; };
+        std::size_t long_run_requests{};
+        mcpo::HttpTransport long_run_transport =
+            [&](const std::string& url, std::chrono::steady_clock::duration timeout, std::size_t,
+                mcpo::HttpResponse& response, std::string&,
+                const mcpo::HttpHeartbeat&, std::chrono::steady_clock::duration) {
+                require(timeout == std::chrono::seconds(60),
+                        "unlimited request timeout is not total-deadline capped");
+                fake_now += std::chrono::seconds(600);
+                response.status = 200U;
+                response.content_type = "application/json";
+                response.body = long_run_requests++ == 0U ?
+                    registry_page(
+                        registry_entry("long/one", "1"), "continue") :
+                    registry_page(registry_entry("long/two", "1"));
+                response.effective_url = url;
+                return true;
+            };
+        require(mcpo::collect_registry(
+                    options, message, long_run_transport),
+                "healthy unlimited collection beyond old deadline succeeds");
+        require(
+            fake_now >= std::chrono::steady_clock::time_point{} +
+                std::chrono::seconds(1'200),
+            "long-running fixture crossed old total timeout");
+
+        options = {};
+        options.output = parent / "stall-watchdog";
+        options.registry_base_url = "http://127.0.0.1:8080/base";
+        options.verbose = true;
+        options.runtime.stall_timeout = std::chrono::seconds(10);
+        fake_now = std::chrono::steady_clock::time_point{};
+        options.now = [&] { return fake_now; };
+        std::ostringstream stall_error;
+        saved_error = std::cerr.rdbuf(stall_error.rdbuf());
+        mcpo::HttpTransport stalled_transport =
+            [&](const std::string&, std::chrono::steady_clock::duration, std::size_t,
+                mcpo::HttpResponse& response, std::string& transport_error,
+                const mcpo::HttpHeartbeat& heartbeat,
+                std::chrono::steady_clock::duration) {
+                fake_now += std::chrono::seconds(10);
+                require(
+                    !heartbeat(std::chrono::seconds(10)).continue_waiting,
+                        "stall heartbeat must request transport cancellation");
+                response.failure_kind = mcpo::HttpFailureKind::cancelled;
+                transport_error = "cancelled by progress watchdog";
+                return false;
+            };
+        const bool stalled = mcpo::collect_registry(
+            options, message, stalled_transport);
+        std::cerr.rdbuf(saved_error);
+        require(!stalled, "stalled collection should fail");
+        require(
+            stall_error.str().find(
+                "stage=progress_watchdog category=collection_stalled") !=
+                std::string::npos &&
+                stall_error.str().find(
+                    "seconds_since_last_completed_page=10") !=
+                std::string::npos,
+            "stall has a distinct durable-progress failure");
+
+        for (const unsigned retry_status :
+             {408U, 425U, 429U, 500U, 502U, 503U, 504U}) {
+            options = {};
+            options.output =
+                parent / ("retry-" + std::to_string(retry_status));
+            options.registry_base_url =
+                "http://127.0.0.1:8080/base";
+            options.runtime.retry_initial = std::chrono::seconds(2);
+            options.runtime.retry_maximum = std::chrono::seconds(10);
+            fake_now = std::chrono::steady_clock::time_point{};
+            options.now = [&] { return fake_now; };
+            std::chrono::steady_clock::duration waited{};
+            options.wait = [&](std::chrono::steady_clock::duration duration) {
+                waited += duration;
+                fake_now += duration;
+            };
+            std::size_t attempts{};
+            mcpo::HttpTransport retry_transport =
+                [&](const std::string& url, std::chrono::steady_clock::duration, std::size_t,
+                    mcpo::HttpResponse& response, std::string&,
+                    const mcpo::HttpHeartbeat&,
+                    std::chrono::steady_clock::duration) {
+                    response.status =
+                        attempts++ == 0U ? retry_status : 200U;
+                    response.content_type = "application/json";
+                    response.body = registry_page(
+                        registry_entry("retry/server", "1"));
+                    response.effective_url = url;
+                    return true;
+                };
+            require(mcpo::collect_registry(
+                        options, message, retry_transport),
+                    "retryable HTTP status should recover");
+            require(attempts == 2U &&
+                        waited == std::chrono::seconds(2),
+                    "retryable HTTP status uses bounded initial backoff");
+        }
+
+        options = {};
+        options.output = parent / "retry-after";
+        options.registry_base_url = "http://127.0.0.1:8080/base";
+        options.runtime.retry_initial = std::chrono::seconds(2);
+        options.runtime.retry_maximum = std::chrono::seconds(5);
+        fake_now = std::chrono::steady_clock::time_point{};
+        options.now = [&] { return fake_now; };
+        std::chrono::steady_clock::duration retry_after_wait{};
+        options.wait = [&](std::chrono::steady_clock::duration duration) {
+            retry_after_wait += duration;
+            fake_now += duration;
+        };
+        std::size_t retry_after_attempts{};
+        mcpo::HttpTransport retry_after_transport =
+            [&](const std::string& url, std::chrono::steady_clock::duration, std::size_t,
+                mcpo::HttpResponse& response, std::string&,
+                const mcpo::HttpHeartbeat&, std::chrono::steady_clock::duration) {
+                response.status =
+                    retry_after_attempts++ == 0U ? 503U : 200U;
+                response.retry_after = "99";
+                response.content_type = "application/json";
+                response.body =
+                    registry_page(registry_entry("retry-after/server", "1"));
+                response.effective_url = url;
+                return true;
+            };
+        require(mcpo::collect_registry(
+                    options, message, retry_after_transport),
+                "integer Retry-After retry should recover");
+        require(retry_after_wait == std::chrono::seconds(5),
+                "Retry-After is capped at retry maximum");
+
+        options = {};
+        options.output = parent / "temporary-network-backoff";
+        options.registry_base_url = "http://127.0.0.1:8080/base";
+        options.runtime.retry_initial = std::chrono::seconds(2);
+        options.runtime.retry_maximum = std::chrono::seconds(5);
+        fake_now = std::chrono::steady_clock::time_point{};
+        options.now = [&] { return fake_now; };
+        std::chrono::steady_clock::duration network_wait{};
+        options.wait = [&](std::chrono::steady_clock::duration duration) {
+            network_wait += duration;
+            fake_now += duration;
+        };
+        std::size_t network_attempts{};
+        mcpo::HttpTransport temporary_network_transport =
+            [&](const std::string& url, std::chrono::steady_clock::duration, std::size_t,
+                mcpo::HttpResponse& response, std::string& transport_error,
+                const mcpo::HttpHeartbeat&, std::chrono::steady_clock::duration) {
+                ++network_attempts;
+                if (network_attempts <= 3U) {
+                    response.failure_kind =
+                        mcpo::HttpFailureKind::temporary_network;
+                    transport_error = "temporary network failure";
+                    return false;
+                }
+                response.status = 200U;
+                response.content_type = "application/json";
+                response.body = registry_page(
+                    registry_entry("network/recovered", "1"));
+                response.effective_url = url;
+                return true;
+            };
+        require(mcpo::collect_registry(
+                    options, message, temporary_network_transport),
+                "temporary network failure should recover");
+        require(
+            network_attempts == 4U &&
+                network_wait == std::chrono::seconds(11),
+            "exponential retry delays double and cap without overflow");
+
+        options = {};
+        options.output = parent / "request-timeout-recovery";
+        options.registry_base_url = "http://127.0.0.1:8080/base";
+        fake_now = std::chrono::steady_clock::time_point{};
+        options.now = [&] { return fake_now; };
+        options.wait = [&](std::chrono::steady_clock::duration duration) {
+            fake_now += duration;
+        };
+        std::size_t timeout_attempts{};
+        mcpo::HttpTransport recovering_timeout_transport =
+            [&](const std::string& url, std::chrono::steady_clock::duration, std::size_t,
+                mcpo::HttpResponse& response, std::string& transport_error,
+                const mcpo::HttpHeartbeat&, std::chrono::steady_clock::duration) {
+                ++timeout_attempts;
+                if (timeout_attempts == 1U) {
+                    response.failure_kind =
+                        mcpo::HttpFailureKind::timeout;
+                    transport_error = "request timed out";
+                    return false;
+                }
+                response.status = 200U;
+                response.content_type = "application/json";
+                response.body = registry_page(
+                    registry_entry("timeout/recovered", "1"));
+                response.effective_url = url;
+                return true;
+            };
+        require(mcpo::collect_registry(
+                    options, message, recovering_timeout_transport),
+                "request timeout should be retryable");
+        require(timeout_attempts == 2U,
+                "request timeout consumed one retry");
+
+        options = {};
+        options.output = parent / "retry-stall-deadline";
+        options.registry_base_url = "http://127.0.0.1:8080/base";
+        options.runtime.stall_timeout = std::chrono::seconds(3);
+        options.runtime.retry_initial = std::chrono::seconds(10);
+        options.runtime.retry_maximum = std::chrono::seconds(10);
+        fake_now = std::chrono::steady_clock::time_point{};
+        options.now = [&] { return fake_now; };
+        std::chrono::steady_clock::duration stall_wait{};
+        options.wait = [&](std::chrono::steady_clock::duration duration) {
+            stall_wait += duration;
+            fake_now += duration;
+        };
+        mcpo::HttpTransport retry_stall_transport =
+            [&](const std::string&, std::chrono::steady_clock::duration, std::size_t,
+                mcpo::HttpResponse& response, std::string& transport_error,
+                const mcpo::HttpHeartbeat&, std::chrono::steady_clock::duration) {
+                response.failure_kind =
+                    mcpo::HttpFailureKind::temporary_network;
+                transport_error = "temporary network failure";
+                return false;
+            };
+        require(!mcpo::collect_registry(
+                    options, message, retry_stall_transport),
+                "retry wait should stop at stall deadline");
+        require(
+            stall_wait == std::chrono::seconds(3) &&
+                message.find("stall deadline") != std::string::npos,
+            "retry sleep did not pass durable-progress deadline");
+
+        options.output = parent / "retry-total-deadline";
+        options.runtime.stall_timeout = std::chrono::seconds(30);
+        options.runtime.run_timeout = std::chrono::seconds(3);
+        fake_now = std::chrono::steady_clock::time_point{};
+        std::chrono::steady_clock::duration total_wait{};
+        options.wait = [&](std::chrono::steady_clock::duration duration) {
+            total_wait += duration;
+            fake_now += duration;
+        };
+        require(!mcpo::collect_registry(
+                    options, message, retry_stall_transport),
+                "retry wait should stop at total deadline");
+        require(
+            total_wait == std::chrono::seconds(3) &&
+                message.find("total run deadline") != std::string::npos,
+            "retry sleep did not pass optional total deadline");
+
+        options = {};
+        options.output = parent / "nonretry-http";
+        options.registry_base_url = "http://127.0.0.1:8080/base";
+        std::size_t nonretry_attempts{};
+        mcpo::HttpTransport nonretry_transport =
+            [&](const std::string& url, std::chrono::steady_clock::duration, std::size_t,
+                mcpo::HttpResponse& response, std::string&,
+                const mcpo::HttpHeartbeat&, std::chrono::steady_clock::duration) {
+                ++nonretry_attempts;
+                response.status = 400U;
+                response.effective_url = url;
+                return true;
+            };
+        require(!mcpo::collect_registry(
+                    options, message, nonretry_transport),
+                "HTTP 400 should not be retried");
+        require(nonretry_attempts == 1U, "HTTP 400 had one attempt");
+
+        options = {};
+        options.output = parent / "malformed-no-retry";
+        options.registry_base_url = "http://127.0.0.1:8080/base";
+        std::size_t malformed_attempts{};
+        mcpo::HttpTransport malformed_transport =
+            [&](const std::string& url, std::chrono::steady_clock::duration, std::size_t,
+                mcpo::HttpResponse& response, std::string&,
+                const mcpo::HttpHeartbeat&, std::chrono::steady_clock::duration) {
+                ++malformed_attempts;
+                response.status = 200U;
+                response.content_type = "application/json";
+                response.body = "{bad";
+                response.effective_url = url;
+                return true;
+            };
+        require(!mcpo::collect_registry(
+                    options, message, malformed_transport),
+                "malformed registry JSON should fail");
+        require(malformed_attempts == 1U,
+                "malformed JSON was not retried");
+
+        options = {};
+        options.output = parent / "checkpoint-failure";
+        options.registry_base_url = "http://127.0.0.1:8080/base";
+        std::size_t checkpoint_failure_attempts{};
+        mcpo::HttpTransport checkpoint_failure_transport =
+            [&](const std::string& url, std::chrono::steady_clock::duration, std::size_t,
+                mcpo::HttpResponse& response, std::string&,
+                const mcpo::HttpHeartbeat&, std::chrono::steady_clock::duration) {
+                ++checkpoint_failure_attempts;
+                for (const auto& entry :
+                     std::filesystem::directory_iterator(parent)) {
+                    if (!entry.path().filename().string().starts_with(
+                            "checkpoint-failure.partial-"))
+                        continue;
+                    std::error_code local_error;
+                    std::filesystem::remove(
+                        entry.path() / "checkpoint.json", local_error);
+                    std::filesystem::create_directory(
+                        entry.path() / "checkpoint.json", local_error);
+                }
+                response.status = 200U;
+                response.content_type = "application/json";
+                response.body = registry_page(
+                    registry_entry("checkpoint/failure", "1"));
+                response.effective_url = url;
+                return true;
+            };
+        require(!mcpo::collect_registry(
+                    options, message, checkpoint_failure_transport),
+                "checkpoint persistence failure should abort");
+        require(
+            checkpoint_failure_attempts == 1U &&
+                message.find("compact checkpoint") != std::string::npos,
+            "checkpoint persistence failure is fatal and not retried");
+
+        const auto read_collector_bytes =
+            [](const std::filesystem::path& path) {
+                std::ifstream input(path, std::ios::binary);
+                return std::string(
+                    std::istreambuf_iterator<char>(input),
+                    std::istreambuf_iterator<char>());
+            };
+        const std::string compact =
+            read_collector_bytes(parent / "multi/checkpoint.json");
+        require(
+            compact.find("\"checkpoint_version\":2") != std::string::npos &&
+                compact.find("\"last_completed_page\":2") !=
+                    std::string::npos &&
+                compact.find("\"pages_metadata_path\":\"raw/pages.jsonl\"") !=
+                    std::string::npos &&
+                compact.find("\"artifacts\"") == std::string::npos,
+            "completed pages leave a compact version-2 resume head");
+        const auto one_checkpoint_size =
+            std::filesystem::file_size(parent / "one/checkpoint.json");
+        const auto multi_checkpoint_size =
+            std::filesystem::file_size(parent / "multi/checkpoint.json");
+        require(
+            multi_checkpoint_size <= one_checkpoint_size + 64U,
+            "checkpoint size is not proportional to page history");
+
+        options = {};
+        options.output = parent / "durable-partial";
+        options.registry_base_url = "http://127.0.0.1:8080/base";
+        options.runtime.maximum_attempts_per_page = 1U;
+        std::size_t partial_requests{};
+        mcpo::HttpTransport partial_transport =
+            [&](const std::string& url, std::chrono::steady_clock::duration, std::size_t,
+                mcpo::HttpResponse& response, std::string&,
+                const mcpo::HttpHeartbeat&, std::chrono::steady_clock::duration) {
+                response.effective_url = url;
+                if (partial_requests++ == 0U) {
+                    response.status = 200U;
+                    response.content_type = "application/json";
+                    response.body = registry_page(
+                        registry_entry("resume/one", "1"),
+                        "resume-cursor");
+                } else {
+                    response.status = 400U;
+                }
+                return true;
+            };
+        require(!mcpo::collect_registry(
+                    options, message, partial_transport),
+                "second-page failure retains partial bundle");
+        std::filesystem::path durable_partial;
+        for (const auto& entry :
+             std::filesystem::directory_iterator(parent)) {
+            const std::string filename =
+                entry.path().filename().string();
+            if (filename.starts_with("durable-partial.partial-"))
+                durable_partial = entry.path();
+        }
+        require(!durable_partial.empty(),
+                "retained partial bundle path is discoverable");
+        {
+            std::ofstream uncommitted(
+                durable_partial / "raw/page-000002.json",
+                std::ios::binary | std::ios::trunc);
+            uncommitted << registry_page(
+                registry_entry("uncommitted/server", "1"));
+        }
+        options.output = parent / "resume-first-uncommitted";
+        options.resume = durable_partial;
+        std::size_t resumed_requests{};
+        mcpo::HttpTransport resume_head_transport =
+            [&](const std::string& url, std::chrono::steady_clock::duration, std::size_t,
+                mcpo::HttpResponse& response, std::string&,
+                const mcpo::HttpHeartbeat&, std::chrono::steady_clock::duration) {
+                require(
+                    url.find("cursor=resume-cursor") != std::string::npos,
+                    "resume uses cursor from last committed page");
+                ++resumed_requests;
+                response.status = 200U;
+                response.content_type = "application/json";
+                response.body = registry_page(
+                    registry_entry("resume/two", "1"));
+                response.effective_url = url;
+                return true;
+            };
+        require(mcpo::collect_registry(
+                    options, message, resume_head_transport),
+                "resume redownloads first uncommitted page");
+        require(resumed_requests == 1U,
+                "committed pages were not redownloaded");
+        require(
+            read_collector_bytes(
+                parent /
+                "resume-first-uncommitted/canonical/servers.jsonl")
+                    .find("uncommitted/server") == std::string::npos,
+            "uncheckpointed raw page was ignored");
+
+        {
+            std::ofstream corrupt(
+                durable_partial / "raw/page-000001.json",
+                std::ios::binary | std::ios::app);
+            corrupt << ' ';
+        }
+        options.output = parent / "resume-corrupt";
+        std::size_t corrupt_resume_requests{};
+        require(!mcpo::collect_registry(
+                    options, message,
+                    [&](const std::string&, std::chrono::steady_clock::duration, std::size_t,
+                        mcpo::HttpResponse&, std::string&,
+                        const mcpo::HttpHeartbeat&,
+                        std::chrono::steady_clock::duration) {
+                        ++corrupt_resume_requests;
+                        return false;
+                    }),
+                "resume rejects a last-page digest mismatch");
+        require(corrupt_resume_requests == 0U,
+                "invalid checkpoint state is rejected before network access");
 
         options = {};
         options.output = parent / "progress-quiet";

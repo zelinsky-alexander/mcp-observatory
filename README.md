@@ -68,18 +68,38 @@ Production collection uses the compiled Official MCP Registry default:
   --output ./official-run
 ```
 
-For a local fixture or compatible registry, including one mounted into a
-Docker or Lambda container:
+For an unattended collection:
 
 ```bash
-./build/dev-debug/mcp-observatory registry collect \
+./build/release/mcp-observatory registry collect \
+  --registry-base-url https://registry.modelcontextprotocol.io \
+  --output official-run \
+  --request-timeout-seconds 60 \
+  --stall-timeout-seconds 300 \
+  --run-timeout-seconds 0 \
+  --maximum-attempts-per-page 8 \
+  --retry-initial-seconds 2 \
+  --retry-maximum-seconds 120 \
+  --maximum-pages 5000 \
+  --maximum-records 500000 \
+  --verbose
+```
+
+For a bounded CI collection:
+
+```bash
+./build/release/mcp-observatory registry collect \
   --registry-base-url http://127.0.0.1:8080 \
-  --output ./test-run \
+  --output ./ci-run \
   --maximum-pages 100 \
   --maximum-page-bytes 8388608 \
   --maximum-records 10000 \
   --request-timeout-seconds 30 \
-  --run-timeout-seconds 600
+  --stall-timeout-seconds 90 \
+  --run-timeout-seconds 600 \
+  --maximum-attempts-per-page 3 \
+  --retry-initial-seconds 1 \
+  --retry-maximum-seconds 10
 ```
 
 `--registry-base-url` overrides `MCPO_REGISTRY_BASE_URL`, which overrides
@@ -87,22 +107,34 @@ Docker or Lambda container:
 supported. Raw pages are mandatory evidence in bundle version 1;
 `--retain-raw` is accepted explicitly for forward-compatible scripts.
 
-Add `--verbose` for continuous human-readable progress on standard error.
-Progress includes the bounded startup configuration, resume validation and
-copy stages, each request start, a waiting heartbeat about every five seconds,
-validated page counters, finalization stages, and a final success or structured
-failure summary. Cursor values, paths, URLs, and diagnostics are escaped and
-bounded. Standard output remains reserved for the concise command result, and
-bundle artifacts are unaffected.
+`run_timeout_seconds=0` means unlimited total runtime.
+`request_timeout_seconds` bounds one HTTP attempt.
+`stall_timeout_seconds` detects lack of durable page completion. Heartbeats
+prove process liveness only; they do not reset the stall watchdog. Durable
+progress means a page, its page-history metadata, and the compact checkpoint
+were atomically committed.
+
+Transient request failures and HTTP 408, 425, 429, 500, 502, 503, and 504 use
+bounded exponential retries. `Retry-After` supports integer seconds only in
+this version and is capped at the configured retry maximum. Other header
+formats fall back to exponential backoff.
+
+Add `--verbose` for human-readable progress on standard error. Request-wait
+heartbeats are distinct from retry-backoff heartbeats and durable page
+completion. Standard output remains reserved for the concise command result.
+Cursor values, paths, URLs, and diagnostics are escaped and bounded.
 
 Example progress:
 
 ```text
 [registry] mode=resume registry=https://registry.modelcontextprotocol.io output=official-run resume_source=legacy-partial
+[registry] request_timeout=60s stall_timeout=300s run_timeout=unlimited maximum_attempts_per_page=8 retry_initial=2s retry_maximum=120s
 [registry] completed_pages=280 completed_records=8400 next_page=281 next_cursor=yes cursor_prefix=abc... cursor_length=96
-[registry] page=281 attempt=1 request_start elapsed=12.4s remaining=1727.6s timeout=90.0s cursor_prefix=abc... cursor_length=96
-[registry] page=281 attempt=1 waiting=5s remaining=1722.6s
-[registry] page=281 status=200 bytes=24821 duration=6.1s records=30 total_records=8430 completed_pages=281 next_cursor=yes saved=raw/page-000281.json checkpoint=not_applicable
+[registry] page=281 attempt=1/8 request_start elapsed=12.4s request_timeout=60.0s since_last_page=1.4s cursor_prefix=abc... cursor_length=96
+[registry] heartbeat state=request_wait page=281 attempt=1/8 request_wait=5s since_last_page=6s completed_pages=280 completed_records=8400 elapsed=17s
+[registry] page=281 attempt=1/8 retryable_http_status=503 retry_in=2s
+[registry] heartbeat state=retry_backoff page=281 next_attempt=2/8 retry_remaining=0s since_last_page=8s completed_pages=280 completed_records=8400 elapsed=19s
+[registry] page=281 status=200 bytes=24821 duration=8.1s records=30 total_records=8430 completed_pages=281 next_cursor=yes saved=raw/page-000281.json checkpoint=committed
 ```
 
 To retain progress separately from machine-readable output:
@@ -112,7 +144,19 @@ mcp-observatory registry collect ... \
   --verbose 2>registry-progress.log
 ```
 
-### Legacy partial checkpoints and resume
+### Compact checkpoints and resume
+
+After each completed page, `checkpoint.json` stores only the current durable
+resume head. Raw page files and `raw/pages.jsonl` remain the authoritative page
+history. The checkpoint records the completed counts, next cursor, last-page
+artifact, page-metadata artifact, provenance, timestamp, and status. It does
+not contain the growing historical artifact list.
+
+Resume validates the checkpoint version and provenance, last-page and
+page-metadata sizes and SHA-256 values, metadata sequence, cursor continuity,
+and safe relative paths before network collection starts. It continues from
+`completed_pages + 1`. A raw page fetched but not checkpointed is ignored and
+downloaded again; committed pages are not downloaded again.
 
 A legacy interrupted directory containing only `raw/page-*.json` can be
 reconstructed without contacting the Registry:

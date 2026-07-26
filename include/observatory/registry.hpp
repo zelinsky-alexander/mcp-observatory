@@ -19,8 +19,15 @@ struct RegistryLimits {
     std::size_t maximum_page_bytes{8U * 1024U * 1024U};
     std::size_t maximum_records{100'000U};
     std::size_t maximum_redirects{5U};
-    unsigned request_timeout_seconds{30U};
-    unsigned run_timeout_seconds{900U};
+};
+
+struct RegistryRuntimePolicy {
+    std::chrono::seconds request_timeout{60};
+    std::chrono::seconds stall_timeout{300};
+    std::optional<std::chrono::seconds> run_timeout;
+    std::size_t maximum_attempts_per_page{8U};
+    std::chrono::seconds retry_initial{2};
+    std::chrono::seconds retry_maximum{120};
 };
 
 struct RegistryUrl {
@@ -36,9 +43,24 @@ struct RegistryCollectOptions {
     std::optional<std::filesystem::path> resume;
     std::string registry_base_url{official_registry_base_url};
     RegistryLimits limits{};
+    RegistryRuntimePolicy runtime{};
     bool retain_raw{true};
     bool verbose{};
     std::chrono::milliseconds heartbeat_interval{std::chrono::seconds(5)};
+    std::function<std::chrono::steady_clock::time_point()> now;
+    std::function<void(std::chrono::steady_clock::duration)> wait;
+};
+
+enum class HttpFailureKind {
+    none,
+    timeout,
+    temporary_network,
+    tls,
+    protocol,
+    cancelled,
+    response_too_large,
+    local_io,
+    other,
 };
 
 struct HttpResponse {
@@ -47,18 +69,26 @@ struct HttpResponse {
     std::string body;
     std::string effective_url;
     std::optional<std::string> location;
+    std::optional<std::string> retry_after;
+    HttpFailureKind failure_kind{HttpFailureKind::none};
 };
 
-using HttpHeartbeat = std::function<void(std::chrono::milliseconds waiting)>;
+struct HttpWaitDecision {
+    bool continue_waiting{};
+    std::chrono::steady_clock::duration next_wake{};
+};
+
+using HttpHeartbeat =
+    std::function<HttpWaitDecision(std::chrono::milliseconds waiting)>;
 
 using HttpTransport = std::function<bool(
     const std::string& url,
-    unsigned timeout_seconds,
+    std::chrono::steady_clock::duration timeout,
     std::size_t maximum_bytes,
     HttpResponse& response,
     std::string& error,
     const HttpHeartbeat& heartbeat,
-    std::chrono::milliseconds heartbeat_interval)>;
+    std::chrono::steady_clock::duration initial_wake)>;
 
 [[nodiscard]] bool parse_registry_url(
     std::string_view text,

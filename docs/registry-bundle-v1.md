@@ -41,6 +41,7 @@ preserved.
 ```text
 bundle/
 ├── manifest.json
+├── checkpoint.json
 ├── raw/
 │   ├── page-000001.json
 │   └── pages.jsonl
@@ -55,17 +56,52 @@ Collection occurs in a uniquely named sibling directory. Existing
 destinations are never replaced. Data files are flushed and hashed, the
 manifest is written, the bundle is self-validated, and `_SUCCESS` is written
 last. A no-replace rename promotes the directory. Failed directories retain a
-bounded diagnostic and successfully retrieved raw pages when safe, but never
+bounded diagnostic and successfully committed raw pages when safe, but never
 appear at the requested successful destination.
 
+## Runtime reliability policy
+
+The default runtime policy is:
+
+```text
+request_timeout_seconds=60
+stall_timeout_seconds=300
+run_timeout_seconds=0
+maximum_attempts_per_page=8
+retry_initial_seconds=2
+retry_maximum_seconds=120
+```
+
+`run_timeout_seconds=0` means unlimited total runtime.
+`request_timeout_seconds` bounds one HTTP attempt.
+`stall_timeout_seconds` detects lack of durable page completion.
+Heartbeats prove process liveness only.
+Durable progress means a page and compact checkpoint were atomically
+committed.
+
+When a positive total runtime is configured, request timeouts and retry waits
+are capped by the remaining total time. Unlimited mode creates no total
+deadline and reports `run_timeout=unlimited`.
+
+Request timeouts and temporary transport failures are retryable. HTTP 408,
+425, 429, 500, 502, 503, and 504 are retryable. Other response validation,
+schema, limit, cursor, identity, URL-policy, and persistence failures are not.
+Backoff doubles from the configured initial delay and saturates at the
+configured maximum without integer overflow. `Retry-After` supports integer
+seconds only in this version, only for HTTP 429 and 503, and is capped at the
+retry maximum. HTTP-date values and invalid values use normal backoff.
+
+Request and retry heartbeats check both deadlines. A stall retains the partial
+bundle with category `collection_stalled`; a positive total deadline uses the
+distinct category `total_run_deadline_exhausted`.
+
 With `registry collect --verbose`, the collector writes continuous progress to
-standard error and flushes every complete line immediately. The bounded output
-reports startup limits, resume validation and periodic copy counts, each page
-request, a waiting heartbeat approximately every five seconds, successful page
-and cumulative counters, canonicalization and validation stages, promotion,
-and a final success or categorized failure summary. It does not include
-response bodies, complete cursors, secrets, or environment values. Standard
-output and the versioned bundle formats do not change.
+standard error and flushes every complete line immediately. Request-wait
+heartbeats, retry-backoff heartbeats, and durable completion logs are distinct.
+Completion is logged only after checkpoint commit. Phase timing covers
+pagination, canonicalization, manifest generation, final validation, atomic
+promotion, and total collection time. Output does not include response bodies,
+complete cursors, secrets, or environment values.
 
 ```bash
 mcp-observatory registry collect --output ./official-run \
@@ -78,6 +114,41 @@ output cursors, redirect count, record count, and raw relative path. It never
 records headers, cookies, credentials, or an environment dump. Raw bodies are
 unmodified. Compression can later change physical artifact names while the
 JSON and JSONL logical formats remain versioned and unchanged.
+
+## Compact checkpoint version 2
+
+`checkpoint.json` stores only the current durable resume head:
+
+```text
+checkpoint_version
+registry
+registry_base_url
+completed_pages
+completed_records
+next_cursor
+last_completed_page
+last_page_path
+last_page_size
+last_page_sha256
+pages_metadata_path
+pages_metadata_size
+pages_metadata_sha256
+updated_at
+status
+```
+
+Raw pages and `raw/pages.jsonl` remain the authoritative page history. The
+checkpoint does not contain a growing artifact array, so its size remains
+approximately constant.
+
+For each page the collector validates the response and limits before writing
+the raw page to a same-directory temporary file. It flushes and closes that
+file, atomically renames it, atomically replaces `raw/pages.jsonl`, then
+atomically replaces `checkpoint.json`. Directory entries are synced on the
+supported Linux implementation. Only then is the page reported complete and
+the stall timer reset. A checkpoint persistence failure is fatal. A raw page
+that exists beyond the checkpoint head is uncommitted and is ignored on
+resume.
 
 ## Canonical identity and hashes
 
@@ -149,21 +220,26 @@ provenance.
 effective URLs derived from the configured base URL, and the fixed unknown-time
 value `1970-01-01T00:00:00Z`. Actual sizes and SHA-256 values are recomputed.
 After the rebuilt page index is flushed, `checkpoint.json` is written to a
-unique sibling temporary file and atomically promoted without replacement. Its
-version-1 fields include `completed_pages`, `records_received`, `next_cursor`,
-normalized registry base URL, and artifact metadata. `_SUCCESS` is never
-created.
+unique sibling temporary file and atomically promoted without replacement.
+Reconstruction writes compact checkpoint version 2. Current version-1
+checkpoints remain readable; unsupported future versions are rejected.
+`_SUCCESS` is never created.
 
 `registry collect --resume PARTIAL --output NEW_BUNDLE` validates or creates
-the checkpoint, verifies it against the raw files, copies the evidence into a
-new temporary bundle, and continues from the derived next cursor. It never
-modifies or promotes the resume directory into a successful bundle.
+the checkpoint, verifies provenance, counts, paths, last-page and page-metadata
+sizes and hashes, metadata termination, and cursor continuity, copies only
+committed evidence into a new temporary bundle, and continues at
+`completed_pages + 1`. Attempt numbering restarts at one. Active stall tracking
+starts when resumed network collection begins, not from a timestamp written by
+an earlier process. It never promotes the resume directory into a successful
+bundle.
 
 ## Current limitations
 
 - Linux process facilities and fixed `/usr/bin/curl` and `/usr/bin/openssl`
-  executable identities are required. This matches Ubuntu/WSL, the documented
-  container image contract, CI Linux runners, and AWS Lambda Linux containers.
+  executable identities are required. Directory durability sync is implemented
+  for the current Linux/WSL workflow; portability to filesystems with different
+  rename or directory-sync semantics requires separate review.
 - curl and OpenSSL are runtime prerequisites rather than linked libraries.
 - JSON numbers retain their valid source spelling; object keys and strings are
   normalized. Registry snapshots are deterministic for identical response
