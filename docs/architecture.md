@@ -61,14 +61,30 @@ raw pages + sorted canonical JSONL + hashes
 bundle validate
         |
         v
-future local or AWS publisher
+transactional local SQLite explorer
 ```
 
-Collection has no AWS dependency. Future filesystem/SQLite and S3/DynamoDB
-publishers should consume only a successful, validated bundle rather than
-sharing collector internals.
+Collection has no SQLite or AWS dependency. The local explorer consumes only a
+successful, fully validated bundle, keeps official metadata in normalized
+schema-version-1 tables, and never modifies the evidence bundle. Explorer
+commands perform no network activity. Future derived analysis remains
+separate from the official imported metadata tables.
 
 Legacy checkpoint reconstruction remains inside the collection boundary. It
 derives bounded continuation state only from preserved raw Registry responses,
 creates no successful-bundle marker, and resumes into a separate immutable
 output directory.
+
+## Local catalog boundary
+
+Each snapshot import is one `BEGIN IMMEDIATE` transaction. Snapshot rows are
+visible only after every canonical record and relationship has been inserted
+and the manifest counts have been rechecked. Exact canonical server versions
+may be reused by multiple snapshots; the same server identifier and version
+with a different canonical digest is rejected as a conflict.
+
+SQLite foreign keys are enabled on every connection. The explorer keeps the
+default rollback journal and durability settings because the expected workflow
+has one local writer and bounded readers; WAL sidecars do not provide a useful
+tradeoff for this milestone. FTS5 is detected by attempting schema creation,
+with an indexed, escaped `LIKE` fallback when the linked SQLite lacks FTS5.

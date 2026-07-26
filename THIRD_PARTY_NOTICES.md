@@ -1,8 +1,15 @@
 # Third-Party Notices
 
-The C++ targets link only the C++ standard library and the selected
-operating-system/compiler toolchain. Registry collection also invokes these
-explicit system executables without a shell:
+The C++ targets use the C++ standard library, the selected
+operating-system/compiler toolchain, and this system library:
+
+- **SQLite** (`SQLite3`), public domain; used for embedded local indexing and
+  querying. SQLite is actively maintained. Major concerns are the normal
+  security considerations for database files and a native library; it has no
+  restrictive licence. SQLite source is not vendored or redistributed here.
+
+Registry collection also invokes these explicit system executables without a
+shell:
 
 - **curl** (`/usr/bin/curl`), curl licence (MIT-style); used as the maintained
   HTTP/TLS client. curl is actively maintained. The collector disables
@@ -18,7 +25,7 @@ Offline CLI tests use Python 3's standard library to host a loopback fixture
 server. Python is PSF-licensed and is a test-only dependency.
 
 No third-party source code is included in this repository. CMake, Ninja,
-compilers, curl, OpenSSL, and Python are not redistributed by this project and
-retain their respective licences. Reassess this file before adding or
-distributing any dependency, generated component, vendored asset, container
-base image, or external schema.
+compilers, SQLite, curl, OpenSSL, and Python are not redistributed by this
+project and retain their respective licences. Reassess this file before adding
+or distributing any dependency, generated component, vendored asset,
+container base image, or external schema.

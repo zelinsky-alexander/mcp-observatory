@@ -3,6 +3,8 @@ project(mcp_observatory VERSION 0.5.0 LANGUAGES CXX)
 
 option(MCPO_BUILD_TESTS "Build focused tests" ON)
 
+find_package(SQLite3 REQUIRED)
+
 execute_process(
     COMMAND git rev-parse --verify HEAD
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
@@ -15,6 +17,7 @@ if(NOT MCPO_GIT_COMMIT)
 endif()
 
 add_library(mcpo_core STATIC
+    src/explorer.cpp
     src/history.cpp
     src/inventory.cpp
     src/observation.cpp
@@ -30,6 +33,7 @@ target_compile_definitions(mcpo_core PRIVATE
 target_compile_options(mcpo_core PRIVATE
     $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall;-Wextra;-Wpedantic;-Wconversion;-Wshadow>
 )
+target_link_libraries(mcpo_core PRIVATE SQLite::SQLite3)
 
 add_executable(mcp-observatory src/main.cpp)
 target_link_libraries(mcp-observatory PRIVATE mcpo_core)
@@ -46,6 +50,12 @@ if(MCPO_BUILD_TESTS)
         NAME mcpo_registry_cli_tests
         COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_registry_cli.py
+            $<TARGET_FILE:mcp-observatory>
+    )
+    add_test(
+        NAME mcpo_explorer_cli_tests
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_explorer_cli.py
             $<TARGET_FILE:mcp-observatory>
     )
 endif()

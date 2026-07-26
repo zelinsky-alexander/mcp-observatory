@@ -1,3 +1,4 @@
+#include "observatory/explorer.hpp"
 #include "observatory/history.hpp"
 #include "observatory/inventory.hpp"
 #include "observatory/observation.hpp"
@@ -27,6 +28,11 @@ void print_usage(std::ostream& out) {
         << "  mcp-observatory history diff-latest HISTORY_JSONL TARGET_ID\n"
         << "  mcp-observatory registry collect --output DIRECTORY [OPTIONS]\n"
         << "  mcp-observatory registry checkpoint reconstruct PARTIAL_DIRECTORY [OPTIONS]\n"
+        << "  mcp-observatory registry index --bundle PATH --database PATH [OPTIONS]\n"
+        << "  mcp-observatory registry summarize DATABASE [OPTIONS]\n"
+        << "  mcp-observatory registry search DATABASE QUERY [OPTIONS]\n"
+        << "  mcp-observatory registry show DATABASE SERVER_NAME [OPTIONS]\n"
+        << "  mcp-observatory registry list DATABASE [OPTIONS]\n"
         << "  mcp-observatory bundle validate DIRECTORY\n";
 }
 
@@ -40,6 +46,297 @@ bool parse_unsigned(std::string_view text, unsigned& value) {
     if (text.empty() || text.front() == '-') return false;
     const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
     return parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size();
+}
+
+bool parse_u64(std::string_view text, std::uint64_t& value) {
+    if (text.empty() || text.front() == '-') return false;
+    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
+    return parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size();
+}
+
+int explorer_exit(mcpo::ExplorerError error) {
+    switch (error) {
+        case mcpo::ExplorerError::none: return 0;
+        case mcpo::ExplorerError::invalid_arguments: return 1;
+        case mcpo::ExplorerError::database: return 2;
+        case mcpo::ExplorerError::bundle_validation: return 3;
+        case mcpo::ExplorerError::snapshot_not_found:
+        case mcpo::ExplorerError::server_not_found: return 5;
+        case mcpo::ExplorerError::incompatible_schema: return 6;
+        case mcpo::ExplorerError::malformed_canonical: return 7;
+        case mcpo::ExplorerError::limit_exceeded: return 8;
+        case mcpo::ExplorerError::database_size_exceeded: return 9;
+    }
+    return 2;
+}
+
+int report_explorer(const mcpo::ExplorerResult& result) {
+    if (result.ok()) {
+        std::cout << result.output;
+        return 0;
+    }
+    std::cerr << result.output << '\n';
+    return explorer_exit(result.error);
+}
+
+bool parse_snapshot_option(
+    int argc,
+    char** argv,
+    int& index,
+    mcpo::SnapshotSelection& selection,
+    bool& latest,
+    std::string& error) {
+    const std::string_view argument(argv[index]);
+    if (argument == "--latest") {
+        if (selection.digest) {
+            error = "--latest contradicts --snapshot";
+            return false;
+        }
+        latest = true;
+        return true;
+    }
+    if (argument != "--snapshot") return false;
+    if (latest) {
+        error = "--snapshot contradicts --latest";
+        return false;
+    }
+    if (index + 1 >= argc) {
+        error = "missing value for --snapshot";
+        return false;
+    }
+    selection.digest = std::string(argv[++index]);
+    return true;
+}
+
+bool parse_filter_option(
+    int argc,
+    char** argv,
+    int& index,
+    mcpo::RegistryFilters& filters,
+    bool allow_hosts,
+    std::string& error) {
+    const std::string_view argument(argv[index]);
+    if (argument == "--has-repository") {
+        filters.has_repository = true;
+        return true;
+    }
+    if (argument == "--without-repository") {
+        filters.without_repository = true;
+        return true;
+    }
+    if (argument == "--has-package") {
+        filters.has_package = true;
+        return true;
+    }
+    if (argument == "--has-remote") {
+        filters.has_remote = true;
+        return true;
+    }
+    std::optional<std::string>* target = nullptr;
+    if (argument == "--status") target = &filters.status;
+    else if (argument == "--transport") target = &filters.transport;
+    else if (argument == "--package-registry") target = &filters.package_registry;
+    else if (allow_hosts && argument == "--repository-host")
+        target = &filters.repository_host;
+    else if (allow_hosts && argument == "--remote-host")
+        target = &filters.remote_host;
+    else
+        return false;
+    if (index + 1 >= argc) {
+        error = "missing value for " + std::string(argument);
+        return false;
+    }
+    *target = std::string(argv[++index]);
+    return true;
+}
+
+int run_registry_index(int argc, char** argv) {
+    mcpo::RegistryIndexOptions options;
+    bool have_bundle{};
+    bool have_database{};
+    for (int index = 3; index < argc; ++index) {
+        const std::string_view argument(argv[index]);
+        if (argument == "--verbose") {
+            options.verbose = true;
+            continue;
+        }
+        if (index + 1 >= argc) {
+            std::cerr << "missing value for " << argument << '\n';
+            return 1;
+        }
+        const std::string_view value(argv[++index]);
+        if (argument == "--bundle") {
+            options.bundle = std::string(value);
+            have_bundle = true;
+        } else if (argument == "--database") {
+            options.database = std::string(value);
+            have_database = true;
+        } else if (argument == "--maximum-records") {
+            if (!parse_size(value, options.maximum_records)) return 1;
+        } else if (argument == "--maximum-line-bytes") {
+            if (!parse_size(value, options.maximum_line_bytes)) return 1;
+        } else if (argument == "--maximum-database-bytes") {
+            if (!parse_u64(value, options.maximum_database_bytes)) return 1;
+        } else {
+            std::cerr << "unknown registry index option: " << argument << '\n';
+            return 1;
+        }
+    }
+    if (!have_bundle || !have_database) {
+        std::cerr << "registry index requires --bundle and --database\n";
+        return 1;
+    }
+    return report_explorer(mcpo::index_registry_bundle(options));
+}
+
+int run_registry_summarize(int argc, char** argv) {
+    if (argc < 4) return 1;
+    mcpo::SnapshotSelection selection;
+    mcpo::SummaryFormat format = mcpo::SummaryFormat::text;
+    bool latest{};
+    for (int index = 4; index < argc; ++index) {
+        std::string error;
+        const int before = index;
+        if (parse_snapshot_option(
+                argc, argv, index, selection, latest, error)) continue;
+        if (!error.empty()) {
+            std::cerr << error << '\n';
+            return 1;
+        }
+        index = before;
+        const std::string_view argument(argv[index]);
+        if (argument == "--format" && index + 1 < argc) {
+            const std::string_view value(argv[++index]);
+            if (value == "text") format = mcpo::SummaryFormat::text;
+            else if (value == "json") format = mcpo::SummaryFormat::json;
+            else {
+                std::cerr << "invalid summarize format\n";
+                return 1;
+            }
+        } else {
+            std::cerr << "unknown registry summarize option: " << argument << '\n';
+            return 1;
+        }
+    }
+    return report_explorer(mcpo::summarize_registry(argv[3], selection, format));
+}
+
+bool parse_rows_format(
+    std::string_view value,
+    mcpo::RowsFormat& format) {
+    if (value == "text") format = mcpo::RowsFormat::text;
+    else if (value == "jsonl") format = mcpo::RowsFormat::jsonl;
+    else return false;
+    return true;
+}
+
+int run_registry_search(int argc, char** argv) {
+    if (argc < 5) return 1;
+    mcpo::RegistrySearchOptions options;
+    options.database = argv[3];
+    options.query = argv[4];
+    bool latest{};
+    for (int index = 5; index < argc; ++index) {
+        std::string error;
+        const int before = index;
+        if (parse_snapshot_option(
+                argc, argv, index, options.snapshot, latest, error)) continue;
+        if (!error.empty()) {
+            std::cerr << error << '\n';
+            return 1;
+        }
+        index = before;
+        if (parse_filter_option(
+                argc, argv, index, options.filters, false, error)) continue;
+        if (!error.empty()) {
+            std::cerr << error << '\n';
+            return 1;
+        }
+        index = before;
+        const std::string_view argument(argv[index]);
+        if (argument == "--limit" && index + 1 < argc) {
+            if (!parse_size(argv[++index], options.limit)) return 1;
+        } else if (argument == "--offset" && index + 1 < argc) {
+            if (!parse_size(argv[++index], options.offset)) return 1;
+        } else if (argument == "--format" && index + 1 < argc) {
+            if (!parse_rows_format(argv[++index], options.format)) return 1;
+        } else {
+            std::cerr << "unknown registry search option: " << argument << '\n';
+            return 1;
+        }
+    }
+    return report_explorer(mcpo::search_registry(options));
+}
+
+int run_registry_list(int argc, char** argv) {
+    if (argc < 4) return 1;
+    mcpo::RegistryListOptions options;
+    options.database = argv[3];
+    bool latest{};
+    for (int index = 4; index < argc; ++index) {
+        std::string error;
+        const int before = index;
+        if (parse_snapshot_option(
+                argc, argv, index, options.snapshot, latest, error)) continue;
+        if (!error.empty()) {
+            std::cerr << error << '\n';
+            return 1;
+        }
+        index = before;
+        if (parse_filter_option(
+                argc, argv, index, options.filters, true, error)) continue;
+        if (!error.empty()) {
+            std::cerr << error << '\n';
+            return 1;
+        }
+        index = before;
+        const std::string_view argument(argv[index]);
+        if (argument == "--limit" && index + 1 < argc) {
+            if (!parse_size(argv[++index], options.limit)) return 1;
+        } else if (argument == "--offset" && index + 1 < argc) {
+            if (!parse_size(argv[++index], options.offset)) return 1;
+        } else if (argument == "--format" && index + 1 < argc) {
+            if (!parse_rows_format(argv[++index], options.format)) return 1;
+        } else {
+            std::cerr << "unknown registry list option: " << argument << '\n';
+            return 1;
+        }
+    }
+    return report_explorer(mcpo::list_registry(options));
+}
+
+int run_registry_show(int argc, char** argv) {
+    if (argc < 5) return 1;
+    mcpo::RegistryShowOptions options;
+    options.database = argv[3];
+    options.server_name = argv[4];
+    bool latest{};
+    for (int index = 5; index < argc; ++index) {
+        std::string error;
+        const int before = index;
+        if (parse_snapshot_option(
+                argc, argv, index, options.snapshot, latest, error)) continue;
+        if (!error.empty()) {
+            std::cerr << error << '\n';
+            return 1;
+        }
+        index = before;
+        const std::string_view argument(argv[index]);
+        if (argument == "--include-canonical") {
+            options.include_canonical = true;
+        } else if (argument == "--version" && index + 1 < argc) {
+            options.version = std::string(argv[++index]);
+        } else if (argument == "--format" && index + 1 < argc) {
+            const std::string_view value(argv[++index]);
+            if (value == "text") options.format = mcpo::ShowFormat::text;
+            else if (value == "json") options.format = mcpo::ShowFormat::json;
+            else return 1;
+        } else {
+            std::cerr << "unknown registry show option: " << argument << '\n';
+            return 1;
+        }
+    }
+    return report_explorer(mcpo::show_registry(options));
 }
 
 int run_registry_collect(int argc, char** argv) {
@@ -345,6 +642,21 @@ int main(int argc, char** argv) {
     if (argc >= 3 && std::string_view(argv[1]) == "registry" &&
         std::string_view(argv[2]) == "collect")
         return run_registry_collect(argc, argv);
+    if (argc >= 3 && std::string_view(argv[1]) == "registry" &&
+        std::string_view(argv[2]) == "index")
+        return run_registry_index(argc, argv);
+    if (argc >= 4 && std::string_view(argv[1]) == "registry" &&
+        std::string_view(argv[2]) == "summarize")
+        return run_registry_summarize(argc, argv);
+    if (argc >= 5 && std::string_view(argv[1]) == "registry" &&
+        std::string_view(argv[2]) == "search")
+        return run_registry_search(argc, argv);
+    if (argc >= 5 && std::string_view(argv[1]) == "registry" &&
+        std::string_view(argv[2]) == "show")
+        return run_registry_show(argc, argv);
+    if (argc >= 4 && std::string_view(argv[1]) == "registry" &&
+        std::string_view(argv[2]) == "list")
+        return run_registry_list(argc, argv);
     if (argc >= 5 && std::string_view(argv[1]) == "registry" &&
         std::string_view(argv[2]) == "checkpoint" &&
         std::string_view(argv[3]) == "reconstruct")

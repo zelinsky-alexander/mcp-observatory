@@ -1,4 +1,5 @@
 #include "observatory/registry.hpp"
+#include "observatory/explorer.hpp"
 
 #include <algorithm>
 #include <array>
@@ -96,6 +97,41 @@ struct Json {
     bool number{};
 };
 
+bool valid_utf8(std::string_view input) {
+    std::size_t position = 0U;
+    while (position < input.size()) {
+        const auto first = static_cast<unsigned char>(input[position++]);
+        if (first <= 0x7fU) continue;
+        unsigned continuation_count{};
+        std::uint32_t value{};
+        if (first >= 0xc2U && first <= 0xdfU) {
+            continuation_count = 1U;
+            value = first & 0x1fU;
+        } else if (first >= 0xe0U && first <= 0xefU) {
+            continuation_count = 2U;
+            value = first & 0x0fU;
+        } else if (first >= 0xf0U && first <= 0xf4U) {
+            continuation_count = 3U;
+            value = first & 0x07U;
+        } else {
+            return false;
+        }
+        if (position + continuation_count > input.size()) return false;
+        for (unsigned index = 0U; index < continuation_count; ++index) {
+            const auto continuation =
+                static_cast<unsigned char>(input[position++]);
+            if ((continuation & 0xc0U) != 0x80U) return false;
+            value = (value << 6U) | (continuation & 0x3fU);
+        }
+        if ((continuation_count == 2U &&
+             (value < 0x800U || (value >= 0xd800U && value <= 0xdfffU))) ||
+            (continuation_count == 3U &&
+             (value < 0x10000U || value > 0x10ffffU)))
+            return false;
+    }
+    return true;
+}
+
 void append_utf8(std::string& out, unsigned value) {
     if (value <= 0x7fU) {
         out.push_back(static_cast<char>(value));
@@ -119,6 +155,7 @@ public:
     explicit JsonParser(std::string_view input) : input_(input) {}
 
     bool parse(Json& out, std::string& error) {
+        if (!valid_utf8(input_)) return fail(error, "invalid UTF-8 in JSON");
         skip_space();
         if (!parse_value(out, 0U, error)) return false;
         skip_space();
@@ -316,7 +353,8 @@ private:
 void append_json_string(std::string& out, std::string_view value) {
     static constexpr char hex[] = "0123456789abcdef";
     out.push_back('"');
-    for (const unsigned char c : value) {
+    for (const char raw_character : value) {
+        const auto c = static_cast<unsigned char>(raw_character);
         switch (c) {
             case '"': out += "\\\""; break;
             case '\\': out += "\\\\"; break;
@@ -397,7 +435,8 @@ std::string lower_ascii(std::string_view input) {
 std::string percent_encode(std::string_view value) {
     static constexpr char hex[] = "0123456789ABCDEF";
     std::string result;
-    for (const unsigned char c : value) {
+    for (const char raw_character : value) {
+        const auto c = static_cast<unsigned char>(raw_character);
         if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
             (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_' || c == '~') {
             result.push_back(static_cast<char>(c));
@@ -586,30 +625,121 @@ bool sha256_bytes(
     const std::filesystem::path&,
     std::string_view bytes,
     std::string& digest,
-    std::string& error) {
-    std::array<char, 64U> path_template{};
-    std::snprintf(path_template.data(), path_template.size(), "/tmp/mcpo-hash-%ld-XXXXXX",
-                  static_cast<long>(getpid()));
-    const int descriptor = mkstemp(path_template.data());
-    if (descriptor < 0) return (error = "cannot create SHA-256 temporary input", false);
-    std::size_t written = 0U;
-    while (written < bytes.size()) {
-        const ssize_t count = write(
-            descriptor, bytes.data() + written, bytes.size() - written);
-        if (count <= 0) {
-            close(descriptor);
-            unlink(path_template.data());
-            return (error = "cannot write SHA-256 temporary input", false);
+    std::string&) {
+    static constexpr std::array<std::uint32_t, 64U> round_constants{
+        0x428a2f98U, 0x71374491U, 0xb5c0fbcfU, 0xe9b5dba5U,
+        0x3956c25bU, 0x59f111f1U, 0x923f82a4U, 0xab1c5ed5U,
+        0xd807aa98U, 0x12835b01U, 0x243185beU, 0x550c7dc3U,
+        0x72be5d74U, 0x80deb1feU, 0x9bdc06a7U, 0xc19bf174U,
+        0xe49b69c1U, 0xefbe4786U, 0x0fc19dc6U, 0x240ca1ccU,
+        0x2de92c6fU, 0x4a7484aaU, 0x5cb0a9dcU, 0x76f988daU,
+        0x983e5152U, 0xa831c66dU, 0xb00327c8U, 0xbf597fc7U,
+        0xc6e00bf3U, 0xd5a79147U, 0x06ca6351U, 0x14292967U,
+        0x27b70a85U, 0x2e1b2138U, 0x4d2c6dfcU, 0x53380d13U,
+        0x650a7354U, 0x766a0abbU, 0x81c2c92eU, 0x92722c85U,
+        0xa2bfe8a1U, 0xa81a664bU, 0xc24b8b70U, 0xc76c51a3U,
+        0xd192e819U, 0xd6990624U, 0xf40e3585U, 0x106aa070U,
+        0x19a4c116U, 0x1e376c08U, 0x2748774cU, 0x34b0bcb5U,
+        0x391c0cb3U, 0x4ed8aa4aU, 0x5b9cca4fU, 0x682e6ff3U,
+        0x748f82eeU, 0x78a5636fU, 0x84c87814U, 0x8cc70208U,
+        0x90befffaU, 0xa4506cebU, 0xbef9a3f7U, 0xc67178f2U};
+    std::array<std::uint32_t, 8U> state{
+        0x6a09e667U, 0xbb67ae85U, 0x3c6ef372U, 0xa54ff53aU,
+        0x510e527fU, 0x9b05688cU, 0x1f83d9abU, 0x5be0cd19U};
+    const auto rotate_right = [](std::uint32_t value, unsigned count) {
+        return (value >> count) | (value << (32U - count));
+    };
+    const auto transform = [&](const unsigned char* block) {
+        std::array<std::uint32_t, 64U> words{};
+        for (std::size_t index = 0U; index < 16U; ++index) {
+            const std::size_t offset = index * 4U;
+            words[index] =
+                (static_cast<std::uint32_t>(block[offset]) << 24U) |
+                (static_cast<std::uint32_t>(block[offset + 1U]) << 16U) |
+                (static_cast<std::uint32_t>(block[offset + 2U]) << 8U) |
+                static_cast<std::uint32_t>(block[offset + 3U]);
         }
-        written += static_cast<std::size_t>(count);
+        for (std::size_t index = 16U; index < words.size(); ++index) {
+            const std::uint32_t left = words[index - 15U];
+            const std::uint32_t right = words[index - 2U];
+            const std::uint32_t sigma0 =
+                rotate_right(left, 7U) ^ rotate_right(left, 18U) ^ (left >> 3U);
+            const std::uint32_t sigma1 =
+                rotate_right(right, 17U) ^ rotate_right(right, 19U) ^ (right >> 10U);
+            words[index] = words[index - 16U] + sigma0 +
+                words[index - 7U] + sigma1;
+        }
+        std::uint32_t a = state[0];
+        std::uint32_t b = state[1];
+        std::uint32_t c = state[2];
+        std::uint32_t d = state[3];
+        std::uint32_t e = state[4];
+        std::uint32_t f = state[5];
+        std::uint32_t g = state[6];
+        std::uint32_t h = state[7];
+        for (std::size_t index = 0U; index < words.size(); ++index) {
+            const std::uint32_t sum1 =
+                rotate_right(e, 6U) ^ rotate_right(e, 11U) ^ rotate_right(e, 25U);
+            const std::uint32_t choose = (e & f) ^ (~e & g);
+            const std::uint32_t temporary1 =
+                h + sum1 + choose + round_constants[index] + words[index];
+            const std::uint32_t sum0 =
+                rotate_right(a, 2U) ^ rotate_right(a, 13U) ^ rotate_right(a, 22U);
+            const std::uint32_t majority = (a & b) ^ (a & c) ^ (b & c);
+            const std::uint32_t temporary2 = sum0 + majority;
+            h = g;
+            g = f;
+            f = e;
+            e = d + temporary1;
+            d = c;
+            c = b;
+            b = a;
+            a = temporary1 + temporary2;
+        }
+        state[0] += a;
+        state[1] += b;
+        state[2] += c;
+        state[3] += d;
+        state[4] += e;
+        state[5] += f;
+        state[6] += g;
+        state[7] += h;
+    };
+
+    const auto* input =
+        reinterpret_cast<const unsigned char*>(bytes.data());
+    std::size_t consumed = 0U;
+    while (bytes.size() - consumed >= 64U) {
+        transform(input + consumed);
+        consumed += 64U;
     }
-    if (fsync(descriptor) != 0 || close(descriptor) != 0) {
-        unlink(path_template.data());
-        return (error = "cannot flush SHA-256 temporary input", false);
+    std::array<unsigned char, 128U> tail{};
+    const std::size_t remaining = bytes.size() - consumed;
+    if (remaining != 0U)
+        std::copy_n(input + consumed, remaining, tail.begin());
+    tail[remaining] = 0x80U;
+    const std::size_t padded_size = remaining < 56U ? 64U : 128U;
+    const std::uint64_t bit_length =
+        static_cast<std::uint64_t>(bytes.size()) * 8U;
+    for (unsigned index = 0U; index < 8U; ++index) {
+        tail[padded_size - 1U - index] =
+            static_cast<unsigned char>(bit_length >> (index * 8U));
     }
-    const bool success = sha256_file(path_template.data(), digest, error);
-    unlink(path_template.data());
-    return success;
+    transform(tail.data());
+    if (padded_size == 128U) transform(tail.data() + 64U);
+
+    static constexpr char hex[] = "0123456789abcdef";
+    digest.clear();
+    digest.reserve(64U);
+    for (const std::uint32_t word : state) {
+        for (int shift = 24; shift >= 0; shift -= 8) {
+            const auto byte = static_cast<unsigned char>(
+                word >> static_cast<unsigned>(shift));
+            digest.push_back(hex[byte >> 4U]);
+            digest.push_back(hex[byte & 0x0fU]);
+        }
+    }
+    return true;
 }
 
 std::optional<std::string> header_value(std::string_view headers, std::string_view wanted) {
@@ -1905,34 +2035,53 @@ bool validate_bundle_impl(
         if (!sha256_file(bundle / *path, actual_digest, error) || actual_digest != *digest)
             return (message = "artifact SHA-256 mismatch: " + *path, false);
     }
-    std::string canonical;
-    if (!read_file(bundle / "canonical/servers.jsonl", 512U * 1024U * 1024U, canonical, message))
-        return false;
+    const std::filesystem::path canonical_path =
+        bundle / "canonical/servers.jsonl";
+    std::error_code canonical_ec;
+    const auto canonical_size =
+        std::filesystem::file_size(canonical_path, canonical_ec);
+    if (canonical_ec || canonical_size > 512U * 1024U * 1024U)
+        return (message = "invalid or oversized file: " +
+            canonical_path.string(), false);
     std::string actual_snapshot;
-    if (!sha256_file(bundle / "canonical/servers.jsonl", actual_snapshot, error) ||
+    if (!sha256_file(canonical_path, actual_snapshot, error) ||
         actual_snapshot != *snapshot)
         return (message = "snapshot SHA-256 mismatch", false);
     std::string previous_identity;
     std::size_t canonical_count = 0U;
-    std::istringstream lines(canonical);
+    std::ifstream lines(canonical_path, std::ios::binary);
+    if (!lines) return (message = "cannot open " + canonical_path.string(), false);
     std::string line;
     while (std::getline(lines, line)) {
-        if (line.empty()) return (message = "empty canonical JSONL record", false);
+        ++canonical_count;
+        if (line.empty())
+            return (message = "empty canonical JSONL record at line " +
+                std::to_string(canonical_count), false);
+        if (line.size() > 8U * 1024U * 1024U)
+            return (message = "oversized canonical JSONL record at line " +
+                std::to_string(canonical_count), false);
         Json record_json;
         JsonParser record_parser(line);
-        if (!record_parser.parse(record_json, error)) return (message = "invalid canonical JSONL", false);
+        if (!record_parser.parse(record_json, error))
+            return (message = "invalid canonical JSONL at line " +
+                std::to_string(canonical_count) + ": " + error, false);
         std::string normalized;
         canonical_json(record_json, normalized);
-        if (normalized != line) return (message = "canonical JSONL record is not normalized", false);
+        if (normalized != line)
+            return (message = "canonical JSONL record is not normalized at line " +
+                std::to_string(canonical_count), false);
         const Json::Object* record = object_value(record_json);
-        if (record == nullptr) return (message = "canonical record must be an object", false);
+        if (record == nullptr)
+            return (message = "canonical record must be an object at line " +
+                std::to_string(canonical_count), false);
         const std::string* name = string_member(*record, "server_identifier");
         const std::string* version = string_member(*record, "server_version");
         const std::string* observed = string_member(*record, "observed_at");
         const std::string* declared_record_hash = string_member(*record, "canonical_sha256");
         if (name == nullptr || version == nullptr || observed == nullptr ||
             declared_record_hash == nullptr || !valid_utc_timestamp(*observed))
-            return (message = "invalid canonical identity, timestamp, or hash", false);
+            return (message = "invalid canonical identity, timestamp, or hash at line " +
+                std::to_string(canonical_count), false);
         Json::Object logical = *record;
         logical.erase("observed_at");
         logical.erase("canonical_sha256");
@@ -1942,13 +2091,16 @@ bool validate_bundle_impl(
         std::string actual_record_hash;
         if (!sha256_bytes(bundle, logical_bytes, actual_record_hash, error) ||
             actual_record_hash != *declared_record_hash)
-            return (message = "canonical record content hash mismatch", false);
+            return (message = "canonical record content hash mismatch at line " +
+                std::to_string(canonical_count), false);
         const std::string identity = *name + "\n" + *version;
         if (!previous_identity.empty() && identity <= previous_identity)
-            return (message = "canonical records are not strictly ordered", false);
+            return (message = "canonical records are not strictly ordered at line " +
+                std::to_string(canonical_count), false);
         previous_identity = identity;
-        ++canonical_count;
     }
+    if (lines.bad())
+        return (message = "cannot read " + canonical_path.string(), false);
     const Json::Object* counts = object_member(*manifest, "counts");
     if (counts == nullptr) return (message = "manifest counts missing", false);
     const auto unique_it = counts->find("unique_server_versions");
@@ -1963,9 +2115,16 @@ bool validate_bundle_impl(
     if (converted.ec != std::errc{} || converted.ptr != expected_text->data() + expected_text->size() ||
         expected != canonical_count)
         return (message = "canonical record count mismatch", false);
-    std::string pages;
-    if (!read_file(bundle / "raw/pages.jsonl", 128U * 1024U * 1024U, pages, message)) return false;
-    std::istringstream page_lines(pages);
+    const std::filesystem::path page_index_path = bundle / "raw/pages.jsonl";
+    std::error_code page_index_ec;
+    const auto page_index_size =
+        std::filesystem::file_size(page_index_path, page_index_ec);
+    if (page_index_ec || page_index_size > 128U * 1024U * 1024U)
+        return (message = "invalid or oversized file: " +
+            page_index_path.string(), false);
+    std::ifstream page_lines(page_index_path, std::ios::binary);
+    if (!page_lines)
+        return (message = "cannot open " + page_index_path.string(), false);
     std::size_t page_count = 0U;
     while (std::getline(page_lines, line)) {
         if (line.empty()) return (message = "empty raw page metadata record", false);
@@ -2004,6 +2163,8 @@ bool validate_bundle_impl(
             return (message = "raw page SHA-256 mismatch", false);
         ++page_count;
     }
+    if (page_lines.bad())
+        return (message = "cannot read " + page_index_path.string(), false);
     const auto pages_it = counts->find("pages");
     std::size_t expected_pages{};
     const std::string* pages_text = pages_it == counts->end() ? nullptr :
@@ -2024,6 +2185,292 @@ bool validate_bundle_impl(
 
 bool validate_bundle(const std::filesystem::path& bundle, std::string& message) {
     return validate_bundle_impl(bundle, true, message);
+}
+
+namespace {
+
+bool json_size_member(
+    const Json::Object& object,
+    std::string_view key,
+    std::size_t& value) {
+    const auto found = object.find(std::string(key));
+    if (found == object.end() || !found->second.number) return false;
+    const auto* text = std::get_if<std::string>(&found->second.value);
+    if (text == nullptr || text->empty() || text->front() == '-') return false;
+    const auto parsed = std::from_chars(text->data(), text->data() + text->size(), value);
+    return parsed.ec == std::errc{} && parsed.ptr == text->data() + text->size();
+}
+
+bool optional_string_member(
+    const Json::Object& object,
+    std::string_view key,
+    std::optional<std::string>& output,
+    std::string& error) {
+    const auto found = object.find(std::string(key));
+    if (found == object.end() ||
+        std::holds_alternative<std::nullptr_t>(found->second.value)) {
+        output.reset();
+        return true;
+    }
+    if (found->second.number) {
+        error = std::string(key) + " must be a string or null";
+        return false;
+    }
+    const auto* value = std::get_if<std::string>(&found->second.value);
+    if (value == nullptr) {
+        error = std::string(key) + " must be a string or null";
+        return false;
+    }
+    output = *value;
+    return true;
+}
+
+bool required_nonempty_string(
+    const Json::Object& object,
+    std::string_view key,
+    std::string& output,
+    std::string& error) {
+    const std::string* value = string_member(object, key);
+    if (value == nullptr || value->empty()) {
+        error = std::string(key) + " must be a non-empty string";
+        return false;
+    }
+    output = *value;
+    return true;
+}
+
+bool required_string(
+    const Json::Object& object,
+    std::string_view key,
+    std::string& output,
+    std::string& error) {
+    const std::string* value = string_member(object, key);
+    if (value == nullptr) {
+        error = std::string(key) + " must be a string";
+        return false;
+    }
+    output = *value;
+    return true;
+}
+
+bool optional_bool_member(
+    const Json::Object& object,
+    std::string_view key,
+    bool& output,
+    std::string& error) {
+    const auto found = object.find(std::string(key));
+    if (found == object.end()) {
+        output = false;
+        return true;
+    }
+    const auto* value = std::get_if<bool>(&found->second.value);
+    if (value == nullptr) {
+        error = std::string(key) + " must be a boolean";
+        return false;
+    }
+    output = *value;
+    return true;
+}
+
+bool parse_transport(
+    const Json::Object& parent,
+    std::string& transport,
+    std::string& error) {
+    const Json::Object* object = object_member(parent, "transport");
+    if (object == nullptr ||
+        !required_nonempty_string(*object, "type", transport, error)) {
+        if (error.empty()) error = "transport must be an object with a type";
+        return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+bool read_registry_bundle_manifest(
+    const std::filesystem::path& bundle,
+    RegistryBundleManifest& result,
+    std::string& error) {
+    std::string bytes;
+    if (!read_file(bundle / "manifest.json", 4U * 1024U * 1024U, bytes, error))
+        return false;
+    Json root;
+    JsonParser parser(bytes);
+    if (!parser.parse(root, error)) {
+        error = "malformed manifest.json: " + error;
+        return false;
+    }
+    const Json::Object* manifest = object_value(root);
+    const Json::Object* counts =
+        manifest == nullptr ? nullptr : object_member(*manifest, "counts");
+    if (manifest == nullptr || counts == nullptr ||
+        !required_nonempty_string(
+            *manifest, "snapshot_sha256", result.snapshot_sha256, error) ||
+        !required_nonempty_string(
+            *manifest, "completed_at", result.completed_at, error) ||
+        !required_nonempty_string(
+            *manifest, "started_at", result.started_at, error) ||
+        !required_nonempty_string(
+            *manifest, "registry_base_url", result.registry_base_url, error) ||
+        !json_size_member(*manifest, "bundle_version", result.bundle_version) ||
+        !json_size_member(*counts, "pages", result.pages) ||
+        !json_size_member(*counts, "records_received", result.records_received) ||
+        !json_size_member(
+            *counts, "unique_server_versions", result.unique_server_versions)) {
+        if (error.empty()) error = "manifest metadata or counts are invalid";
+        return false;
+    }
+    const Json::Object* collector = object_member(*manifest, "collector");
+    if (collector != nullptr) {
+        if (!optional_string_member(
+                *collector, "name", result.collector_name, error) ||
+            !optional_string_member(
+                *collector, "version", result.collector_version, error) ||
+            !optional_string_member(
+                *collector, "git_commit", result.collector_git_commit, error))
+            return false;
+    }
+    return true;
+}
+
+bool parse_registry_canonical_record(
+    std::string_view line,
+    RegistryCanonicalRecord& result,
+    std::string& error) {
+    result = {};
+    Json root;
+    JsonParser parser(line);
+    if (!parser.parse(root, error)) return false;
+    const Json::Object* record = object_value(root);
+    if (record == nullptr) return (error = "canonical record must be an object", false);
+    if (!required_nonempty_string(
+            *record, "server_identifier", result.server_identifier, error) ||
+        !valid_server_name(result.server_identifier) ||
+        !required_nonempty_string(
+            *record, "server_version", result.server_version, error) ||
+        !valid_server_version(result.server_version) ||
+        !required_nonempty_string(
+            *record, "canonical_sha256", result.canonical_sha256, error)) {
+        if (error.empty()) error = "invalid canonical identity";
+        return false;
+    }
+    if (!optional_string_member(
+            *record, "description", result.description, error))
+        return false;
+
+    const auto repository_it = record->find("repository");
+    if (repository_it != record->end()) {
+        const Json::Object* repository =
+            std::get_if<Json::Object>(&repository_it->second.value);
+        RegistryRepositoryRecord parsed;
+        if (repository == nullptr ||
+            !optional_string_member(
+                *repository, "source", parsed.source, error) ||
+            !optional_string_member(
+                *repository, "url", parsed.url, error)) {
+            if (error.empty()) error = "repository must be an object";
+            return false;
+        }
+        result.repository = std::move(parsed);
+    }
+
+    const auto packages_it = record->find("packages");
+    if (packages_it != record->end()) {
+        const auto* packages = std::get_if<Json::Array>(&packages_it->second.value);
+        if (packages == nullptr) return (error = "packages must be an array", false);
+        for (const Json& entry : *packages) {
+            const Json::Object* package = object_value(entry);
+            RegistryPackageRecord parsed;
+            if (package == nullptr ||
+                !required_nonempty_string(
+                    *package, "registryType", parsed.registry_type, error) ||
+                !required_nonempty_string(
+                    *package, "identifier", parsed.identifier, error) ||
+                !optional_string_member(
+                    *package, "version", parsed.version, error) ||
+                !parse_transport(*package, parsed.transport, error)) {
+                if (error.empty()) error = "invalid package declaration";
+                return false;
+            }
+            const auto arguments_it = package->find("packageArguments");
+            if (arguments_it != package->end()) {
+                const auto* arguments =
+                    std::get_if<Json::Array>(&arguments_it->second.value);
+                if (arguments == nullptr)
+                    return (error = "packageArguments must be an array", false);
+                for (const Json& argument_value : *arguments) {
+                    const Json::Object* argument = object_value(argument_value);
+                    RegistryPackageArgumentRecord parsed_argument;
+                    if (argument == nullptr) {
+                        error = "package argument must be an object";
+                        return false;
+                    }
+                    if (!optional_string_member(
+                            *argument, "value", parsed_argument.value, error))
+                        return false;
+                    parsed.arguments.push_back(std::move(parsed_argument));
+                }
+            }
+            const auto environment_it = package->find("environmentVariables");
+            if (environment_it != package->end()) {
+                const auto* environment =
+                    std::get_if<Json::Array>(&environment_it->second.value);
+                if (environment == nullptr)
+                    return (error = "environmentVariables must be an array", false);
+                for (const Json& environment_value : *environment) {
+                    const Json::Object* declaration = object_value(environment_value);
+                    RegistryEnvironmentRecord parsed_environment;
+                    if (declaration == nullptr ||
+                        !required_string(
+                            *declaration, "name", parsed_environment.name, error) ||
+                        !optional_bool_member(
+                            *declaration, "isRequired",
+                            parsed_environment.required, error) ||
+                        !optional_string_member(
+                            *declaration, "description",
+                            parsed_environment.description, error)) {
+                        if (error.empty()) error = "invalid environment declaration";
+                        return false;
+                    }
+                    parsed.environment.push_back(std::move(parsed_environment));
+                }
+            }
+            result.packages.push_back(std::move(parsed));
+        }
+    }
+
+    const auto remotes_it = record->find("remotes");
+    if (remotes_it != record->end()) {
+        const auto* remotes = std::get_if<Json::Array>(&remotes_it->second.value);
+        if (remotes == nullptr) return (error = "remotes must be an array", false);
+        for (const Json& entry : *remotes) {
+            const Json::Object* remote = object_value(entry);
+            RegistryRemoteRecord parsed;
+            if (remote == nullptr ||
+                !required_nonempty_string(*remote, "url", parsed.url, error) ||
+                !required_nonempty_string(*remote, "type", parsed.transport, error)) {
+                if (error.empty()) error = "invalid remote declaration";
+                return false;
+            }
+            result.remotes.push_back(std::move(parsed));
+        }
+    }
+
+    const Json::Object* original = object_member(*record, "original");
+    const Json::Object* metadata = original == nullptr ?
+        nullptr : object_member(*original, "_meta");
+    const Json::Object* official = metadata == nullptr ?
+        nullptr : object_member(*metadata, "io.modelcontextprotocol.registry/official");
+    if (official != nullptr) {
+        if (!optional_string_member(
+                *official, "status", result.registry_status, error) ||
+            !optional_string_member(
+                *official, "publishedAt", result.published_at, error) ||
+            !optional_string_member(
+                *official, "updatedAt", result.updated_at, error))
+            return false;
+    }
+    return true;
 }
 
 }  // namespace mcpo

@@ -18,7 +18,10 @@ Requirements:
 - Ninja
 - A C++20 compiler such as Clang 17+ or GCC 13+
 - `/usr/bin/curl` and `/usr/bin/openssl` for registry collection and hashing
+- SQLite 3 development files for the local Registry explorer
 - Python 3 for the offline loopback HTTP tests
+
+On Ubuntu/WSL, SQLite development files are provided by `libsqlite3-dev`.
 
 ```bash
 cmake --preset dev-debug
@@ -137,6 +140,68 @@ The resume directory remains partial evidence and is not promoted or
 overwritten. When the final reconstructed page has no next cursor, resume
 performs no HTTP request and finalizes the new bundle from the validated raw
 pages.
+
+## Local Registry Explorer v0.1
+
+The explorer indexes official registry metadata from an immutable completed
+bundle. It performs no network enrichment. It does not determine whether an
+MCP server is safe, vulnerable or malicious. Security findings and
+longitudinal comparison are planned for later milestones.
+
+SQLite is required through the system development package; SQLite source is
+not vendored. Indexing first runs the authoritative full bundle validator,
+then streams `canonical/servers.jsonl` into one `BEGIN IMMEDIATE` transaction.
+A failed import is rolled back and exposes no snapshot. The source bundle is
+never modified.
+
+```bash
+./build/release/mcp-observatory registry index \
+  --bundle /home/alex/source/mcp-observatory/official-run-resumed \
+  --database /home/alex/source/mcp-observatory/local-registry.sqlite
+
+./build/release/mcp-observatory registry summarize \
+  /home/alex/source/mcp-observatory/local-registry.sqlite
+
+./build/release/mcp-observatory registry search \
+  /home/alex/source/mcp-observatory/local-registry.sqlite github \
+  --limit 20
+
+./build/release/mcp-observatory registry list \
+  /home/alex/source/mcp-observatory/local-registry.sqlite \
+  --has-remote \
+  --without-repository \
+  --limit 50
+
+./build/release/mcp-observatory registry show \
+  /home/alex/source/mcp-observatory/local-registry.sqlite \
+  io.example/server
+```
+
+`registry index` accepts `--maximum-records`,
+`--maximum-line-bytes`, `--maximum-database-bytes`, and `--verbose`. Defaults
+are 500,000 records, 8 MiB per canonical line, and 4 GiB for the database.
+
+`registry summarize` selects the snapshot with the latest bytewise
+`completed_at` value and highest snapshot ID tie-breaker unless
+`--snapshot DIGEST` is supplied. It supports `--format text|json`.
+
+`registry search` searches server identifiers, descriptions, package
+identifiers, repository URLs, remote URLs, and remote hosts. It supports
+snapshot selection, `--limit` (maximum 500), `--offset`, status/transport and
+presence filters, and `--format text|jsonl`. Schema creation explicitly tries
+FTS5. When the linked SQLite does not provide FTS5, the schema records `like`
+mode and search uses prepared, escaped, bounded `LIKE` expressions with the
+same filters and result shape.
+
+`registry list` supports status, transport, package-registry, repository-host,
+remote-host, and presence filters with `--limit` (maximum 1,000), `--offset`,
+and text or JSONL output. `registry show` performs exact server-name matching,
+optionally selects `--version`, and emits canonical JSON only with
+`--include-canonical`. Version strings use deterministic bytewise ordering,
+not semantic-version ordering.
+
+The complete schema and import/query behavior are documented in
+[`docs/registry-explorer-v1.md`](docs/registry-explorer-v1.md).
 
 The same build commands work in Ubuntu and WSL. In Docker, CI, or an AWS Lambda
 Linux container, install the build toolchain for compilation and ensure the
