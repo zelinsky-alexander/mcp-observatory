@@ -46,6 +46,34 @@ The default SQLite rollback journal and durability configuration are retained.
 WAL is not enabled because this v0.1 workflow has one bounded local writer and
 does not need WAL sidecar lifecycle or write-concurrency behavior.
 
+### Periodic refresh
+
+`registry refresh --database PATH --output PATH` composes the existing
+collector, authoritative validator, and transactional importer. Before output
+creation or network access it opens the catalog read-only and selects:
+
+```sql
+ORDER BY completed_at COLLATE BINARY DESC, id DESC LIMIT 1
+```
+
+The selected snapshot's exact `completed_at` is the default Official Registry
+`updated_since` filter. `--updated-since YYYY-MM-DDTHH:MM:SSZ` overrides the
+filter for testing or recovery but does not remove the baseline requirement.
+No snapshot produces `no_baseline_snapshot`; refresh does not create output,
+modify the database, contact the Registry, or fall back to a full collection.
+
+Refresh creates a normal immutable bundle first, then imports it. Successful
+text or JSON output includes collection mode, filter, portable baseline
+digest, new snapshot digest, completed pages, received records, inserted and
+reused immutable versions, changed identity records, and snapshot links. A
+zero-record response is valid and creates a snapshot with zero links.
+
+If collection completes but import fails, `_SUCCESS` and the valid bundle are
+preserved, the SQLite transaction is rolled back, and the command reports
+`collection_completed_import_failed`. `registry index` can import that bundle
+later. A different canonical digest for an existing identifier/version is a
+new immutable historical variant, not an identity conflict.
+
 ## Schema
 
 `schema_info` contains one singleton row with `schema_version=1`, the creating
@@ -57,11 +85,21 @@ registry base URL, collector name/version/commit, bundle version, absolute
 source bundle path, page and record counts, unique version count, and import
 timestamp.
 
+Schema version 1 is unchanged by periodic refresh. Incremental provenance is
+portable bundle evidence rather than a dependency on a database-local
+snapshot integer. Manifest version 1 remains a legacy full bundle. New
+manifest version 2 explicitly uses `collection_mode` equal to `full` or
+`incremental`; only incremental manifests carry `updated_since`,
+`base_snapshot_sha256`, and `base_snapshot_completed_at`.
+
 `server_versions` preserves identifier, exact version string, description,
 official Registry status and timestamps, canonical digest, and complete
 canonical JSON. Its immutable uniqueness key is
-`(server_identifier, server_version, canonical_sha256)`. Import explicitly
-rejects a different digest for an identifier/version already in the catalog.
+`(server_identifier, server_version, canonical_sha256)`. Import reuses an exact
+digest and inserts a new immutable variant when Registry metadata changes for
+an existing identifier/version. `changed_identity_records` counts those new
+digests under identities already present in the catalog; it is a subset of
+`inserted_server_versions`.
 
 `snapshot_server_versions` is the many-to-many snapshot relationship.
 `repositories`, `packages`, `package_arguments`, `package_environment`, and
@@ -73,6 +111,12 @@ relationship with nullable source/URL fields. Package argument declarations
 without a literal `value` are preserved in order with SQL `NULL` for
 `argument_value`; no value is inferred from a name, hint, or default. The
 complete declaration remains in canonical JSON.
+
+Incremental import links every returned canonical record to the new snapshot,
+reuses exact immutable versions, and retains earlier snapshots and source
+records. Absence from a change response never marks a version deleted,
+inactive, removed, or superseded. Re-importing the same incremental bundle is
+idempotent because `snapshot_sha256` is unique.
 
 HTTP(S) URL scheme, lowercase host, and explicit port are extracted only when
 the authority can be parsed without credentials. Repository owner/name are

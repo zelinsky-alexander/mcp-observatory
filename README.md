@@ -56,6 +56,10 @@ ctest --preset dev-debug
 ./build/dev-debug/mcp-observatory registry collect \
   --output ./official-run
 
+./build/dev-debug/mcp-observatory registry refresh \
+  --database ./db/local-registry.sqlite \
+  --output ./registry-refresh
+
 ./build/dev-debug/mcp-observatory bundle validate ./official-run
 ```
 
@@ -184,6 +188,100 @@ The resume directory remains partial evidence and is not promoted or
 overwritten. When the final reconstructed page has no next cursor, resume
 performs no HTTP request and finalizes the new bundle from the validated raw
 pages.
+
+### Full collection, resume, and periodic refresh
+
+`registry collect` starts a new full collection. `registry collect --resume`
+continues the first uncommitted page of an interrupted cursor chain.
+`registry refresh` instead starts a new immutable incremental collection and
+applies the Official Registry `updated_since` filter to every cursor request.
+
+Refresh requires a completed snapshot already indexed in SQLite. It opens the
+catalog read-only first and selects the greatest bytewise `completed_at`, with
+the highest local snapshot ID breaking ties. That exact timestamp is the
+default filter, while the baseline snapshot SHA-256 and completion timestamp
+are recorded as portable provenance. A missing baseline fails as
+`no_baseline_snapshot` before network access, output creation, or database
+modification; refresh never silently bootstraps a full collection.
+
+```bash
+./build/release/mcp-observatory registry refresh \
+  --database db/local-registry.sqlite \
+  --output registry-refresh-20260727T120000Z
+```
+
+For testing or recovery, override only the filter value:
+
+```bash
+./build/release/mcp-observatory registry refresh \
+  --database db/local-registry.sqlite \
+  --output registry-refresh-recovery \
+  --updated-since 2026-07-26T18:42:11Z \
+  --format json
+```
+
+The timestamp must be exactly `YYYY-MM-DDTHH:MM:SSZ`; it is percent-encoded in
+requests and preserved byte-for-byte in checkpoint and bundle evidence.
+Refresh accepts the collector's existing timeout, retry, redirect, page,
+record, byte, resume, Registry URL, and verbose options. Incremental
+checkpoints bind the Registry URL, collection mode, exact timestamp, baseline
+digest, and baseline completion time. Changing any bound provenance fails
+closed. Legacy checkpoints remain full-collection checkpoints.
+
+A valid zero-record response succeeds, creates a validated immutable bundle,
+and imports a new zero-link snapshot. Absence from an incremental response
+never means deletion, inactivity, or removal; historical snapshots, records,
+and links remain unchanged.
+
+Text output uses stable `name=value` fields:
+
+```text
+status=completed
+collection_mode=incremental
+updated_since=2026-07-26T18:42:11Z
+base_snapshot_sha256=<baseline-digest>
+snapshot_sha256=<incremental-digest>
+completed_pages=2
+received_records=37
+inserted_server_versions=12
+reused_server_versions=25
+changed_identity_records=4
+snapshot_links_created=37
+```
+
+`--format json` emits the same fields as one JSON object with numeric counts.
+Progress goes only to standard error.
+
+If collection succeeds but transactional import fails, refresh preserves the
+valid bundle and `_SUCCESS`, rolls back the database fully, exits non-zero,
+and reports `collection_completed_import_failed`. After resolving the local
+catalog issue, retry the existing importer:
+
+```bash
+mcp-observatory registry index \
+  --bundle registry-refresh-recovery \
+  --database db/local-registry.sqlite
+```
+
+Example scheduled workflow (the project does not install or enable a
+scheduler):
+
+```bash
+stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+
+mcp-observatory registry refresh \
+  --database db/local-registry.sqlite \
+  --output "registry-refresh-${stamp}" \
+  --request-timeout-seconds 60 \
+  --stall-timeout-seconds 300 \
+  --run-timeout-seconds 900 \
+  --maximum-attempts-per-page 8 \
+  --verbose
+```
+
+Current limitations: refresh requires an indexed baseline; it does not infer
+removals, construct a merged current-state snapshot, download packages,
+execute servers, invoke MCP tools, or manage scheduling or retention.
 
 ## Local Registry Explorer v0.1
 

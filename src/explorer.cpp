@@ -37,7 +37,7 @@ bool fits_sqlite_integer(std::size_t value) {
 }
 
 ExplorerResult failure(ExplorerError error, std::string message) {
-    return {error, std::move(message)};
+    return {error, std::move(message), std::nullopt};
 }
 
 std::string elapsed_text(std::chrono::steady_clock::duration duration) {
@@ -562,7 +562,8 @@ UrlParts parse_url_parts(std::string_view url, bool derive_repository) {
 }
 
 struct ImportStatements {
-    Statement identity;
+    Statement exact_identity;
+    Statement identity_exists;
     Statement insert_server;
     Statement link;
     Statement repository;
@@ -573,9 +574,15 @@ struct ImportStatements {
     Statement fts;
 
     bool prepare(Database& database, bool fts_enabled, std::string& error) {
-        return identity.prepare(
+        return exact_identity.prepare(
                    database,
-                   "SELECT id,canonical_sha256 FROM server_versions "
+                   "SELECT id FROM server_versions "
+                   "WHERE server_identifier=?1 AND server_version=?2 "
+                   "AND canonical_sha256=?3;",
+                   error) &&
+            identity_exists.prepare(
+                   database,
+                   "SELECT 1 FROM server_versions "
                    "WHERE server_identifier=?1 AND server_version=?2 LIMIT 1;",
                    error) &&
             insert_server.prepare(
@@ -765,7 +772,7 @@ ExplorerResult index_registry_bundle(const RegistryIndexOptions& options) {
     RegistryBundleManifest manifest;
     if (!read_registry_bundle_manifest(options.bundle, manifest, detail))
         return failure(ExplorerError::bundle_validation, detail);
-    if (manifest.bundle_version != 1U)
+    if (manifest.bundle_version != 1U && manifest.bundle_version != 2U)
         return failure(
             ExplorerError::bundle_validation,
             "unsupported registry bundle version " +
@@ -847,7 +854,9 @@ ExplorerResult index_registry_bundle(const RegistryIndexOptions& options) {
                << "snapshot_sha256=" << manifest.snapshot_sha256 << '\n'
                << "snapshot_id=" << snapshot_id << '\n'
                << "database=" << options.database.string() << '\n';
-        return {ExplorerError::none, output.str()};
+        RegistryIndexStats stats;
+        stats.snapshot_already_indexed = true;
+        return {ExplorerError::none, output.str(), stats};
     }
     if (existing_result != SQLITE_DONE)
         return failure(
@@ -909,6 +918,10 @@ ExplorerResult index_registry_bundle(const RegistryIndexOptions& options) {
     std::size_t repositories{};
     std::size_t packages{};
     std::size_t remotes{};
+    std::size_t inserted_server_versions{};
+    std::size_t reused_server_versions{};
+    std::size_t changed_identity_records{};
+    std::size_t snapshot_links_created{};
     std::string previous_name;
     std::string line;
     while (std::getline(input, line)) {
@@ -942,28 +955,42 @@ ExplorerResult index_registry_bundle(const RegistryIndexOptions& options) {
         packages += record.packages.size();
         remotes += record.remotes.size();
 
-        statements.identity.reset();
-        if (!statements.identity.bind_text(1, record.server_identifier, detail) ||
-            !statements.identity.bind_text(2, record.server_version, detail))
+        statements.exact_identity.reset();
+        if (!statements.exact_identity.bind_text(
+                1, record.server_identifier, detail) ||
+            !statements.exact_identity.bind_text(
+                2, record.server_version, detail) ||
+            !statements.exact_identity.bind_text(
+                3, record.canonical_sha256, detail))
             return failure(ExplorerError::database, detail);
-        const int identity_result = statements.identity.step();
+        const int identity_result = statements.exact_identity.step();
         sqlite3_int64 server_id{};
         bool is_new = identity_result == SQLITE_DONE;
         if (identity_result == SQLITE_ROW) {
-            server_id = statements.identity.integer(0);
-            if (statements.identity.text(1) != record.canonical_sha256)
-                return failure(
-                    ExplorerError::malformed_canonical,
-                    "canonical identity conflict at line " +
-                        std::to_string(imported) + " for " +
-                        record.server_identifier + "@" + record.server_version);
+            server_id = statements.exact_identity.integer(0);
+            ++reused_server_versions;
         } else if (identity_result != SQLITE_DONE) {
             return failure(
                 ExplorerError::database,
-                sqlite_message(database.get(), "query canonical identity"));
+                sqlite_message(database.get(), "query exact canonical identity"));
         }
 
         if (is_new) {
+            statements.identity_exists.reset();
+            if (!statements.identity_exists.bind_text(
+                    1, record.server_identifier, detail) ||
+                !statements.identity_exists.bind_text(
+                    2, record.server_version, detail))
+                return failure(ExplorerError::database, detail);
+            const int exists_result = statements.identity_exists.step();
+            if (exists_result == SQLITE_ROW) {
+                ++changed_identity_records;
+            } else if (exists_result != SQLITE_DONE) {
+                return failure(
+                    ExplorerError::database,
+                    sqlite_message(database.get(), "query canonical identity"));
+            }
+            ++inserted_server_versions;
             statements.insert_server.reset();
             if (!statements.insert_server.bind_text(
                     1, record.server_identifier, detail) ||
@@ -998,6 +1025,7 @@ ExplorerResult index_registry_bundle(const RegistryIndexOptions& options) {
                 ExplorerError::malformed_canonical,
                 "duplicate exact identity at canonical line " +
                     std::to_string(imported) + ": " + detail);
+        ++snapshot_links_created;
 
         if (options.verbose && imported % 10'000U == 0U)
             progress(
@@ -1074,12 +1102,24 @@ ExplorerResult index_registry_bundle(const RegistryIndexOptions& options) {
            << "snapshot_id=" << snapshot_id << '\n'
            << "snapshot_sha256=" << manifest.snapshot_sha256 << '\n'
            << "records=" << imported << '\n'
+           << "inserted_server_versions=" << inserted_server_versions << '\n'
+           << "reused_server_versions=" << reused_server_versions << '\n'
+           << "changed_identity_records=" << changed_identity_records << '\n'
+           << "snapshot_links_created=" << snapshot_links_created << '\n'
            << "unique_server_names=" << unique_names << '\n'
            << "repositories=" << repositories << '\n'
            << "packages=" << packages << '\n'
            << "remotes=" << remotes << '\n'
            << "database=" << options.database.string() << '\n';
-    return {ExplorerError::none, output.str()};
+    return {
+        ExplorerError::none,
+        output.str(),
+        RegistryIndexStats{
+            inserted_server_versions,
+            reused_server_versions,
+            changed_identity_records,
+            snapshot_links_created,
+            false}};
 }
 
 namespace {
@@ -1410,10 +1450,27 @@ ExplorerResult execute_rows(
             query.optional_text(3), query.optional_text(4),
             query.integer(5), query.integer(6)});
     }
-    return {ExplorerError::none, render_rows(rows, format)};
+    return {ExplorerError::none, render_rows(rows, format), std::nullopt};
 }
 
 }  // namespace
+
+ExplorerResult latest_registry_snapshot(
+    const std::filesystem::path& database_path,
+    RegistryBaselineSnapshot& result) {
+    Database database;
+    std::string search_mode;
+    ExplorerResult opened = open_catalog(database_path, database, search_mode);
+    if (!opened.ok()) return opened;
+    SelectedSnapshot selected;
+    ExplorerResult selection =
+        select_snapshot(database, SnapshotSelection{}, selected);
+    if (!selection.ok()) return selection;
+    result.id = selected.id;
+    result.snapshot_sha256 = std::move(selected.digest);
+    result.completed_at = std::move(selected.completed_at);
+    return {};
+}
 
 ExplorerResult summarize_registry(
     const std::filesystem::path& database_path,
@@ -1550,7 +1607,7 @@ ExplorerResult summarize_registry(
         }
         output << "}\n";
     }
-    return {ExplorerError::none, output.str()};
+    return {ExplorerError::none, output.str(), std::nullopt};
 }
 
 ExplorerResult search_registry(const RegistrySearchOptions& options) {
@@ -1951,7 +2008,8 @@ ExplorerResult show_registry(const RegistryShowOptions& options) {
         ExplorerError::none,
         options.format == ShowFormat::json ?
             show_json(records, snapshot.digest, options.include_canonical) :
-            show_text(records, snapshot.digest, options.include_canonical)};
+            show_text(records, snapshot.digest, options.include_canonical),
+        std::nullopt};
 }
 
 }  // namespace mcpo

@@ -38,10 +38,23 @@ struct RegistryUrl {
     std::string normalized;
 };
 
+enum class RegistryCollectionMode {
+    full,
+    incremental,
+};
+
+struct RegistryIncrementalProvenance {
+    std::string updated_since;
+    std::string base_snapshot_sha256;
+    std::string base_snapshot_completed_at;
+};
+
 struct RegistryCollectOptions {
     std::filesystem::path output;
     std::optional<std::filesystem::path> resume;
     std::string registry_base_url{official_registry_base_url};
+    RegistryCollectionMode collection_mode{RegistryCollectionMode::full};
+    std::optional<RegistryIncrementalProvenance> incremental;
     RegistryLimits limits{};
     RegistryRuntimePolicy runtime{};
     bool retain_raw{true};
@@ -101,7 +114,8 @@ using HttpTransport = std::function<bool(
 
 [[nodiscard]] std::string registry_api_url(
     const RegistryUrl& base,
-    std::optional<std::string_view> cursor);
+    std::optional<std::string_view> cursor,
+    std::optional<std::string_view> updated_since = std::nullopt);
 
 [[nodiscard]] bool collect_registry(
     const RegistryCollectOptions& options,

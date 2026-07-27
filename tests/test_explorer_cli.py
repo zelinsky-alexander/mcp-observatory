@@ -555,11 +555,22 @@ def main():
             "--database",
             database,
         )
-        require(conflict.returncode == 7, "canonical conflict was accepted", conflict)
+        require(
+            conflict.returncode == 0
+            and "changed_identity_records=1" in conflict.stdout,
+            "changed canonical variant was rejected",
+            conflict,
+        )
         connection = sqlite3.connect(database)
         require(
-            connection.execute("SELECT COUNT(*) FROM snapshots").fetchone() == (3,),
-            "failed conflict import exposed a snapshot",
+            connection.execute("SELECT COUNT(*) FROM snapshots").fetchone() == (4,)
+            and connection.execute(
+                "SELECT COUNT(*) FROM server_versions "
+                "WHERE server_identifier=? AND server_version=?",
+                (specs[0]["name"], specs[0]["version"]),
+            ).fetchone()
+            == (2,),
+            "changed canonical variant was not preserved",
         )
         connection.close()
 
@@ -631,6 +642,35 @@ def main():
         require(
             not malformed_canonical_db.exists(),
             "validation failure created a database",
+        )
+
+        hash_inconsistent = root / "hash-inconsistent"
+        shutil.copytree(bundle, hash_inconsistent)
+        hash_path = hash_inconsistent / "canonical" / "servers.jsonl"
+        hash_records = [
+            json.loads(line) for line in hash_path.read_text().splitlines()
+        ]
+        hash_records[0]["canonical_sha256"] = "0" * 64
+        hash_path.write_text(
+            "".join(encoded(record) + "\n" for record in hash_records)
+        )
+        refresh_canonical_metadata(hash_inconsistent)
+        hash_database = root / "hash-inconsistent.sqlite"
+        hash_result = run(
+            binary,
+            "registry",
+            "index",
+            "--bundle",
+            hash_inconsistent,
+            "--database",
+            hash_database,
+        )
+        require(
+            hash_result.returncode == 7
+            and "canonical record content hash mismatch" in hash_result.stderr
+            and not hash_database.exists(),
+            "hash-inconsistent canonical record did not fail closed",
+            hash_result,
         )
 
         count_mismatch = root / "count-mismatch"

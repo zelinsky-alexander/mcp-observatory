@@ -1366,7 +1366,7 @@ bool checkpoint_head(
         !json_count(*object, "completed_pages", pages) ||
         pages > std::numeric_limits<std::size_t>::max())
         return (error = "checkpoint head is invalid", false);
-    if (version != 1U && version != 2U)
+    if (version != 1U && version != 2U && version != 3U)
         return (error = "unsupported checkpoint version " +
             std::to_string(version), false);
     completed_pages = static_cast<std::size_t>(pages);
@@ -1379,8 +1379,11 @@ std::string compact_checkpoint_json(
     std::size_t completed_records,
     const std::optional<std::string>& next_cursor,
     const Artifact* last,
-    const Artifact& pages_artifact) {
-    std::string result = "{\"checkpoint_version\":2,\"completed_pages\":" +
+    const Artifact& pages_artifact,
+    const RegistryCollectOptions* options = nullptr) {
+    std::string result = "{\"checkpoint_version\":" +
+        std::to_string(options == nullptr ? 2U : 3U) +
+        ",\"completed_pages\":" +
         std::to_string(completed_pages) + ",\"completed_records\":" +
         std::to_string(completed_records) + ",\"last_completed_page\":" +
         std::to_string(completed_pages) + ",\"last_page_path\":";
@@ -1402,6 +1405,23 @@ std::string compact_checkpoint_json(
         std::to_string(completed_records) +
         ",\"registry\":\"official-mcp\",\"registry_base_url\":";
     append_json_string(result, origin.normalized);
+    if (options != nullptr) {
+        result += ",\"collection_mode\":";
+        append_json_string(
+            result,
+            options->collection_mode == RegistryCollectionMode::incremental ?
+                "incremental" : "full");
+        if (options->collection_mode == RegistryCollectionMode::incremental) {
+            result += ",\"updated_since\":";
+            append_json_string(result, options->incremental->updated_since);
+            result += ",\"base_snapshot_sha256\":";
+            append_json_string(
+                result, options->incremental->base_snapshot_sha256);
+            result += ",\"base_snapshot_completed_at\":";
+            append_json_string(
+                result, options->incremental->base_snapshot_completed_at);
+        }
+    }
     result += ",\"status\":\"partial\",\"updated_at\":";
     append_json_string(result, utc_now());
     result += "}\n";
@@ -1563,6 +1583,7 @@ bool checkpoint_matches(
     const std::filesystem::path& path,
     const RegistryUrl& origin,
     const ReconstructedState& state,
+    const RegistryCollectOptions& options,
     std::string& error) {
     std::string bytes;
     if (!read_file(path, 4U * 1024U * 1024U, bytes, error)) return false;
@@ -1574,11 +1595,48 @@ bool checkpoint_matches(
     std::uintmax_t checkpoint_version{};
     if (!json_count(*object, "checkpoint_version", checkpoint_version))
         return (error = "checkpoint version is missing", false);
-    if (checkpoint_version == 2U)
+    if (checkpoint_version == 3U) {
+        if (!checkpoint_v2_matches(path, *object, origin, state, error))
+            return false;
+        const std::string* mode = string_member(*object, "collection_mode");
+        const std::string expected_mode =
+            options.collection_mode == RegistryCollectionMode::incremental ?
+                "incremental" : "full";
+        if (mode == nullptr || *mode != expected_mode)
+            return (error = "checkpoint collection mode provenance mismatch", false);
+        const std::string* updated_since =
+            string_member(*object, "updated_since");
+        const std::string* base_digest =
+            string_member(*object, "base_snapshot_sha256");
+        const std::string* base_completed =
+            string_member(*object, "base_snapshot_completed_at");
+        if (options.collection_mode == RegistryCollectionMode::full) {
+            if (updated_since != nullptr || base_digest != nullptr ||
+                base_completed != nullptr)
+                return (error = "full checkpoint has incremental provenance", false);
+        } else if (updated_since == nullptr || base_digest == nullptr ||
+                   base_completed == nullptr ||
+                   *updated_since != options.incremental->updated_since ||
+                   *base_digest != options.incremental->base_snapshot_sha256 ||
+                   *base_completed !=
+                       options.incremental->base_snapshot_completed_at) {
+            return (error = "checkpoint incremental provenance mismatch", false);
+        }
+        return true;
+    }
+    if (checkpoint_version == 2U) {
+        if (options.collection_mode != RegistryCollectionMode::full)
+            return (error =
+                "legacy checkpoint cannot resume an incremental collection",
+                false);
         return checkpoint_v2_matches(path, *object, origin, state, error);
+    }
     if (checkpoint_version != 1U)
         return (error = "unsupported checkpoint version " +
             std::to_string(checkpoint_version), false);
+    if (options.collection_mode != RegistryCollectionMode::full)
+        return (error =
+            "legacy checkpoint cannot resume an incremental collection", false);
     const std::string* base_url = string_member(*object, "registry_base_url");
     const std::string* registry = string_member(*object, "registry");
     if (base_url == nullptr || *base_url != origin.normalized ||
@@ -1824,6 +1882,7 @@ bool persist_pages_metadata(
 bool persist_compact_checkpoint(
     const std::filesystem::path& bundle,
     const RegistryUrl& origin,
+    const RegistryCollectOptions& options,
     std::size_t completed_pages,
     std::size_t completed_records,
     const std::optional<std::string>& next_cursor,
@@ -1834,7 +1893,7 @@ bool persist_compact_checkpoint(
         bundle / "checkpoint.json",
         compact_checkpoint_json(
             origin, completed_pages, completed_records, next_cursor,
-            last_page, pages_artifact),
+            last_page, pages_artifact, &options),
         false, error);
 }
 
@@ -1923,10 +1982,22 @@ bool registry_same_origin(const RegistryUrl& left, const RegistryUrl& right) noe
     return left.scheme == right.scheme && left.host == right.host && left.port == right.port;
 }
 
-std::string registry_api_url(const RegistryUrl& base, std::optional<std::string_view> cursor) {
+std::string registry_api_url(
+    const RegistryUrl& base,
+    std::optional<std::string_view> cursor,
+    std::optional<std::string_view> updated_since) {
     std::string result = base.normalized;
     result += "/v0.1/servers";
-    if (cursor.has_value()) result += "?cursor=" + percent_encode(*cursor);
+    char separator = '?';
+    if (updated_since.has_value()) {
+        result += separator;
+        result += "updated_since=" + percent_encode(*updated_since);
+        separator = '&';
+    }
+    if (cursor.has_value()) {
+        result += separator;
+        result += "cursor=" + percent_encode(*cursor);
+    }
     return result;
 }
 
@@ -2010,6 +2081,25 @@ bool collect_registry(
             "page, byte, and record limits must be greater than zero");
     if (!validate_runtime_policy(options.runtime, message))
         return preflight_fail(message);
+    const auto valid_digest = [](std::string_view value) {
+        return value.size() == 64U &&
+            std::all_of(value.begin(), value.end(), [](char character) {
+                return (character >= '0' && character <= '9') ||
+                    (character >= 'a' && character <= 'f');
+            });
+    };
+    if (options.collection_mode == RegistryCollectionMode::full) {
+        if (options.incremental)
+            return preflight_fail(
+                "full collection must not have incremental provenance");
+    } else if (!options.incremental ||
+               !valid_utc_timestamp(options.incremental->updated_since) ||
+               !valid_digest(options.incremental->base_snapshot_sha256) ||
+               !valid_utc_timestamp(
+                   options.incremental->base_snapshot_completed_at)) {
+        return preflight_fail(
+            "incremental collection provenance is missing or invalid");
+    }
 
     std::error_code filesystem_error;
     if (std::filesystem::exists(options.output, filesystem_error))
@@ -2147,7 +2237,7 @@ bool collect_registry(
     std::string error;
     if (!persist_pages_metadata(temporary, "", pages_artifact, error) ||
         !persist_compact_checkpoint(
-            temporary, origin, 0U, 0U, std::nullopt, nullptr,
+            temporary, origin, options, 0U, 0U, std::nullopt, nullptr,
             pages_artifact, error))
         return fail("cannot initialize compact checkpoint: " + error);
 
@@ -2167,6 +2257,9 @@ bool collect_registry(
             registry_progress(
                 options.verbose, "resume checkpoint_reconstruct_start");
             std::string reconstruction;
+            if (options.collection_mode == RegistryCollectionMode::incremental)
+                return fail(
+                    "incremental resume requires its provenance-bound checkpoint");
             if (!reconstruct_registry_checkpoint(
                     source, origin.normalized, options.limits, reconstruction))
                 return fail(
@@ -2183,14 +2276,14 @@ bool collect_registry(
         ReconstructedState state;
         if (!reconstruct_state(
                 source, origin, options.limits, state, error,
-                checkpoint_version == 2U ?
+                checkpoint_version >= 2U ?
                     std::optional<std::size_t>(committed_pages) :
                     std::nullopt))
             return fail("invalid resume bundle: " + error);
         if (!checkpoint_matches(
-                source / "checkpoint.json", origin, state, error))
+                source / "checkpoint.json", origin, state, options, error))
             return fail("invalid resume checkpoint: " + error);
-        if (checkpoint_version == 2U &&
+        if (checkpoint_version >= 2U &&
             !read_file(
                 source / "raw/pages.jsonl", 128U * 1024U * 1024U,
                 state.pages_jsonl, error))
@@ -2224,7 +2317,7 @@ bool collect_registry(
         if (!persist_pages_metadata(
                 temporary, pages_jsonl, pages_artifact, error) ||
             !persist_compact_checkpoint(
-                temporary, origin, pages, records.size(), cursor,
+                temporary, origin, options, pages, records.size(), cursor,
                 raw_artifacts.empty() ? nullptr : &raw_artifacts.back(),
                 pages_artifact, error))
             return fail("cannot persist resumed durable head: " + error);
@@ -2261,7 +2354,11 @@ bool collect_registry(
             return fail_deadline(status);
         const std::string request_url = registry_api_url(
             origin, cursor ?
-                std::optional<std::string_view>(*cursor) : std::nullopt);
+                std::optional<std::string_view>(*cursor) : std::nullopt,
+            options.collection_mode == RegistryCollectionMode::incremental ?
+                std::optional<std::string_view>(
+                    options.incremental->updated_since) :
+                std::nullopt);
         const SteadyTime page_started = now();
         HttpResponse response;
         std::size_t redirects{};
@@ -2603,7 +2700,7 @@ bool collect_registry(
                 temporary, candidate_metadata, pages_artifact, error))
             return fail(error);
         if (!persist_compact_checkpoint(
-                temporary, origin, page_number,
+                temporary, origin, options, page_number,
                 records.size() + page_records.size(), next_cursor,
                 &raw_artifact, pages_artifact, error)) {
             Artifact ignored_artifact;
@@ -2730,7 +2827,22 @@ bool collect_registry(
         if (index != 0U) manifest.push_back(',');
         manifest += artifact_json(artifacts[index]);
     }
-    manifest += "],\"bundle_version\":1,\"collector\":{\"git_commit\":";
+    manifest += "],\"bundle_version\":2,\"collection_mode\":";
+    append_json_string(
+        manifest,
+        options.collection_mode == RegistryCollectionMode::incremental ?
+            "incremental" : "full");
+    if (options.collection_mode == RegistryCollectionMode::incremental) {
+        manifest += ",\"updated_since\":";
+        append_json_string(manifest, options.incremental->updated_since);
+        manifest += ",\"base_snapshot_sha256\":";
+        append_json_string(
+            manifest, options.incremental->base_snapshot_sha256);
+        manifest += ",\"base_snapshot_completed_at\":";
+        append_json_string(
+            manifest, options.incremental->base_snapshot_completed_at);
+    }
+    manifest += ",\"collector\":{\"git_commit\":";
     append_json_string(manifest, MCPO_GIT_COMMIT);
     manifest += ",\"name\":\"mcp-observatory\",\"version\":";
     append_json_string(manifest, MCPO_VERSION);
@@ -2863,12 +2975,53 @@ bool validate_bundle_impl(
     const std::string* completed = string_member(*manifest, "completed_at");
     const std::string* registry = string_member(*manifest, "registry");
     const Json::Array* artifacts = array_member(*manifest, "artifacts");
+    std::uintmax_t bundle_version{};
     if (status == nullptr || *status != "complete" || base_text == nullptr ||
         snapshot == nullptr || started == nullptr || completed == nullptr ||
         !valid_utc_timestamp(*started) || !valid_utc_timestamp(*completed) ||
         *completed < *started || registry == nullptr || *registry != registry_name ||
-        artifacts == nullptr)
+        artifacts == nullptr ||
+        !json_count(*manifest, "bundle_version", bundle_version) ||
+        (bundle_version != 1U && bundle_version != 2U))
         return (message = "manifest is missing required complete-bundle fields", false);
+    const std::string* collection_mode =
+        string_member(*manifest, "collection_mode");
+    const std::string* updated_since =
+        string_member(*manifest, "updated_since");
+    const std::string* base_snapshot =
+        string_member(*manifest, "base_snapshot_sha256");
+    const std::string* base_completed =
+        string_member(*manifest, "base_snapshot_completed_at");
+    const auto valid_digest = [](std::string_view value) {
+        return value.size() == 64U &&
+            std::all_of(value.begin(), value.end(), [](char character) {
+                return (character >= '0' && character <= '9') ||
+                    (character >= 'a' && character <= 'f');
+            });
+    };
+    if (bundle_version == 2U) {
+        if (collection_mode == nullptr ||
+            (*collection_mode != "full" && *collection_mode != "incremental"))
+            return (message = "manifest collection_mode is invalid", false);
+        if (*collection_mode == "incremental") {
+            if (updated_since == nullptr ||
+                !valid_utc_timestamp(*updated_since) ||
+                base_snapshot == nullptr || !valid_digest(*base_snapshot) ||
+                base_completed == nullptr ||
+                !valid_utc_timestamp(*base_completed))
+                return (message =
+                    "incremental manifest provenance is invalid", false);
+        } else if (updated_since != nullptr || base_snapshot != nullptr ||
+                   base_completed != nullptr) {
+            return (message =
+                "full manifest contains incremental provenance", false);
+        }
+    } else if (collection_mode != nullptr || updated_since != nullptr ||
+               base_snapshot != nullptr || base_completed != nullptr) {
+        return (message =
+            "bundle version 1 must not be reinterpreted with collection metadata",
+            false);
+    }
     RegistryUrl base;
     std::string error;
     if (!parse_registry_url(*base_text, base, error) || base.normalized != *base_text)
@@ -3008,6 +3161,21 @@ bool validate_bundle_impl(
             !validate_artifact_path(*raw_path) || request->find('@') != std::string::npos ||
             effective->find('@') != std::string::npos)
             return (message = "invalid raw page provenance metadata", false);
+        const std::string* pagination_input =
+            string_member(*page_object, "pagination_input");
+        const std::string expected_request = registry_api_url(
+            base,
+            pagination_input == nullptr ?
+                std::nullopt :
+                std::optional<std::string_view>(*pagination_input),
+            bundle_version == 2U && collection_mode != nullptr &&
+                    *collection_mode == "incremental" ?
+                std::optional<std::string_view>(*updated_since) :
+                std::nullopt);
+        if (*request != expected_request)
+            return (message =
+                "raw page request URL does not match collection provenance",
+                false);
         const std::string* raw_bytes_text = std::get_if<std::string>(&bytes_it->second.value);
         std::uintmax_t raw_bytes{};
         if (raw_bytes_text == nullptr)
@@ -3192,6 +3360,31 @@ bool read_registry_bundle_manifest(
             !optional_string_member(
                 *collector, "git_commit", result.collector_git_commit, error))
             return false;
+    }
+    result.collection_mode = "full";
+    result.updated_since.reset();
+    result.base_snapshot_sha256.reset();
+    result.base_snapshot_completed_at.reset();
+    if (result.bundle_version == 2U) {
+        if (!required_nonempty_string(
+                *manifest, "collection_mode", result.collection_mode, error) ||
+            (result.collection_mode != "full" &&
+             result.collection_mode != "incremental"))
+            return (error = "manifest collection_mode is invalid", false);
+        if (result.collection_mode == "incremental") {
+            if (!optional_string_member(
+                    *manifest, "updated_since", result.updated_since, error) ||
+                !optional_string_member(
+                    *manifest, "base_snapshot_sha256",
+                    result.base_snapshot_sha256, error) ||
+                !optional_string_member(
+                    *manifest, "base_snapshot_completed_at",
+                    result.base_snapshot_completed_at, error) ||
+                !result.updated_since || !result.base_snapshot_sha256 ||
+                !result.base_snapshot_completed_at)
+                return (error =
+                    "incremental manifest provenance is missing", false);
+        }
     }
     return true;
 }

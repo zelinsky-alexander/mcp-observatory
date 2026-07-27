@@ -25,9 +25,18 @@ enum class ExplorerError {
     database_size_exceeded,
 };
 
+struct RegistryIndexStats {
+    std::size_t inserted_server_versions{};
+    std::size_t reused_server_versions{};
+    std::size_t changed_identity_records{};
+    std::size_t snapshot_links_created{};
+    bool snapshot_already_indexed{};
+};
+
 struct ExplorerResult {
     ExplorerError error{ExplorerError::none};
     std::string output;
+    std::optional<RegistryIndexStats> index_stats;
     [[nodiscard]] bool ok() const noexcept { return error == ExplorerError::none; }
 };
 
@@ -143,6 +152,16 @@ struct RegistryBundleManifest {
     std::size_t pages{};
     std::size_t records_received{};
     std::size_t unique_server_versions{};
+    std::string collection_mode{"full"};
+    std::optional<std::string> updated_since;
+    std::optional<std::string> base_snapshot_sha256;
+    std::optional<std::string> base_snapshot_completed_at;
+};
+
+struct RegistryBaselineSnapshot {
+    std::int64_t id{};
+    std::string snapshot_sha256;
+    std::string completed_at;
 };
 
 [[nodiscard]] bool read_registry_bundle_manifest(
@@ -156,6 +175,9 @@ struct RegistryBundleManifest {
     std::string& error);
 
 [[nodiscard]] ExplorerResult index_registry_bundle(const RegistryIndexOptions& options);
+[[nodiscard]] ExplorerResult latest_registry_snapshot(
+    const std::filesystem::path& database,
+    RegistryBaselineSnapshot& snapshot);
 [[nodiscard]] ExplorerResult summarize_registry(
     const std::filesystem::path& database,
     const SnapshotSelection& snapshot,

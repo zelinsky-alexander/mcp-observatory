@@ -27,6 +27,7 @@ void print_usage(std::ostream& out) {
         << "  mcp-observatory history latest HISTORY_JSONL TARGET_ID\n"
         << "  mcp-observatory history diff-latest HISTORY_JSONL TARGET_ID\n"
         << "  mcp-observatory registry collect --output DIRECTORY [OPTIONS]\n"
+        << "  mcp-observatory registry refresh --database PATH --output DIRECTORY [OPTIONS]\n"
         << "  mcp-observatory registry checkpoint reconstruct PARTIAL_DIRECTORY [OPTIONS]\n"
         << "  mcp-observatory registry index --bundle PATH --database PATH [OPTIONS]\n"
         << "  mcp-observatory registry summarize DATABASE [OPTIONS]\n"
@@ -346,26 +347,25 @@ int run_registry_show(int argc, char** argv) {
     return report_explorer(mcpo::show_registry(options));
 }
 
-int run_registry_collect(int argc, char** argv) {
-    mcpo::RegistryCollectOptions options;
-    if (const char* environment = std::getenv("MCPO_REGISTRY_BASE_URL");
-        environment != nullptr && *environment != '\0') {
-        options.registry_base_url = environment;
-    }
-    bool have_output = false;
-    for (int index = 3; index < argc; ++index) {
+bool parse_collect_option(
+    int argc,
+    char** argv,
+    int& index,
+    mcpo::RegistryCollectOptions& options,
+    bool& have_output,
+    std::string& error) {
         const std::string_view argument(argv[index]);
         if (argument == "--retain-raw") {
             options.retain_raw = true;
-            continue;
+            return true;
         }
         if (argument == "--verbose") {
             options.verbose = true;
-            continue;
+            return true;
         }
         if (index + 1 >= argc) {
-            std::cerr << "missing value for " << argument << '\n';
-            return 1;
+            error = "missing value for " + std::string(argument);
+            return false;
         }
         const std::string_view value(argv[++index]);
         if (argument == "--output") {
@@ -376,43 +376,88 @@ int run_registry_collect(int argc, char** argv) {
         } else if (argument == "--registry-base-url") {
             options.registry_base_url = value;
         } else if (argument == "--maximum-pages") {
-            if (!parse_size(value, options.limits.maximum_pages)) return 1;
+            if (!parse_size(value, options.limits.maximum_pages))
+                error = "invalid --maximum-pages";
         } else if (argument == "--maximum-page-bytes") {
-            if (!parse_size(value, options.limits.maximum_page_bytes)) return 1;
+            if (!parse_size(value, options.limits.maximum_page_bytes))
+                error = "invalid --maximum-page-bytes";
         } else if (argument == "--maximum-records") {
-            if (!parse_size(value, options.limits.maximum_records)) return 1;
+            if (!parse_size(value, options.limits.maximum_records))
+                error = "invalid --maximum-records";
         } else if (argument == "--maximum-redirects") {
-            if (!parse_size(value, options.limits.maximum_redirects)) return 1;
+            if (!parse_size(value, options.limits.maximum_redirects))
+                error = "invalid --maximum-redirects";
         } else if (argument == "--request-timeout-seconds") {
             unsigned parsed{};
-            if (!parse_unsigned(value, parsed)) return 1;
+            if (!parse_unsigned(value, parsed)) {
+                error = "invalid --request-timeout-seconds";
+                return false;
+            }
             options.runtime.request_timeout = std::chrono::seconds(parsed);
         } else if (argument == "--stall-timeout-seconds") {
             unsigned parsed{};
-            if (!parse_unsigned(value, parsed)) return 1;
+            if (!parse_unsigned(value, parsed)) {
+                error = "invalid --stall-timeout-seconds";
+                return false;
+            }
             options.runtime.stall_timeout = std::chrono::seconds(parsed);
         } else if (argument == "--run-timeout-seconds") {
             unsigned parsed{};
-            if (!parse_unsigned(value, parsed)) return 1;
+            if (!parse_unsigned(value, parsed)) {
+                error = "invalid --run-timeout-seconds";
+                return false;
+            }
             options.runtime.run_timeout =
                 parsed == 0U ? std::nullopt :
                     std::optional<std::chrono::seconds>(
                         std::chrono::seconds(parsed));
         } else if (argument == "--maximum-attempts-per-page") {
             if (!parse_size(
-                    value, options.runtime.maximum_attempts_per_page)) return 1;
+                    value, options.runtime.maximum_attempts_per_page))
+                error = "invalid --maximum-attempts-per-page";
         } else if (argument == "--retry-initial-seconds") {
             unsigned parsed{};
-            if (!parse_unsigned(value, parsed)) return 1;
+            if (!parse_unsigned(value, parsed)) {
+                error = "invalid --retry-initial-seconds";
+                return false;
+            }
             options.runtime.retry_initial = std::chrono::seconds(parsed);
         } else if (argument == "--retry-maximum-seconds") {
             unsigned parsed{};
-            if (!parse_unsigned(value, parsed)) return 1;
+            if (!parse_unsigned(value, parsed)) {
+                error = "invalid --retry-maximum-seconds";
+                return false;
+            }
             options.runtime.retry_maximum = std::chrono::seconds(parsed);
         } else {
-            std::cerr << "unknown registry collect option: " << argument << '\n';
+            --index;
+            return false;
+        }
+        return error.empty();
+}
+
+void apply_registry_environment(mcpo::RegistryCollectOptions& options) {
+    if (const char* environment = std::getenv("MCPO_REGISTRY_BASE_URL");
+        environment != nullptr && *environment != '\0')
+        options.registry_base_url = environment;
+}
+
+int run_registry_collect(int argc, char** argv) {
+    mcpo::RegistryCollectOptions options;
+    apply_registry_environment(options);
+    bool have_output = false;
+    for (int index = 3; index < argc; ++index) {
+        std::string error;
+        const int before = index;
+        if (parse_collect_option(
+                argc, argv, index, options, have_output, error))
+            continue;
+        if (!error.empty()) {
+            std::cerr << error << '\n';
             return 1;
         }
+        std::cerr << "unknown registry collect option: " << argv[before] << '\n';
+        return 1;
     }
     if (!have_output) {
         std::cerr << "registry collect requires --output\n";
@@ -424,6 +469,155 @@ int run_registry_collect(int argc, char** argv) {
         return 3;
     }
     std::cout << message << '\n';
+    return 0;
+}
+
+std::string json_quote(std::string_view value) {
+    std::string output{"\""};
+    for (char character : value) {
+        if (character == '"' || character == '\\') output.push_back('\\');
+        output.push_back(character);
+    }
+    output.push_back('"');
+    return output;
+}
+
+int run_registry_refresh(int argc, char** argv) {
+    mcpo::RegistryCollectOptions collect;
+    apply_registry_environment(collect);
+    std::filesystem::path database;
+    std::optional<std::string> updated_since;
+    std::string format{"text"};
+    bool have_database{};
+    bool have_output{};
+    for (int index = 3; index < argc; ++index) {
+        const std::string_view argument(argv[index]);
+        if (argument == "--database" || argument == "--updated-since" ||
+            argument == "--format") {
+            if (index + 1 >= argc) {
+                std::cerr << "missing value for " << argument << '\n';
+                return 1;
+            }
+            const std::string value(argv[++index]);
+            if (argument == "--database") {
+                database = value;
+                have_database = true;
+            } else if (argument == "--updated-since") {
+                updated_since = value;
+            } else if (value == "text" || value == "json") {
+                format = value;
+            } else {
+                std::cerr << "invalid refresh format\n";
+                return 1;
+            }
+            continue;
+        }
+        std::string error;
+        const int before = index;
+        if (parse_collect_option(
+                argc, argv, index, collect, have_output, error))
+            continue;
+        if (!error.empty()) {
+            std::cerr << error << '\n';
+            return 1;
+        }
+        std::cerr << "unknown registry refresh option: " << argv[before] << '\n';
+        return 1;
+    }
+    if (!have_database || !have_output) {
+        std::cerr << "registry refresh requires --database and --output\n";
+        return 1;
+    }
+    if (updated_since && !mcpo::valid_utc_timestamp(*updated_since)) {
+        std::cerr << "invalid_updated_since: expected YYYY-MM-DDTHH:MM:SSZ\n";
+        return 1;
+    }
+    std::error_code path_error;
+    if (!std::filesystem::is_regular_file(database, path_error) || path_error) {
+        std::cerr << "no_baseline_snapshot: database has no completed snapshot\n";
+        return 5;
+    }
+    mcpo::RegistryBaselineSnapshot baseline;
+    const mcpo::ExplorerResult selected =
+        mcpo::latest_registry_snapshot(database, baseline);
+    if (!selected.ok()) {
+        if (selected.error == mcpo::ExplorerError::snapshot_not_found) {
+            std::cerr << "no_baseline_snapshot: database has no completed snapshot\n";
+            return 5;
+        }
+        std::cerr << selected.output << '\n';
+        return explorer_exit(selected.error);
+    }
+    collect.collection_mode = mcpo::RegistryCollectionMode::incremental;
+    collect.incremental = mcpo::RegistryIncrementalProvenance{
+        updated_since.value_or(baseline.completed_at),
+        baseline.snapshot_sha256,
+        baseline.completed_at};
+
+    std::string collection_message;
+    if (!mcpo::collect_registry(collect, collection_message)) {
+        std::cerr << "registry refresh collection failed: "
+                  << collection_message << '\n';
+        return 3;
+    }
+    mcpo::RegistryBundleManifest manifest;
+    std::string manifest_error;
+    if (!mcpo::read_registry_bundle_manifest(
+            collect.output, manifest, manifest_error)) {
+        std::cerr << "collection_completed_import_failed: "
+                  << manifest_error << '\n';
+        return 3;
+    }
+    mcpo::RegistryIndexOptions index;
+    index.bundle = collect.output;
+    index.database = database;
+    index.verbose = collect.verbose;
+    const mcpo::ExplorerResult imported = mcpo::index_registry_bundle(index);
+    if (!imported.ok()) {
+        std::cerr << "collection_completed_import_failed: "
+                  << imported.output << "; bundle=" << collect.output.string()
+                  << '\n';
+        return explorer_exit(imported.error);
+    }
+    const mcpo::RegistryIndexStats stats =
+        imported.index_stats.value_or(mcpo::RegistryIndexStats{});
+    if (format == "json") {
+        std::cout
+            << "{\"status\":\"completed\",\"collection_mode\":\"incremental\","
+            << "\"updated_since\":"
+            << json_quote(collect.incremental->updated_since)
+            << ",\"base_snapshot_sha256\":"
+            << json_quote(baseline.snapshot_sha256)
+            << ",\"snapshot_sha256\":"
+            << json_quote(manifest.snapshot_sha256)
+            << ",\"completed_pages\":" << manifest.pages
+            << ",\"received_records\":" << manifest.records_received
+            << ",\"inserted_server_versions\":"
+            << stats.inserted_server_versions
+            << ",\"reused_server_versions\":"
+            << stats.reused_server_versions
+            << ",\"changed_identity_records\":"
+            << stats.changed_identity_records
+            << ",\"snapshot_links_created\":"
+            << stats.snapshot_links_created << "}\n";
+    } else {
+        std::cout
+            << "status=completed\n"
+            << "collection_mode=incremental\n"
+            << "updated_since=" << collect.incremental->updated_since << '\n'
+            << "base_snapshot_sha256=" << baseline.snapshot_sha256 << '\n'
+            << "snapshot_sha256=" << manifest.snapshot_sha256 << '\n'
+            << "completed_pages=" << manifest.pages << '\n'
+            << "received_records=" << manifest.records_received << '\n'
+            << "inserted_server_versions="
+            << stats.inserted_server_versions << '\n'
+            << "reused_server_versions="
+            << stats.reused_server_versions << '\n'
+            << "changed_identity_records="
+            << stats.changed_identity_records << '\n'
+            << "snapshot_links_created="
+            << stats.snapshot_links_created << '\n';
+    }
     return 0;
 }
 
@@ -663,7 +857,7 @@ int main(int argc, char** argv) {
         std::cout
             << "mcp-observatory 0.5.0\n"
             << "bounded longitudinal MCP history analysis\n"
-            << "network activity: registry collect only\n"
+            << "network activity: registry collect and registry refresh only\n"
             << "external process execution: explicit curl and OpenSSL only\n";
         return 0;
     }
@@ -671,6 +865,9 @@ int main(int argc, char** argv) {
     if (argc >= 3 && std::string_view(argv[1]) == "registry" &&
         std::string_view(argv[2]) == "collect")
         return run_registry_collect(argc, argv);
+    if (argc >= 3 && std::string_view(argv[1]) == "registry" &&
+        std::string_view(argv[2]) == "refresh")
+        return run_registry_refresh(argc, argv);
     if (argc >= 3 && std::string_view(argv[1]) == "registry" &&
         std::string_view(argv[2]) == "index")
         return run_registry_index(argc, argv);

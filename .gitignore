@@ -15,4 +15,7 @@ mcp-registry-partial-*
 official-run-resumed/_SUCCESS
 official-run-resumed/manifest.json
 db/
+test-refresh/
+official-refresh-*/
+official-refresh-*.json
 

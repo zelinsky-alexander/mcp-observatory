@@ -58,4 +58,10 @@ if(MCPO_BUILD_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_explorer_cli.py
             $<TARGET_FILE:mcp-observatory>
     )
+    add_test(
+        NAME mcpo_registry_refresh_cli_tests
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_refresh_cli.py
+            $<TARGET_FILE:mcp-observatory>
+    )
 endif()

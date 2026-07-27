@@ -1284,7 +1284,7 @@ int main() {
         const std::string compact =
             read_collector_bytes(parent / "multi/checkpoint.json");
         require(
-            compact.find("\"checkpoint_version\":2") != std::string::npos &&
+            compact.find("\"checkpoint_version\":3") != std::string::npos &&
                 compact.find("\"last_completed_page\":2") !=
                     std::string::npos &&
                 compact.find("\"pages_metadata_path\":\"raw/pages.jsonl\"") !=

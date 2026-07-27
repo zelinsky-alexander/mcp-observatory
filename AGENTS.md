@@ -17,3 +17,4 @@ Build MCP Observatory as an original, dependency-minimal C++20 single-binary res
 - Do not introduce GPL, AGPL, SSPL, source-available, or similarly restrictive code without explicit approval.
 - Add focused tests for malformed, duplicate, reordered, oversized, and excessive-depth inputs where relevant.
 - Never claim the code is legally cleared or plagiarism-free; require manual licence, similarity, security, and legal review before publication or commercial use.
+
