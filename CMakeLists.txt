@@ -1,7 +1,14 @@
 cmake_minimum_required(VERSION 3.24)
-project(mcp_observatory VERSION 0.5.0 LANGUAGES CXX)
+project(mcp_observatory VERSION 0.6.0 LANGUAGES CXX)
 
 option(MCPO_BUILD_TESTS "Build focused tests" ON)
+
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/rules")
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/rules/artifact-static-analysis-v1.json"
+    "${CMAKE_CURRENT_BINARY_DIR}/rules/artifact-static-analysis-v1.json"
+    COPYONLY
+)
 
 find_package(SQLite3 REQUIRED)
 
@@ -17,6 +24,7 @@ if(NOT MCPO_GIT_COMMIT)
 endif()
 
 add_library(mcpo_core STATIC
+    src/analyze.cpp
     src/explorer.cpp
     src/history.cpp
     src/inventory.cpp
@@ -62,6 +70,12 @@ if(MCPO_BUILD_TESTS)
         NAME mcpo_registry_refresh_cli_tests
         COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_refresh_cli.py
+            $<TARGET_FILE:mcp-observatory>
+    )
+    add_test(
+        NAME mcpo_analyze_cli_tests
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_analyze_cli.py
             $<TARGET_FILE:mcp-observatory>
     )
 endif()

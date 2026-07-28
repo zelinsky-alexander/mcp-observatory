@@ -1,3 +1,4 @@
+#include "observatory/analyze.hpp"
 #include "observatory/history.hpp"
 #include "observatory/inventory.hpp"
 #include "observatory/observation.hpp"
@@ -1414,6 +1415,370 @@ int main() {
                     read_bytes(parent / "progress-new/canonical/servers.jsonl") ==
                         read_bytes(parent / "progress-quiet/canonical/servers.jsonl"),
                 "verbose mode changed generated evidence artifacts");
+
+        std::filesystem::remove_all(parent, ec);
+    }
+
+    {
+        // npm metadata parsing and integrity verification
+        std::string error;
+        mcpo::NpmDistMetadata metadata;
+        require(
+            mcpo::parse_npm_version_metadata(
+                R"json({"name":"demo","version":"1.2.3","dist":{"tarball":"https://example/demo-1.2.3.tgz","integrity":"sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="}})json",
+                "demo",
+                "1.2.3",
+                metadata,
+                error),
+            "nested dist metadata should parse");
+        require(metadata.tarball_url == "https://example/demo-1.2.3.tgz", "tarball url");
+        require(
+            mcpo::parse_npm_version_metadata(
+                R"json({"name":"demo","version":"1.2.3","dist.tarball":"https://example/flat.tgz","dist.integrity":"sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="})json",
+                "demo",
+                "1.2.3",
+                metadata,
+                error),
+            "flattened dist keys should parse");
+        require(metadata.tarball_url == "https://example/flat.tgz", "flattened tarball");
+
+        const std::string payload = "fixture-bytes-for-integrity";
+        // Generate integrity with openssl in-process via analyze API after computing expected.
+        // Use a known sha512 integrity by verifying mismatch first.
+        require(
+            !mcpo::verify_npm_integrity(
+                payload,
+                "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+                error),
+            "integrity mismatch should fail");
+        require(!error.empty(), "integrity failure should set error");
+    }
+
+    {
+        const auto parent = std::filesystem::temp_directory_path() /
+            ("mcpo-analyze-unit-" + std::to_string(getpid()));
+        std::error_code ec;
+        std::filesystem::remove_all(parent, ec);
+        std::filesystem::create_directories(parent / "package");
+        {
+            std::ofstream manifest(parent / "package" / "package.json");
+            manifest << R"json({
+  "name": "fixture-pkg",
+  "version": "9.9.9",
+  "license": "MIT",
+  "main": "index.js",
+  "bin": {"fixture-pkg": "index.js"},
+  "engines": {"node": ">=18"},
+  "scripts": {"prepare": "echo prepare", "preinstall": "echo pre"},
+  "dependencies": {"leftpad": "1.0.0"},
+  "devDependencies": {"tape": "5.0.0"},
+  "repository": {"type": "git", "url": "git+https://example/repo.git"}
+})json";
+        }
+        {
+            std::ofstream js(parent / "package" / "index.js");
+            js << "import fs from 'node:fs';\n"
+               << "import { fileURLToPath } from 'node:url';\n"
+               << "const ignored = /abc/.exec('abc');\n"
+               << "const docs = 'see https://example.com/docs for fetch guidance';\n"
+               << "const TOKEN = 'literal';\n";
+        }
+        {
+            std::ofstream bad(parent / "package" / "danger.js");
+            bad << "import cp from 'child_process';\ncp.exec('true');\n";
+        }
+        require(
+            std::system(("tar -C '" + parent.string() +
+                         "' -czf '" + (parent / "good.tgz").string() +
+                         "' package").c_str()) == 0,
+            "create good fixture tarball");
+
+        std::ifstream input(parent / "good.tgz", std::ios::binary);
+        const std::string bytes(
+            (std::istreambuf_iterator<char>(input)),
+            std::istreambuf_iterator<char>());
+        mcpo::ArchiveLimits limits;
+        const auto rules_path = std::filesystem::path(__FILE__).parent_path()
+            .parent_path() / "rules/artifact-static-analysis-v1.json";
+        mcpo::AnalyzerWorkerResult result;
+        std::string error;
+        require(
+            mcpo::analyze_npm_tarball_bytes(
+                bytes, rules_path, limits, result, error),
+            "analyze fixture tarball");
+        require(result.package_version == "9.9.9", "package version");
+        require(result.lifecycle_scripts.size() >= 2U, "lifecycle scripts");
+        bool saw_prepare = false;
+        bool saw_fs = false;
+        bool saw_url = false;
+        bool saw_child = false;
+        bool saw_regexp_false_positive = false;
+        bool saw_docs_fetch = false;
+        for (const auto& script : result.lifecycle_scripts)
+            if (script.first == "prepare") saw_prepare = true;
+        for (const auto& finding : result.findings) {
+            if (finding.symbol && *finding.symbol == "fs") saw_fs = true;
+            if (finding.symbol && *finding.symbol == "url") saw_url = true;
+            if (finding.symbol && *finding.symbol == "child_process") saw_child = true;
+            if (finding.rule_id == "risk-api:exec" &&
+                finding.evidence.find("RegExp") == std::string::npos &&
+                finding.subject_path.find("index.js") != std::string::npos)
+                saw_regexp_false_positive = true;
+            if (finding.rule_id == "risk-api:fetch" &&
+                finding.subject_path.find("index.js") != std::string::npos)
+                saw_docs_fetch = true;
+        }
+        require(saw_prepare, "prepare lifecycle");
+        require(saw_fs, "node:fs finding");
+        require(saw_url, "node:url finding");
+        require(saw_child, "child_process finding");
+        require(!saw_regexp_false_positive, "RegExp.exec false positive");
+        require(!saw_docs_fetch, "documentation URL false positive");
+        require(result.dependencies.size() >= 2U, "dependencies extracted");
+        require(!result.has_native_code, "no native code in fixture");
+
+        // Rules are loaded from JSON: changing policy changes findings without
+        // recompiling the analyzer.
+        std::ifstream rules_input(rules_path);
+        std::string custom_rules(
+            (std::istreambuf_iterator<char>(rules_input)),
+            std::istreambuf_iterator<char>());
+        const std::size_t child_rule =
+            custom_rules.find("\"symbol\": \"child_process\"");
+        require(child_rule != std::string::npos, "child_process rule fixture");
+        const std::size_t child_severity =
+            custom_rules.find("\"severity\": \"high\"", child_rule);
+        require(child_severity != std::string::npos, "child_process severity fixture");
+        custom_rules.replace(
+            child_severity,
+            std::string("\"severity\": \"high\"").size(),
+            "\"severity\": \"low\"");
+        const std::size_t ruleset_version =
+            custom_rules.find("\"ruleset_version\": \"1.0.0\"");
+        require(ruleset_version != std::string::npos, "ruleset version fixture");
+        custom_rules.replace(
+            ruleset_version,
+            std::string("\"ruleset_version\": \"1.0.0\"").size(),
+            "\"ruleset_version\": \"test-low-child-process\"");
+        const auto custom_rules_path = parent / "custom-rules.json";
+        {
+            std::ofstream custom_rules_out(custom_rules_path);
+            custom_rules_out << custom_rules;
+        }
+        mcpo::AnalyzerWorkerResult custom_result;
+        require(
+            mcpo::analyze_npm_tarball_bytes(
+                bytes, custom_rules_path, limits, custom_result, error),
+            "custom analysis rules should load");
+        bool child_became_low = false;
+        for (const auto& finding : custom_result.findings) {
+            if (finding.rule_id == "node-builtin:child_process" &&
+                finding.severity == "low")
+                child_became_low = true;
+        }
+        require(child_became_low, "custom rules should control severity");
+        require(
+            custom_result.ruleset_version == "test-low-child-process",
+            "worker should report loaded ruleset version");
+
+        const auto malformed_rules_path = parent / "malformed-rules.json";
+        {
+            std::ofstream malformed_rules(malformed_rules_path);
+            malformed_rules << R"json({"schema_version":1})json";
+        }
+        mcpo::AnalyzerWorkerResult malformed_rules_result;
+        require(
+            !mcpo::analyze_npm_tarball_bytes(
+                bytes,
+                malformed_rules_path,
+                limits,
+                malformed_rules_result,
+                error),
+            "incomplete analysis rules should fail closed");
+        require(
+            error.find("ruleset_version") != std::string::npos,
+            "malformed rules error should identify missing field");
+
+        // absolute path rejection
+        std::filesystem::create_directories(parent / "abs");
+        require(
+            std::system(("tar -C '" + (parent / "abs").string() +
+                         "' --absolute-names -czf '" +
+                         (parent / "abs.tgz").string() +
+                         "' -T /dev/null 2>/dev/null; "
+                         "python3 - <<'PY'\n"
+                         "import tarfile, io\n"
+                         "path='" +
+                         (parent / "abs.tgz").string() +
+                         "'\n"
+                         "with tarfile.open(path,'w:gz') as t:\n"
+                         "    info=tarfile.TarInfo('/etc/passwd')\n"
+                         "    data=b'x'\n"
+                         "    info.size=len(data)\n"
+                         "    t.addfile(info, io.BytesIO(data))\n"
+                         "PY")
+                            .c_str()) == 0,
+            "create absolute-path tarball");
+        {
+            std::ifstream abs_input(parent / "abs.tgz", std::ios::binary);
+            const std::string abs_bytes(
+                (std::istreambuf_iterator<char>(abs_input)),
+                std::istreambuf_iterator<char>());
+            mcpo::AnalyzerWorkerResult abs_result;
+            require(
+                !mcpo::analyze_npm_tarball_bytes(
+                    abs_bytes, rules_path, limits, abs_result, error),
+                "absolute path rejected");
+            require(error.find("absolute") != std::string::npos, "absolute message");
+        }
+
+        // parent traversal
+        {
+            require(
+                std::system(("python3 - <<'PY'\n"
+                             "import tarfile, io\n"
+                             "path='" +
+                             (parent / "trav.tgz").string() +
+                             "'\n"
+                             "with tarfile.open(path,'w:gz') as t:\n"
+                             "    info=tarfile.TarInfo('package/../evil')\n"
+                             "    data=b'x'\n"
+                             "    info.size=len(data)\n"
+                             "    t.addfile(info, io.BytesIO(data))\n"
+                             "PY")
+                                .c_str()) == 0,
+                "create traversal tarball");
+            std::ifstream trav_input(parent / "trav.tgz", std::ios::binary);
+            const std::string trav_bytes(
+                (std::istreambuf_iterator<char>(trav_input)),
+                std::istreambuf_iterator<char>());
+            mcpo::AnalyzerWorkerResult trav_result;
+            require(
+                !mcpo::analyze_npm_tarball_bytes(
+                    trav_bytes, rules_path, limits, trav_result, error),
+                "traversal rejected");
+            require(error.find("parent-traversal") != std::string::npos, "traversal message");
+        }
+
+        // escaping symlink
+        {
+            require(
+                std::system(("python3 - <<'PY'\n"
+                             "import tarfile, io\n"
+                             "path='" +
+                             (parent / "link.tgz").string() +
+                             "'\n"
+                             "with tarfile.open(path,'w:gz') as t:\n"
+                             "    info=tarfile.TarInfo('package/link')\n"
+                             "    info.type=tarfile.SYMTYPE\n"
+                             "    info.linkname='/tmp/escape'\n"
+                             "    t.addfile(info)\n"
+                             "    man=tarfile.TarInfo('package/package.json')\n"
+                             "    data=b'{\"name\":\"x\",\"version\":\"1.0.0\"}'\n"
+                             "    man.size=len(data)\n"
+                             "    t.addfile(man, io.BytesIO(data))\n"
+                             "PY")
+                                .c_str()) == 0,
+                "create symlink tarball");
+            std::ifstream link_input(parent / "link.tgz", std::ios::binary);
+            const std::string link_bytes(
+                (std::istreambuf_iterator<char>(link_input)),
+                std::istreambuf_iterator<char>());
+            mcpo::AnalyzerWorkerResult link_result;
+            require(
+                !mcpo::analyze_npm_tarball_bytes(
+                    link_bytes, rules_path, limits, link_result, error),
+                "escaping symlink rejected");
+        }
+
+        // file count limit
+        {
+            limits.maximum_files = 1U;
+            mcpo::AnalyzerWorkerResult limited;
+            require(
+                !mcpo::analyze_npm_tarball_bytes(
+                    bytes, rules_path, limits, limited, error),
+                "file count limit");
+            require(error.find("file count") != std::string::npos, "file count message");
+            limits.maximum_files = 10'000U;
+        }
+
+        // individual file size limit
+        {
+            limits.maximum_individual_file_bytes = 8U;
+            mcpo::AnalyzerWorkerResult limited;
+            require(
+                !mcpo::analyze_npm_tarball_bytes(
+                    bytes, rules_path, limits, limited, error),
+                "individual size limit");
+            limits.maximum_individual_file_bytes = 8U * 1024U * 1024U;
+        }
+
+        // total size limit
+        {
+            limits.maximum_total_uncompressed_bytes = 32U;
+            mcpo::AnalyzerWorkerResult limited;
+            require(
+                !mcpo::analyze_npm_tarball_bytes(
+                    bytes, rules_path, limits, limited, error),
+                "total size limit");
+            limits.maximum_total_uncompressed_bytes = 64U * 1024U * 1024U;
+        }
+
+        // native binary detection
+        {
+            require(
+                std::system(("python3 - <<'PY'\n"
+                             "import tarfile, io\n"
+                             "path='" +
+                             (parent / "elf.tgz").string() +
+                             "'\n"
+                             "with tarfile.open(path,'w:gz') as t:\n"
+                             "    man=tarfile.TarInfo('package/package.json')\n"
+                             "    data=b'{\"name\":\"x\",\"version\":\"1.0.0\"}'\n"
+                             "    man.size=len(data)\n"
+                             "    t.addfile(man, io.BytesIO(data))\n"
+                             "    elf=tarfile.TarInfo('package/native.node')\n"
+                             "    payload=b'\\x7fELF'+b'\\0'*12\n"
+                             "    elf.size=len(payload)\n"
+                             "    t.addfile(elf, io.BytesIO(payload))\n"
+                             "PY")
+                                .c_str()) == 0,
+                "create elf tarball");
+            std::ifstream elf_input(parent / "elf.tgz", std::ios::binary);
+            const std::string elf_bytes(
+                (std::istreambuf_iterator<char>(elf_input)),
+                std::istreambuf_iterator<char>());
+            mcpo::AnalyzerWorkerResult elf_result;
+            require(
+                mcpo::analyze_npm_tarball_bytes(
+                    elf_bytes, rules_path, limits, elf_result, error),
+                "analyze elf fixture");
+            require(elf_result.has_native_code, "native binary detected");
+        }
+
+        // successful integrity with generated sha512
+        {
+            require(
+                std::system(("python3 - <<'PY'\n"
+                             "import hashlib, base64, pathlib\n"
+                             "data=pathlib.Path('" +
+                             (parent / "good.tgz").string() +
+                             "').read_bytes()\n"
+                             "digest=base64.b64encode(hashlib.sha512(data).digest()).decode()\n"
+                             "pathlib.Path('" +
+                             (parent / "good.integrity").string() +
+                             "').write_text('sha512-'+digest)\n"
+                             "PY")
+                                .c_str()) == 0,
+                "create integrity text");
+            std::ifstream integrity_input(parent / "good.integrity");
+            std::string integrity;
+            std::getline(integrity_input, integrity);
+            require(
+                mcpo::verify_npm_integrity(bytes, integrity, error),
+                "sha512 integrity success");
+        }
 
         std::filesystem::remove_all(parent, ec);
     }

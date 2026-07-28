@@ -15,8 +15,13 @@ mcp-registry-partial-*
 official-run-resumed/_SUCCESS
 official-run-resumed/manifest.json
 db/
+.deps/
 test-refresh/
 official-refresh-*/
 official-refresh-*.json
 runtime
+analysis/
+evidence/
+/tests/__pycache__
 
+/tests/smoke_analyze_color_engine.sh

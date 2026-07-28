@@ -1,0 +1,326 @@
+{
+  "schema_version": 1,
+  "ruleset_version": "1.0.0",
+  "engine_options": {
+    "process_call_owners": ["cp", "child_process", "childprocess", "proc", "process"],
+    "documentation_context_markers": ["http://", "https://", "see ", "docs", "readme", "*", "//"]
+  },
+  "package_metadata_rule": {
+    "rule_id": "package-metadata",
+    "category": "package_metadata",
+    "severity": "info",
+    "confidence": "high",
+    "title": "Package metadata extracted",
+    "subject_path": "package/package.json",
+    "explanation": "Captured package name, version, bin/main entries, engines, dependencies, repository, license, and lifecycle scripts."
+  },
+  "node_builtin_defaults": {
+    "rule_id_prefix": "node-builtin:",
+    "category": "node_builtin_import",
+    "confidence": "high",
+    "title_prefix": "Node built-in import: ",
+    "explanation": "Observed a textual reference to a Node.js built-in module."
+  },
+  "node_builtin_rules": [
+    {
+      "symbol": "child_process",
+      "tokens": ["node:child_process", "child_process"],
+      "severity": "high"
+    },
+    {
+      "symbol": "vm",
+      "tokens": ["node:vm", "vm"],
+      "severity": "high"
+    },
+    {
+      "symbol": "module",
+      "tokens": ["node:module", "module"],
+      "severity": "high"
+    },
+    {
+      "symbol": "fs",
+      "tokens": ["node:fs", "node:fs/promises", "fs/promises", "fs"],
+      "severity": "medium"
+    },
+    {
+      "symbol": "http",
+      "tokens": ["node:http", "http"],
+      "severity": "medium"
+    },
+    {
+      "symbol": "https",
+      "tokens": ["node:https", "https"],
+      "severity": "medium"
+    },
+    {
+      "symbol": "net",
+      "tokens": ["node:net", "net"],
+      "severity": "medium"
+    },
+    {
+      "symbol": "worker_threads",
+      "tokens": ["node:worker_threads", "worker_threads"],
+      "severity": "medium"
+    },
+    {
+      "symbol": "dns",
+      "tokens": ["node:dns", "dns"],
+      "severity": "low"
+    },
+    {
+      "symbol": "tls",
+      "tokens": ["node:tls", "tls"],
+      "severity": "low"
+    },
+    {
+      "symbol": "dgram",
+      "tokens": ["node:dgram", "dgram"],
+      "severity": "low"
+    },
+    {
+      "symbol": "os",
+      "tokens": ["node:os", "os"],
+      "severity": "low"
+    },
+    {
+      "symbol": "url",
+      "tokens": ["node:url", "url"],
+      "severity": "low"
+    }
+  ],
+  "risk_api_defaults": {
+    "category": "risk_relevant_api",
+    "confidence": "medium",
+    "explanation": "Observed a textual reference to a risk-relevant API surface."
+  },
+  "risk_api_rules": [
+    {
+      "rule_id": "risk-api:spawnSync",
+      "detector": "process_call",
+      "pattern": "spawnSync",
+      "symbol": "spawnSync",
+      "severity": "high",
+      "title": "Process spawnSync call"
+    },
+    {
+      "rule_id": "risk-api:spawn",
+      "detector": "process_call",
+      "pattern": "spawn",
+      "symbol": "spawn",
+      "severity": "high",
+      "title": "Process spawn call"
+    },
+    {
+      "rule_id": "risk-api:execSync",
+      "detector": "process_call",
+      "pattern": "execSync",
+      "symbol": "execSync",
+      "severity": "high",
+      "title": "Process execSync call"
+    },
+    {
+      "rule_id": "risk-api:execFile",
+      "detector": "process_call",
+      "pattern": "execFile",
+      "symbol": "execFile",
+      "severity": "high",
+      "title": "Process execFile call"
+    },
+    {
+      "rule_id": "risk-api:exec",
+      "detector": "process_call",
+      "pattern": "exec",
+      "symbol": "exec",
+      "severity": "high",
+      "title": "Process exec call"
+    },
+    {
+      "rule_id": "risk-api:fork",
+      "detector": "process_call",
+      "pattern": "fork",
+      "symbol": "fork",
+      "severity": "high",
+      "title": "Process fork call"
+    },
+    {
+      "rule_id": "risk-api:eval",
+      "detector": "call",
+      "pattern": "eval",
+      "symbol": "eval",
+      "severity": "high",
+      "title": "eval() call"
+    },
+    {
+      "rule_id": "risk-api:Function",
+      "detector": "substring",
+      "pattern": "new Function",
+      "symbol": "Function",
+      "severity": "high",
+      "title": "new Function(...) construction"
+    },
+    {
+      "rule_id": "risk-api:fetch",
+      "detector": "call",
+      "pattern": "fetch",
+      "symbol": "fetch",
+      "severity": "medium",
+      "title": "fetch() call",
+      "suppress_documentation_context": true
+    },
+    {
+      "rule_id": "risk-api:WebSocket",
+      "detector": "websocket_call",
+      "pattern": "WebSocket",
+      "symbol": "WebSocket",
+      "severity": "medium",
+      "title": "WebSocket usage",
+      "suppress_documentation_context": true
+    },
+    {
+      "rule_id": "risk-api:dynamic-import",
+      "detector": "call",
+      "pattern": "import",
+      "symbol": "import",
+      "severity": "medium",
+      "title": "Dynamic import()"
+    },
+    {
+      "rule_id": "risk-api:nonliteral-require",
+      "detector": "nonliteral_require",
+      "pattern": "require",
+      "symbol": "require",
+      "severity": "medium",
+      "title": "Non-literal require()"
+    },
+    {
+      "rule_id": "risk-api:writeFile",
+      "detector": "call",
+      "pattern": "writeFile",
+      "symbol": "writeFile",
+      "severity": "medium",
+      "title": "writeFile call"
+    },
+    {
+      "rule_id": "risk-api:appendFile",
+      "detector": "call",
+      "pattern": "appendFile",
+      "symbol": "appendFile",
+      "severity": "medium",
+      "title": "appendFile call"
+    },
+    {
+      "rule_id": "risk-api:createWriteStream",
+      "detector": "call",
+      "pattern": "createWriteStream",
+      "symbol": "createWriteStream",
+      "severity": "medium",
+      "title": "createWriteStream call"
+    },
+    {
+      "rule_id": "risk-api:mkdir",
+      "detector": "call",
+      "pattern": "mkdir",
+      "symbol": "mkdir",
+      "severity": "medium",
+      "title": "mkdir call"
+    },
+    {
+      "rule_id": "risk-api:rename",
+      "detector": "call",
+      "pattern": "rename",
+      "symbol": "rename",
+      "severity": "medium",
+      "title": "rename call"
+    },
+    {
+      "rule_id": "risk-api:unlink",
+      "detector": "call",
+      "pattern": "unlink",
+      "symbol": "unlink",
+      "severity": "medium",
+      "title": "unlink call"
+    },
+    {
+      "rule_id": "risk-api:chmod",
+      "detector": "call",
+      "pattern": "chmod",
+      "symbol": "chmod",
+      "severity": "medium",
+      "title": "chmod call"
+    },
+    {
+      "rule_id": "risk-api:chown",
+      "detector": "call",
+      "pattern": "chown",
+      "symbol": "chown",
+      "severity": "medium",
+      "title": "chown call"
+    },
+    {
+      "rule_id": "risk-api:process.env",
+      "detector": "substring",
+      "pattern": "process.env",
+      "symbol": "process.env",
+      "severity": "low",
+      "title": "process.env access"
+    }
+  ],
+  "lifecycle_defaults": {
+    "rule_id_prefix": "lifecycle:",
+    "category": "lifecycle_script",
+    "confidence": "high",
+    "title_prefix": "npm lifecycle script: ",
+    "subject_path": "package/package.json",
+    "explanation": "package.json declares an npm lifecycle script. This analyzer never executes lifecycle scripts."
+  },
+  "lifecycle_rules": [
+    {"name": "preinstall", "severity": "high"},
+    {"name": "install", "severity": "high"},
+    {"name": "postinstall", "severity": "high"},
+    {"name": "prepare", "severity": "medium"},
+    {"name": "prepublish", "severity": "medium"},
+    {"name": "prepublishOnly", "severity": "medium"}
+  ],
+  "file_type_rules": [
+    {
+      "rule_id": "file-type:native",
+      "category": "file_type",
+      "file_types": ["elf", "pe", "mach_o", "native_node_module", "shared_library", "wasm"],
+      "marks_native": true,
+      "severity": "high",
+      "confidence": "high",
+      "title": "Native or binary content present",
+      "explanation": "Archive member classified as native/binary content."
+    },
+    {
+      "rule_id": "file-type:shell_script",
+      "category": "file_type",
+      "file_types": ["shell_script"],
+      "marks_native": false,
+      "severity": "medium",
+      "confidence": "high",
+      "title": "Notable file type: shell_script",
+      "explanation": "Archive member matched a notable file-type rule."
+    },
+    {
+      "rule_id": "file-type:powershell_script",
+      "category": "file_type",
+      "file_types": ["powershell_script"],
+      "marks_native": false,
+      "severity": "medium",
+      "confidence": "high",
+      "title": "Notable file type: powershell_script",
+      "explanation": "Archive member matched a notable file-type rule."
+    },
+    {
+      "rule_id": "file-type:nested_archive",
+      "category": "file_type",
+      "file_types": ["nested_archive"],
+      "marks_native": false,
+      "severity": "medium",
+      "confidence": "high",
+      "title": "Notable file type: nested_archive",
+      "explanation": "Archive member matched a notable file-type rule."
+    }
+  ]
+}

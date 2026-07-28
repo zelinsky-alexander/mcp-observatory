@@ -24,8 +24,21 @@ shell:
 Offline CLI tests use Python 3's standard library to host a loopback fixture
 server. Python is PSF-licensed and is a test-only dependency.
 
+Package static analysis additionally invokes these host executables without a
+shell:
+
+- **gzip** (`/usr/bin/gzip`), GPL-licensed as part of GNU gzip; used only to
+  decompress npm tarballs inside the analyzer worker before ustar parsing.
+  Operators must keep the distribution gzip package patched. The executable is
+  not redistributed here.
+- **Docker** (`/usr/bin/docker`), Apache License 2.0 for Moby/Docker Engine;
+  used to launch the disposable read-only, network-disabled analyzer container.
+  Operators must keep Docker and its base images patched. Docker is not
+  redistributed here. Offline tests may use `--allow-in-process-worker` and do
+  not require Docker.
+
 No third-party source code is included in this repository. CMake, Ninja,
-compilers, SQLite, curl, OpenSSL, and Python are not redistributed by this
-project and retain their respective licences. Reassess this file before adding
-or distributing any dependency, generated component, vendored asset,
+compilers, SQLite, curl, OpenSSL, gzip, Docker, and Python are not redistributed
+by this project and retain their respective licences. Reassess this file before
+adding or distributing any dependency, generated component, vendored asset,
 container base image, or external schema.

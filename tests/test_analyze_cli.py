@@ -1,0 +1,470 @@
+#!/usr/bin/env python3
+"""Offline Artifact Static Analysis v1 CLI tests."""
+
+import hashlib
+import http.server
+import json
+import pathlib
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import threading
+import urllib.parse
+
+# Reuse explorer fixture helpers.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from test_explorer_cli import make_bundle, require, run  # noqa: E402
+
+
+def sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def sha512_integrity(data: bytes) -> str:
+    import base64
+
+    return "sha512-" + base64.b64encode(hashlib.sha512(data).digest()).decode()
+
+
+def make_tarball(root: pathlib.Path, files: dict[str, bytes]) -> bytes:
+    import io
+    import tarfile
+
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        for name, data in files.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
+    return buffer.getvalue()
+
+
+class NpmHandler(http.server.BaseHTTPRequestHandler):
+    catalog = {}
+
+    def log_message(self, format, *args):  # noqa: A003
+        return
+
+    def do_GET(self):  # noqa: N802
+        path = urllib.parse.unquote(self.path)
+        item = self.catalog.get(path)
+        if item is None:
+            self.send_response(404)
+            self.end_headers()
+            return
+        body, content_type = item
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def serve_npm(catalog):
+    NpmHandler.catalog = catalog
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), NpmHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    return server, f"http://{host}:{port}"
+
+
+def seed_database(binary, root: pathlib.Path):
+    specs = [
+        {
+            "name": "io.example/demo-npm",
+            "version": "1.0.1",
+            "description": "npm demo",
+            "packages": [
+                {
+                    "registryType": "npm",
+                    "identifier": "demo-npm",
+                    "version": "1.0.1",
+                    "transport": {"type": "stdio"},
+                }
+            ],
+        },
+        {
+            "name": "io.example/ambiguous",
+            "version": "1.0.0",
+            "description": "two packages",
+            "packages": [
+                {
+                    "registryType": "npm",
+                    "identifier": "same-name",
+                    "version": "1.0.0",
+                    "transport": {"type": "stdio"},
+                },
+                {
+                    "registryType": "npm",
+                    "identifier": "same-name",
+                    "version": "1.0.0",
+                    "transport": {"type": "stdio"},
+                },
+            ],
+        },
+        {
+            "name": "io.example/pypi-only",
+            "version": "2.0.0",
+            "description": "pypi",
+            "packages": [
+                {
+                    "registryType": "pypi",
+                    "identifier": "demo-pypi",
+                    "version": "2.0.0",
+                    "transport": {"type": "stdio"},
+                }
+            ],
+        },
+        {
+            "name": "io.example/missing-version",
+            "version": "3.0.0",
+            "description": "no package version",
+            "packages": [
+                {
+                    "registryType": "npm",
+                    "identifier": "no-version-pkg",
+                    "transport": {"type": "stdio"},
+                }
+            ],
+        },
+    ]
+    # Ambiguous case needs two package rows with same identifier; explorer stores by position.
+    bundle = root / "bundle"
+    make_bundle(bundle, specs, "2026-07-27T00:00:00Z")
+    database = root / "registry.sqlite"
+    indexed = run(
+        binary,
+        "registry",
+        "index",
+        "--bundle",
+        str(bundle),
+        "--database",
+        str(database),
+    )
+    require(indexed.returncode == 0, "index fixture database", indexed)
+    # Force a second identical package row for ambiguity by duplicating in SQL after import
+    # is not possible due UNIQUE(server_version_id, position). Instead insert another
+    # server_versions variant with same identity fields for same-name package.
+    connection = sqlite3.connect(database)
+    row = connection.execute(
+        "SELECT server_version_id FROM packages WHERE identifier='same-name' LIMIT 1"
+    ).fetchone()
+    require(row is not None, "ambiguous seed missing")
+    server_version_id = row[0]
+    # Duplicate package under next position already exists from two package entries.
+    count = connection.execute(
+        "SELECT COUNT(*) FROM packages WHERE identifier='same-name'"
+    ).fetchone()[0]
+    require(count == 2, f"expected two same-name packages, got {count}")
+    connection.close()
+    return database
+
+
+def main(binary: str) -> None:
+    with tempfile.TemporaryDirectory(prefix="mcpo-analyze-cli-") as temp:
+        root = pathlib.Path(temp)
+        database = seed_database(binary, root)
+
+        # 1 exact resolution success path prep
+        package_json = json.dumps(
+            {
+                "name": "demo-npm",
+                "version": "1.0.1",
+                "license": "MIT",
+                "bin": {"demo-npm": "dist/server.js"},
+                "scripts": {"prepare": "tsc"},
+                "dependencies": {"zod": "3.0.0"},
+                "engines": {"node": ">=20"},
+            }
+        ).encode()
+        server_js = b"import fs from 'node:fs';\nimport url from 'node:url';\n"
+        tarball = make_tarball(
+            root,
+            {
+                "package/package.json": package_json,
+                "package/dist/server.js": server_js,
+            },
+        )
+        integrity = sha512_integrity(tarball)
+        metadata = {
+            "name": "demo-npm",
+            "version": "1.0.1",
+            "dist": {
+                "tarball": "PLACEHOLDER",
+                "integrity": integrity,
+            },
+        }
+        server, base = serve_npm({})
+        metadata["dist"]["tarball"] = f"{base}/demo-npm/-/demo-npm-1.0.1.tgz"
+        NpmHandler.catalog = {
+            "/demo-npm/1.0.1": (
+                json.dumps(metadata).encode(),
+                "application/json",
+            ),
+            "/demo-npm/-/demo-npm-1.0.1.tgz": (tarball, "application/octet-stream"),
+        }
+
+        evidence = root / "evidence"
+        first = run(
+            binary,
+            "analyze",
+            "package",
+            "--database",
+            str(database),
+            "--server",
+            "io.example/demo-npm",
+            "--version",
+            "1.0.1",
+            "--package",
+            "demo-npm",
+            "--evidence-root",
+            str(evidence),
+            "--npm-registry-url",
+            base,
+            "--allow-in-process-worker",
+            "--format",
+            "json",
+        )
+        require(first.returncode == 0, "analyze package failed", first)
+        payload = json.loads(first.stdout)
+        require(payload["status"] == "completed", "status")
+        require(payload["integrity_verified"] is True, "integrity")
+        require(payload["package_version"] == "1.0.1", "version")
+        require(payload["reused_existing"] is False, "first run reused")
+        require("prepare" in payload["lifecycle_scripts"], "prepare script")
+        require(payload["native_code"] is False, "native")
+        artifact_sha = payload["artifact_sha256"]
+        require(artifact_sha == sha256(tarball), "artifact digest")
+        run_id = payload["analysis_run_id"]
+
+        connection = sqlite3.connect(database)
+        require(
+            connection.execute("SELECT schema_version FROM schema_info").fetchone()
+            == (2,),
+            "schema migrated to 2",
+        )
+        require(
+            connection.execute(
+                "SELECT COUNT(*) FROM analysis_findings WHERE analysis_run_id=?",
+                (run_id,),
+            ).fetchone()[0]
+            > 0,
+            "findings stored",
+        )
+        require(
+            connection.execute(
+                "SELECT COUNT(*) FROM analysis_evidence WHERE analysis_run_id=?",
+                (run_id,),
+            ).fetchone()[0]
+            >= 10,
+            "evidence rows stored",
+        )
+        require(
+            connection.execute("PRAGMA foreign_key_check").fetchall() == [],
+            "foreign keys",
+        )
+        # relative paths only
+        for (relative,) in connection.execute(
+            "SELECT relative_path FROM analysis_evidence"
+        ):
+            require(not relative.startswith("/"), f"absolute evidence path {relative}")
+        connection.close()
+
+        evidence_dir = (
+            evidence
+            / "artifacts"
+            / "sha256"
+            / artifact_sha[:2]
+            / artifact_sha
+        )
+        require((evidence_dir / "artifact.tgz").is_file(), "artifact evidence")
+        require(
+            (evidence_dir / "analysis-rules.json").is_file(),
+            "analysis rules evidence",
+        )
+        require((evidence_dir / "findings.jsonl").is_file(), "findings evidence")
+
+        # 25 deduplication
+        second = run(
+            binary,
+            "analyze",
+            "package",
+            "--database",
+            str(database),
+            "--server",
+            "io.example/demo-npm",
+            "--version",
+            "1.0.1",
+            "--package",
+            "demo-npm",
+            "--evidence-root",
+            str(evidence),
+            "--npm-registry-url",
+            base,
+            "--allow-in-process-worker",
+            "--format",
+            "json",
+        )
+        require(second.returncode == 0, "dedupe analyze failed", second)
+        reused = json.loads(second.stdout)
+        require(reused["reused_existing"] is True, "expected reuse")
+        require(reused["analysis_run_id"] == run_id, "same run id")
+
+        # text output stable keys
+        text = run(
+            binary,
+            "analyze",
+            "package",
+            "--database",
+            str(database),
+            "--server",
+            "io.example/demo-npm",
+            "--version",
+            "1.0.1",
+            "--package",
+            "demo-npm",
+            "--evidence-root",
+            str(evidence),
+            "--npm-registry-url",
+            base,
+            "--allow-in-process-worker",
+            "--format",
+            "text",
+        )
+        require(text.returncode == 0, "text output failed", text)
+        for key in (
+            "analysis_run_id=",
+            "integrity_verified=true",
+            "status=completed",
+            "reused_existing=true",
+        ):
+            require(key in text.stdout, f"missing {key}", text)
+
+        # 2 ambiguous rejection
+        ambiguous = run(
+            binary,
+            "analyze",
+            "package",
+            "--database",
+            str(database),
+            "--server",
+            "io.example/ambiguous",
+            "--version",
+            "1.0.0",
+            "--package",
+            "same-name",
+            "--evidence-root",
+            str(evidence),
+            "--allow-in-process-worker",
+        )
+        require(ambiguous.returncode == 5, "ambiguous should fail", ambiguous)
+        require("ambiguous" in ambiguous.stderr.lower(), "ambiguous message", ambiguous)
+
+        # 3 unsupported registry
+        unsupported = run(
+            binary,
+            "analyze",
+            "package",
+            "--database",
+            str(database),
+            "--server",
+            "io.example/pypi-only",
+            "--version",
+            "2.0.0",
+            "--package",
+            "demo-pypi",
+            "--evidence-root",
+            str(evidence),
+            "--allow-in-process-worker",
+        )
+        require(unsupported.returncode == 5, "unsupported should fail", unsupported)
+        require(
+            "unsupported" in unsupported.stderr.lower(),
+            "unsupported message",
+            unsupported,
+        )
+
+        # 4 missing exact package version
+        missing = run(
+            binary,
+            "analyze",
+            "package",
+            "--database",
+            str(database),
+            "--server",
+            "io.example/missing-version",
+            "--version",
+            "3.0.0",
+            "--package",
+            "no-version-pkg",
+            "--evidence-root",
+            str(evidence),
+            "--allow-in-process-worker",
+        )
+        require(missing.returncode == 5, "missing version should fail", missing)
+        require("exact package version" in missing.stderr.lower(), "missing message", missing)
+
+        # failed-run recording via integrity mismatch
+        bad_meta = dict(metadata)
+        bad_meta["dist"] = dict(metadata["dist"])
+        bad_meta["dist"]["integrity"] = (
+            "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="
+        )
+        NpmHandler.catalog["/demo-npm/1.0.1"] = (
+            json.dumps(bad_meta).encode(),
+            "application/json",
+        )
+        failed = run(
+            binary,
+            "analyze",
+            "package",
+            "--database",
+            str(database),
+            "--server",
+            "io.example/demo-npm",
+            "--version",
+            "1.0.1",
+            "--package",
+            "demo-npm",
+            "--evidence-root",
+            str(evidence),
+            "--npm-registry-url",
+            base,
+            "--allow-in-process-worker",
+            "--force",
+        )
+        require(failed.returncode == 7, "integrity failure exit", failed)
+        connection = sqlite3.connect(database)
+        require(
+            connection.execute(
+                "SELECT COUNT(*) FROM analysis_runs WHERE status='failed' AND error_stage='integrity'"
+            ).fetchone()[0]
+            >= 1,
+            "failed run recorded",
+        )
+        connection.close()
+
+        # worker JSON stability on fixture
+        worker = run(
+            binary,
+            "analyze-worker",
+            "--tarball",
+            str(evidence_dir / "artifact.tgz"),
+        )
+        require(worker.returncode == 0, "worker failed", worker)
+        worker_json = json.loads(worker.stdout)
+        require(worker_json["package_name"] == "demo-npm", "worker name")
+        require(worker_json["status"] == "ok", "worker status")
+
+        server.shutdown()
+        print("analyze cli tests passed")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        print("usage: test_analyze_cli.py PATH_TO_mcp-observatory", file=sys.stderr)
+        sys.exit(2)
+    main(sys.argv[1])

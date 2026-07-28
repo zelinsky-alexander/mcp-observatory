@@ -4,15 +4,19 @@ The initial scaffold is deliberately non-invasive.
 
 ## Current guarantees
 
-- Network access is limited to the explicitly invoked public Registry
-  collection command and its validated same-origin redirects.
+- Network access is limited to explicitly invoked registry collection/refresh
+  and the `analyze package` download step for npm metadata and tarballs.
+- Static archive extraction and code inspection run only in a disposable
+  restricted Docker container with network disabled.
 - No address-range scanning or registry-entry probing.
-- No package installation.
-- No external process execution except the fixed curl HTTP client and OpenSSL
-  SHA-256 command used by registry bundle collection.
+- No package installation and no execution of package entry points or npm
+  lifecycle scripts.
 - No authentication attempts.
 - No MCP tool invocation.
 - No automatic consumption of registry entries as executable commands.
+
+Static analysis findings describe observed artifact properties only. They do
+not prove that an MCP server is non-malicious.
 
 ## Future measurement requirements
 

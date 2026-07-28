@@ -4,7 +4,11 @@ MCP Observatory is a longitudinal security research platform for collecting, val
 
 The project is a dependency-minimal C++20 single binary. It consumes versioned observation documents and can produce a bounded, deterministic filesystem bundle of public Official MCP Registry metadata.
 
-> **Status:** early research prototype. Network activity is limited to the explicit registry collector. It performs no package installation, authentication, MCP server execution, or MCP tool invocation.
+> **Status:** early research prototype. Network activity is limited to the
+> explicit registry collector/refresh commands and the download stage of
+> `analyze package`. Package static analysis never installs packages, never
+> executes lifecycle scripts, never authenticates, and never invokes MCP tools.
+> No static analysis result proves that an MCP server is non-malicious.
 
 ## Why it exists
 
@@ -60,8 +64,19 @@ ctest --preset dev-debug
   --database ./db/local-registry.sqlite \
   --output ./registry-refresh
 
+./build/dev-debug/mcp-observatory analyze package \
+  --database ./db/local-registry.sqlite \
+  --server io.github.aimsise/color-engine-mcp \
+  --version 1.0.1 \
+  --package color-engine-mcp \
+  --rules ./rules/artifact-static-analysis-v1.json \
+  --evidence-root ./evidence
+
 ./build/dev-debug/mcp-observatory bundle validate ./official-run
 ```
+
+See [docs/artifact-static-analysis-v1.md](docs/artifact-static-analysis-v1.md)
+for the static-analysis trust model and limitations.
 
 ## Portable registry collection
 

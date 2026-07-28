@@ -22,9 +22,10 @@ longitudinal comparison and reporting
 
 The `mcp-observatory` executable owns command dispatch and links a small C++20 core library only for build organization and tests. The delivered program remains one binary.
 
-Most commands perform no network activity. `registry collect` is the reviewed,
-bounded exception: it retrieves the configured Registry list API using an
-explicit curl process and uses OpenSSL for SHA-256. It does not act on entries.
+Most commands perform no network activity. Reviewed network exceptions are
+`registry collect`, `registry refresh`, and the download stage of
+`analyze package`. Static extraction and scanning for package analysis run in a
+disposable Docker container with network disabled.
 
 ## Integration boundary with mcp-native-guard
 

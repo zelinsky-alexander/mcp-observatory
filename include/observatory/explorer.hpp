@@ -10,7 +10,7 @@
 
 namespace mcpo {
 
-inline constexpr int registry_explorer_schema_version = 1;
+inline constexpr int registry_explorer_schema_version = 2;
 
 enum class ExplorerError {
     none,

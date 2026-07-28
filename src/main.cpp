@@ -1,3 +1,4 @@
+#include "observatory/analyze.hpp"
 #include "observatory/explorer.hpp"
 #include "observatory/history.hpp"
 #include "observatory/inventory.hpp"
@@ -7,11 +8,13 @@
 
 #include <charconv>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unistd.h>
 
 namespace {
 
@@ -34,7 +37,20 @@ void print_usage(std::ostream& out) {
         << "  mcp-observatory registry search DATABASE QUERY [OPTIONS]\n"
         << "  mcp-observatory registry show DATABASE SERVER_NAME [OPTIONS]\n"
         << "  mcp-observatory registry list DATABASE [OPTIONS]\n"
+        << "  mcp-observatory analyze package [OPTIONS]\n"
+        << "  mcp-observatory analyze-worker --tarball PATH [OPTIONS]\n"
         << "  mcp-observatory bundle validate DIRECTORY\n"
+        << "\nanalyze package options:\n"
+        << "  --database PATH               registry SQLite database\n"
+        << "  --server IDENTIFIER           exact server identifier\n"
+        << "  --version VERSION             exact server version\n"
+        << "  --package IDENTIFIER          exact npm package name\n"
+        << "  --evidence-root PATH          evidence root (default evidence)\n"
+        << "  --rules PATH                  analysis rules JSON\n"
+        << "  --format text|json            output format (default text)\n"
+        << "  --force                       ignore completed-run deduplication\n"
+        << "  --npm-registry-url URL        npm registry base URL\n"
+        << "  --allow-in-process-worker     test-only: skip Docker worker\n"
         << "\nregistry collect runtime options:\n"
         << "  --request-timeout-seconds N   one HTTP attempt (default 60)\n"
         << "  --stall-timeout-seconds N     no durable page completion (default 300)\n"
@@ -660,6 +676,135 @@ int run_checkpoint_reconstruct(int argc, char** argv) {
     return 0;
 }
 
+int analyze_exit(mcpo::AnalyzeError error) {
+    switch (error) {
+        case mcpo::AnalyzeError::none: return 0;
+        case mcpo::AnalyzeError::invalid_arguments: return 1;
+        case mcpo::AnalyzeError::database: return 2;
+        case mcpo::AnalyzeError::download:
+        case mcpo::AnalyzeError::container:
+        case mcpo::AnalyzeError::io: return 3;
+        case mcpo::AnalyzeError::package_not_found:
+        case mcpo::AnalyzeError::ambiguous_package:
+        case mcpo::AnalyzeError::unsupported_registry:
+        case mcpo::AnalyzeError::missing_version: return 5;
+        case mcpo::AnalyzeError::incompatible_schema: return 6;
+        case mcpo::AnalyzeError::validation:
+        case mcpo::AnalyzeError::integrity:
+        case mcpo::AnalyzeError::archive: return 7;
+        case mcpo::AnalyzeError::limit_exceeded: return 8;
+    }
+    return 2;
+}
+
+int run_analyze_package(int argc, char** argv) {
+    mcpo::AnalyzePackageOptions options;
+    char self_buffer[4096]{};
+    const ssize_t self_length = readlink("/proc/self/exe", self_buffer, sizeof(self_buffer) - 1U);
+    if (self_length > 0) {
+        self_buffer[self_length] = '\0';
+        options.self_executable = self_buffer;
+    } else if (argc > 0) {
+        options.self_executable = argv[0];
+    }
+    for (int index = 3; index < argc; ++index) {
+        const std::string_view argument(argv[index]);
+        if (argument == "--force") {
+            options.force = true;
+            continue;
+        }
+        if (argument == "--allow-in-process-worker") {
+            options.allow_in_process_worker = true;
+            continue;
+        }
+        if (index + 1 >= argc) {
+            std::cerr << "missing value for " << argument << '\n';
+            return 1;
+        }
+        const std::string_view value(argv[++index]);
+        if (argument == "--database") options.database = std::string(value);
+        else if (argument == "--server")
+            options.server_identifier = std::string(value);
+        else if (argument == "--version")
+            options.server_version = std::string(value);
+        else if (argument == "--package")
+            options.package_identifier = std::string(value);
+        else if (argument == "--evidence-root")
+            options.evidence_root = std::string(value);
+        else if (argument == "--rules")
+            options.rules_path = std::string(value);
+        else if (argument == "--npm-registry-url")
+            options.npm_registry_url = std::string(value);
+        else if (argument == "--format") {
+            if (value == "text") options.format = mcpo::AnalyzeOutputFormat::text;
+            else if (value == "json") options.format = mcpo::AnalyzeOutputFormat::json;
+            else {
+                std::cerr << "invalid analyze format\n";
+                return 1;
+            }
+        } else if (argument == "--maximum-files") {
+            if (!parse_size(value, options.limits.maximum_files)) return 1;
+        } else if (argument == "--maximum-total-uncompressed-bytes") {
+            if (!parse_size(value, options.limits.maximum_total_uncompressed_bytes))
+                return 1;
+        } else if (argument == "--maximum-individual-file-bytes") {
+            if (!parse_size(value, options.limits.maximum_individual_file_bytes))
+                return 1;
+        } else if (argument == "--maximum-tarball-bytes") {
+            if (!parse_size(value, options.limits.maximum_tarball_bytes)) return 1;
+        } else {
+            std::cerr << "unknown analyze package option: " << argument << '\n';
+            return 1;
+        }
+    }
+    if (options.database.empty() || options.server_identifier.empty() ||
+        options.server_version.empty() || options.package_identifier.empty()) {
+        std::cerr << "analyze package requires --database --server --version --package\n";
+        return 1;
+    }
+    const mcpo::AnalyzePackageResult result = mcpo::analyze_package(options);
+    if (!result.ok()) {
+        std::cerr << result.output << '\n';
+        return analyze_exit(result.error);
+    }
+    std::cout << result.output;
+    return 0;
+}
+
+int run_analyze_worker(int argc, char** argv) {
+    std::filesystem::path tarball;
+    std::filesystem::path rules_path{mcpo::default_package_rules_path};
+    mcpo::ArchiveLimits limits;
+    for (int index = 2; index < argc; ++index) {
+        const std::string_view argument(argv[index]);
+        if (index + 1 >= argc) {
+            std::cerr << "missing value for " << argument << '\n';
+            return 1;
+        }
+        const std::string_view value(argv[++index]);
+        if (argument == "--tarball") tarball = std::string(value);
+        else if (argument == "--rules") rules_path = std::string(value);
+        else if (argument == "--maximum-files") {
+            if (!parse_size(value, limits.maximum_files)) return 1;
+        } else if (argument == "--maximum-total-uncompressed-bytes") {
+            if (!parse_size(value, limits.maximum_total_uncompressed_bytes)) return 1;
+        } else if (argument == "--maximum-individual-file-bytes") {
+            if (!parse_size(value, limits.maximum_individual_file_bytes)) return 1;
+        } else if (argument == "--maximum-tarball-bytes") {
+            if (!parse_size(value, limits.maximum_tarball_bytes)) return 1;
+        } else {
+            std::cerr << "unknown analyze-worker option: " << argument << '\n';
+            return 1;
+        }
+    }
+    if (tarball.empty()) {
+        std::cerr << "analyze-worker requires --tarball\n";
+        return 1;
+    }
+    return mcpo::analyze_worker_main(
+        tarball, rules_path, limits, std::cout, std::cerr);
+}
+
 int run_bundle_validate(const char* path) {
     std::string message;
     if (!mcpo::validate_bundle(path, message)) {
@@ -855,12 +1000,18 @@ int run_history_diff_latest(const char* path, const char* target_id) {
 int main(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "about") {
         std::cout
-            << "mcp-observatory 0.5.0\n"
+            << "mcp-observatory 0.6.0\n"
             << "bounded longitudinal MCP history analysis\n"
-            << "network activity: registry collect and registry refresh only\n"
-            << "external process execution: explicit curl and OpenSSL only\n";
+            << "network activity: registry collect/refresh and analyze package download\n"
+            << "external process execution: curl, OpenSSL, gzip, and Docker analyze-worker\n";
         return 0;
     }
+
+    if (argc >= 3 && std::string_view(argv[1]) == "analyze" &&
+        std::string_view(argv[2]) == "package")
+        return run_analyze_package(argc, argv);
+    if (argc >= 2 && std::string_view(argv[1]) == "analyze-worker")
+        return run_analyze_worker(argc, argv);
 
     if (argc >= 3 && std::string_view(argv[1]) == "registry" &&
         std::string_view(argv[2]) == "collect")

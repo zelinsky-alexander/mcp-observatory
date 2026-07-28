@@ -253,7 +253,8 @@ bool initialize_schema(
     Database& database,
     std::string& search_mode,
     bool& created,
-    std::string& error) {
+    std::string& error,
+    bool allow_migration = true) {
     bool has_schema{};
     if (!has_table(database, "schema_info", has_schema, error)) return false;
     if (has_schema) {
@@ -273,7 +274,7 @@ bool initialize_schema(
             error = "schema_info must contain exactly one row";
             return false;
         }
-        if (version != registry_explorer_schema_version) {
+        if (version != 1 && version != registry_explorer_schema_version) {
             error = "unsupported registry explorer schema version " +
                 std::to_string(version);
             return false;
@@ -301,6 +302,131 @@ bool initialize_schema(
             if (!present) {
                 error = "incompatible registry explorer schema: missing FTS5 table";
                 return false;
+            }
+        }
+        if (version == 1) {
+            if (!allow_migration) {
+                created = false;
+                return true;
+            }
+            static constexpr std::string_view analysis_sql = R"SQL(
+CREATE TABLE analysis_runs(
+    id INTEGER PRIMARY KEY,
+    server_version_id INTEGER NOT NULL REFERENCES server_versions(id) ON DELETE RESTRICT,
+    package_id INTEGER NOT NULL REFERENCES packages(id) ON DELETE RESTRICT,
+    analysis_type TEXT NOT NULL CHECK(analysis_type IN ('npm_package_static_v1')),
+    status TEXT NOT NULL CHECK(status IN ('running','completed','failed')),
+    analyzer_name TEXT NOT NULL,
+    analyzer_version TEXT NOT NULL,
+    ruleset_version TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    artifact_sha256 TEXT,
+    published_integrity TEXT,
+    integrity_verified INTEGER CHECK(integrity_verified IN (0, 1)),
+    base_image_ref TEXT,
+    base_image_digest TEXT,
+    network_mode TEXT,
+    container_read_only INTEGER CHECK(container_read_only IN (0, 1)),
+    container_user TEXT,
+    summary_json TEXT,
+    error_stage TEXT,
+    error_message TEXT
+);
+CREATE TABLE analysis_artifacts(
+    id INTEGER PRIMARY KEY,
+    analysis_run_id INTEGER NOT NULL UNIQUE REFERENCES analysis_runs(id) ON DELETE CASCADE,
+    registry_type TEXT NOT NULL,
+    package_identifier TEXT NOT NULL,
+    package_version TEXT NOT NULL,
+    source_url TEXT NOT NULL,
+    local_relative_path TEXT NOT NULL,
+    byte_size INTEGER NOT NULL CHECK(byte_size >= 0),
+    sha256 TEXT NOT NULL,
+    published_integrity TEXT NOT NULL,
+    integrity_verified INTEGER NOT NULL CHECK(integrity_verified IN (0, 1)),
+    downloaded_at TEXT NOT NULL
+);
+CREATE TABLE analysis_findings(
+    id INTEGER PRIMARY KEY,
+    analysis_run_id INTEGER NOT NULL REFERENCES analysis_runs(id) ON DELETE CASCADE,
+    rule_id TEXT NOT NULL,
+    category TEXT NOT NULL,
+    severity TEXT NOT NULL CHECK(severity IN ('info','low','medium','high','critical')),
+    confidence TEXT NOT NULL CHECK(confidence IN ('low','medium','high')),
+    disposition TEXT NOT NULL CHECK(disposition IN (
+        'unreviewed','expected','reviewed-benign','mitigated',
+        'suspicious','confirmed-risk','false-positive')),
+    subject_path TEXT NOT NULL,
+    line_number INTEGER CHECK(line_number IS NULL OR line_number > 0),
+    symbol TEXT,
+    title TEXT NOT NULL,
+    evidence TEXT,
+    explanation TEXT NOT NULL
+);
+CREATE TABLE analysis_files(
+    id INTEGER PRIMARY KEY,
+    analysis_run_id INTEGER NOT NULL REFERENCES analysis_runs(id) ON DELETE CASCADE,
+    archive_path TEXT NOT NULL,
+    file_type TEXT NOT NULL,
+    byte_size INTEGER NOT NULL CHECK(byte_size >= 0),
+    sha256 TEXT NOT NULL,
+    executable INTEGER NOT NULL CHECK(executable IN (0, 1)),
+    native_binary INTEGER NOT NULL CHECK(native_binary IN (0, 1)),
+    generated INTEGER NOT NULL CHECK(generated IN (0, 1)),
+    minified INTEGER NOT NULL CHECK(minified IN (0, 1)),
+    UNIQUE(analysis_run_id, archive_path)
+);
+CREATE TABLE analysis_dependencies(
+    id INTEGER PRIMARY KEY,
+    analysis_run_id INTEGER NOT NULL REFERENCES analysis_runs(id) ON DELETE CASCADE,
+    dependency_type TEXT NOT NULL CHECK(dependency_type IN ('runtime','development','peer','optional')),
+    dependency_name TEXT NOT NULL,
+    declared_version TEXT NOT NULL,
+    resolved_version TEXT,
+    direct INTEGER NOT NULL CHECK(direct IN (0, 1)),
+    development INTEGER NOT NULL CHECK(development IN (0, 1))
+);
+CREATE TABLE analysis_evidence(
+    id INTEGER PRIMARY KEY,
+    analysis_run_id INTEGER NOT NULL REFERENCES analysis_runs(id) ON DELETE CASCADE,
+    evidence_type TEXT NOT NULL,
+    relative_path TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    byte_size INTEGER NOT NULL CHECK(byte_size >= 0),
+    media_type TEXT NOT NULL,
+    UNIQUE(analysis_run_id, relative_path)
+);
+CREATE INDEX analysis_runs_package ON analysis_runs(package_id, status);
+CREATE INDEX analysis_runs_artifact ON analysis_runs(
+    artifact_sha256, analyzer_version, ruleset_version, status);
+CREATE INDEX analysis_findings_run ON analysis_findings(analysis_run_id);
+CREATE INDEX analysis_findings_rule ON analysis_findings(rule_id);
+CREATE INDEX analysis_files_run ON analysis_files(analysis_run_id);
+CREATE INDEX analysis_dependencies_run ON analysis_dependencies(analysis_run_id);
+CREATE INDEX analysis_evidence_run ON analysis_evidence(analysis_run_id);
+)SQL";
+            if (!database.execute(analysis_sql, error)) return false;
+            Statement bump;
+            if (!bump.prepare(
+                    database,
+                    "UPDATE schema_info SET schema_version=?1 WHERE singleton=1;",
+                    error) ||
+                !bump.bind_int64(1, registry_explorer_schema_version, error) ||
+                !bump.step_done(database, error))
+                return false;
+        } else {
+            static constexpr std::string_view analysis_tables[] = {
+                "analysis_runs", "analysis_artifacts", "analysis_findings",
+                "analysis_files", "analysis_dependencies", "analysis_evidence"};
+            for (const std::string_view table : analysis_tables) {
+                bool present{};
+                if (!has_table(database, table, present, error)) return false;
+                if (!present) {
+                    error = "incompatible registry explorer schema: missing table " +
+                        std::string(table);
+                    return false;
+                }
             }
         }
         created = false;
@@ -413,6 +539,101 @@ CREATE INDEX repositories_host ON repositories(host);
 CREATE INDEX remotes_server ON remotes(server_version_id);
 CREATE INDEX remotes_host ON remotes(host);
 CREATE INDEX remotes_transport ON remotes(transport);
+CREATE TABLE analysis_runs(
+    id INTEGER PRIMARY KEY,
+    server_version_id INTEGER NOT NULL REFERENCES server_versions(id) ON DELETE RESTRICT,
+    package_id INTEGER NOT NULL REFERENCES packages(id) ON DELETE RESTRICT,
+    analysis_type TEXT NOT NULL CHECK(analysis_type IN ('npm_package_static_v1')),
+    status TEXT NOT NULL CHECK(status IN ('running','completed','failed')),
+    analyzer_name TEXT NOT NULL,
+    analyzer_version TEXT NOT NULL,
+    ruleset_version TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    artifact_sha256 TEXT,
+    published_integrity TEXT,
+    integrity_verified INTEGER CHECK(integrity_verified IN (0, 1)),
+    base_image_ref TEXT,
+    base_image_digest TEXT,
+    network_mode TEXT,
+    container_read_only INTEGER CHECK(container_read_only IN (0, 1)),
+    container_user TEXT,
+    summary_json TEXT,
+    error_stage TEXT,
+    error_message TEXT
+);
+CREATE TABLE analysis_artifacts(
+    id INTEGER PRIMARY KEY,
+    analysis_run_id INTEGER NOT NULL UNIQUE REFERENCES analysis_runs(id) ON DELETE CASCADE,
+    registry_type TEXT NOT NULL,
+    package_identifier TEXT NOT NULL,
+    package_version TEXT NOT NULL,
+    source_url TEXT NOT NULL,
+    local_relative_path TEXT NOT NULL,
+    byte_size INTEGER NOT NULL CHECK(byte_size >= 0),
+    sha256 TEXT NOT NULL,
+    published_integrity TEXT NOT NULL,
+    integrity_verified INTEGER NOT NULL CHECK(integrity_verified IN (0, 1)),
+    downloaded_at TEXT NOT NULL
+);
+CREATE TABLE analysis_findings(
+    id INTEGER PRIMARY KEY,
+    analysis_run_id INTEGER NOT NULL REFERENCES analysis_runs(id) ON DELETE CASCADE,
+    rule_id TEXT NOT NULL,
+    category TEXT NOT NULL,
+    severity TEXT NOT NULL CHECK(severity IN ('info','low','medium','high','critical')),
+    confidence TEXT NOT NULL CHECK(confidence IN ('low','medium','high')),
+    disposition TEXT NOT NULL CHECK(disposition IN (
+        'unreviewed','expected','reviewed-benign','mitigated',
+        'suspicious','confirmed-risk','false-positive')),
+    subject_path TEXT NOT NULL,
+    line_number INTEGER CHECK(line_number IS NULL OR line_number > 0),
+    symbol TEXT,
+    title TEXT NOT NULL,
+    evidence TEXT,
+    explanation TEXT NOT NULL
+);
+CREATE TABLE analysis_files(
+    id INTEGER PRIMARY KEY,
+    analysis_run_id INTEGER NOT NULL REFERENCES analysis_runs(id) ON DELETE CASCADE,
+    archive_path TEXT NOT NULL,
+    file_type TEXT NOT NULL,
+    byte_size INTEGER NOT NULL CHECK(byte_size >= 0),
+    sha256 TEXT NOT NULL,
+    executable INTEGER NOT NULL CHECK(executable IN (0, 1)),
+    native_binary INTEGER NOT NULL CHECK(native_binary IN (0, 1)),
+    generated INTEGER NOT NULL CHECK(generated IN (0, 1)),
+    minified INTEGER NOT NULL CHECK(minified IN (0, 1)),
+    UNIQUE(analysis_run_id, archive_path)
+);
+CREATE TABLE analysis_dependencies(
+    id INTEGER PRIMARY KEY,
+    analysis_run_id INTEGER NOT NULL REFERENCES analysis_runs(id) ON DELETE CASCADE,
+    dependency_type TEXT NOT NULL CHECK(dependency_type IN ('runtime','development','peer','optional')),
+    dependency_name TEXT NOT NULL,
+    declared_version TEXT NOT NULL,
+    resolved_version TEXT,
+    direct INTEGER NOT NULL CHECK(direct IN (0, 1)),
+    development INTEGER NOT NULL CHECK(development IN (0, 1))
+);
+CREATE TABLE analysis_evidence(
+    id INTEGER PRIMARY KEY,
+    analysis_run_id INTEGER NOT NULL REFERENCES analysis_runs(id) ON DELETE CASCADE,
+    evidence_type TEXT NOT NULL,
+    relative_path TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    byte_size INTEGER NOT NULL CHECK(byte_size >= 0),
+    media_type TEXT NOT NULL,
+    UNIQUE(analysis_run_id, relative_path)
+);
+CREATE INDEX analysis_runs_package ON analysis_runs(package_id, status);
+CREATE INDEX analysis_runs_artifact ON analysis_runs(
+    artifact_sha256, analyzer_version, ruleset_version, status);
+CREATE INDEX analysis_findings_run ON analysis_findings(analysis_run_id);
+CREATE INDEX analysis_findings_rule ON analysis_findings(rule_id);
+CREATE INDEX analysis_files_run ON analysis_files(analysis_run_id);
+CREATE INDEX analysis_dependencies_run ON analysis_dependencies(analysis_run_id);
+CREATE INDEX analysis_evidence_run ON analysis_evidence(analysis_run_id);
 )SQL";
     if (!database.execute(schema_sql, error)) return false;
 
@@ -1138,7 +1359,7 @@ ExplorerResult open_catalog(
     if (!database.open(path, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, error))
         return failure(ExplorerError::database, error);
     bool created{};
-    if (!initialize_schema(database, search_mode, created, error) || created)
+    if (!initialize_schema(database, search_mode, created, error, false) || created)
         return failure(ExplorerError::incompatible_schema, error);
     if (!verify_foreign_keys(database, error))
         return failure(ExplorerError::database, error);
