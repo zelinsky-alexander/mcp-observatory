@@ -24,6 +24,7 @@ if(NOT MCPO_GIT_COMMIT)
 endif()
 
 add_library(mcpo_core STATIC
+    src/acquisition.cpp
     src/analyze.cpp
     src/explorer.cpp
     src/history.cpp
@@ -54,6 +55,12 @@ if(MCPO_BUILD_TESTS)
     target_link_libraries(mcpo_tests PRIVATE mcpo_core)
     target_compile_features(mcpo_tests PRIVATE cxx_std_20)
     add_test(NAME mcpo_tests COMMAND mcpo_tests)
+
+    add_executable(mcpo_acquisition_tests tests/test_acquisition.cpp)
+    target_link_libraries(mcpo_acquisition_tests PRIVATE mcpo_core)
+    target_compile_features(mcpo_acquisition_tests PRIVATE cxx_std_20)
+    add_test(NAME mcpo_acquisition_tests COMMAND mcpo_acquisition_tests)
+
     add_test(
         NAME mcpo_registry_cli_tests
         COMMAND ${Python3_EXECUTABLE}
