@@ -904,6 +904,20 @@ bool write_file_bytes(
     return true;
 }
 
+bool replace_permissions(
+    const std::filesystem::path& path,
+    std::filesystem::perms permissions,
+    std::string& error) {
+    std::error_code ec;
+    std::filesystem::permissions(
+        path, permissions, std::filesystem::perm_options::replace, ec);
+    if (ec) {
+        error = "cannot set permissions on " + path.string() + ": " + ec.message();
+        return false;
+    }
+    return true;
+}
+
 struct RuleMetadata {
     std::string rule_id;
     std::string category;
@@ -3334,10 +3348,32 @@ AnalyzePackageResult analyze_package(
         ("mcpo-analyze-" + std::to_string(getpid()));
     std::error_code ec;
     std::filesystem::create_directories(staging, ec);
+    if (ec || !replace_permissions(
+                  staging,
+                  std::filesystem::perms::owner_all,
+                  error)) {
+        if (ec)
+            error =
+                "cannot create analysis staging directory " + staging.string() +
+                ": " + ec.message();
+        std::filesystem::remove_all(staging, ec);
+        return failure_result(AnalyzeError::io, error);
+    }
     const auto staged_tarball = staging / "artifact.tgz";
     const auto staged_rules = staging / "analysis-rules.json";
     if (!write_file_bytes(staged_tarball, artifact_bytes, error) ||
         !write_file_bytes(staged_rules, rules_json, error)) {
+        std::filesystem::remove_all(staging, ec);
+        return failure_result(AnalyzeError::io, error);
+    }
+    constexpr auto container_input_permissions =
+        std::filesystem::perms::owner_read |
+        std::filesystem::perms::group_read |
+        std::filesystem::perms::others_read;
+    if (!replace_permissions(
+            staged_tarball, container_input_permissions, error) ||
+        !replace_permissions(
+            staged_rules, container_input_permissions, error)) {
         std::filesystem::remove_all(staging, ec);
         return failure_result(AnalyzeError::io, error);
     }

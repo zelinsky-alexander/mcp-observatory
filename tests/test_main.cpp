@@ -1,4 +1,5 @@
 #include "observatory/analyze.hpp"
+#include "observatory/explorer.hpp"
 #include "observatory/history.hpp"
 #include "observatory/inventory.hpp"
 #include "observatory/observation.hpp"
@@ -13,6 +14,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <sys/stat.h>
 #include <utility>
 #include <unistd.h>
 
@@ -1758,6 +1760,7 @@ int main() {
         }
 
         // successful integrity with generated sha512
+        std::string integrity;
         {
             require(
                 std::system(("python3 - <<'PY'\n"
@@ -1773,11 +1776,119 @@ int main() {
                                 .c_str()) == 0,
                 "create integrity text");
             std::ifstream integrity_input(parent / "good.integrity");
-            std::string integrity;
             std::getline(integrity_input, integrity);
             require(
                 mcpo::verify_npm_integrity(bytes, integrity, error),
                 "sha512 integrity success");
+        }
+
+        // Container staging remains readable by the fixed unprivileged worker
+        // identity even when the parent process uses a restrictive umask.
+        {
+            mcpo::RegistryCollectOptions collect;
+            collect.output = parent / "staging-permissions-bundle";
+            collect.registry_base_url = "http://127.0.0.1:8080/base";
+            std::string message;
+            require(
+                mcpo::collect_registry(
+                    collect,
+                    message,
+                    fixture_transport({registry_page(registry_entry(
+                        "io.example/staging-permissions",
+                        "9.9.9",
+                        R"json(,"packages":[{"registryType":"npm","identifier":"fixture-pkg","version":"9.9.9","transport":{"type":"stdio"}}])json"))})),
+                "collect staging-permissions registry fixture");
+
+            mcpo::RegistryIndexOptions index;
+            index.bundle = collect.output;
+            index.database = parent / "staging-permissions.sqlite";
+            require(
+                mcpo::index_registry_bundle(index).ok(),
+                "index staging-permissions registry fixture");
+
+            mcpo::AnalyzePackageOptions options;
+            options.database = index.database;
+            options.server_identifier = "io.example/staging-permissions";
+            options.server_version = "9.9.9";
+            options.package_identifier = "fixture-pkg";
+            options.evidence_root = parent / "staging-permissions-evidence";
+            options.rules_path = rules_path;
+
+            const std::string metadata_json =
+                std::string(
+                    R"json({"name":"fixture-pkg","version":"9.9.9","dist":{"tarball":"https://example.invalid/fixture-pkg-9.9.9.tgz","integrity":")json") +
+                integrity + R"json("}})json";
+            std::size_t download_count{};
+            mcpo::AnalyzeDownloadTransport download =
+                [&](const std::string&,
+                    std::chrono::steady_clock::duration,
+                    std::size_t,
+                    std::string& body,
+                    std::string&) {
+                    body = download_count++ == 0U ? metadata_json : bytes;
+                    return true;
+                };
+
+            bool worker_read_both_inputs = false;
+            bool staging_permissions_are_restricted = false;
+            bool input_permissions_are_container_readable = false;
+            mcpo::AnalyzeWorkerRunner worker =
+                [&](const std::filesystem::path& tarball,
+                    const std::filesystem::path& staged_rules,
+                    const mcpo::ArchiveLimits& worker_limits,
+                    mcpo::AnalyzerWorkerResult& worker_result,
+                    std::string& raw_json,
+                    std::string& worker_error) {
+                    const auto permission_bits = [](const std::filesystem::path& path) {
+                        std::error_code status_error;
+                        const auto status = std::filesystem::status(path, status_error);
+                        return status_error
+                            ? std::filesystem::perms::unknown
+                            : status.permissions() & std::filesystem::perms::mask;
+                    };
+                    constexpr auto read_only_for_all =
+                        std::filesystem::perms::owner_read |
+                        std::filesystem::perms::group_read |
+                        std::filesystem::perms::others_read;
+                    staging_permissions_are_restricted =
+                        permission_bits(tarball.parent_path()) ==
+                        std::filesystem::perms::owner_all;
+                    input_permissions_are_container_readable =
+                        permission_bits(tarball) == read_only_for_all &&
+                        permission_bits(staged_rules) == read_only_for_all;
+
+                    std::ifstream artifact_input(tarball, std::ios::binary);
+                    std::ifstream rules_input(staged_rules, std::ios::binary);
+                    worker_read_both_inputs =
+                        artifact_input.good() && rules_input.good();
+                    raw_json.clear();
+                    return worker_read_both_inputs &&
+                        mcpo::analyze_npm_tarball_bytes(
+                            std::string(
+                                std::istreambuf_iterator<char>(artifact_input),
+                                std::istreambuf_iterator<char>()),
+                            staged_rules,
+                            worker_limits,
+                            worker_result,
+                            worker_error);
+                };
+
+            const mode_t previous_umask = umask(0077);
+            const auto package_result =
+                mcpo::analyze_package(options, download, worker);
+            umask(previous_umask);
+
+            require(package_result.ok(), "restrictive-umask package analysis");
+            require(download_count == 2U, "metadata and artifact downloaded");
+            require(
+                staging_permissions_are_restricted,
+                "analysis staging directory must be mode 0700");
+            require(
+                input_permissions_are_container_readable,
+                "container inputs must be mode 0444");
+            require(
+                worker_read_both_inputs,
+                "unprivileged analyzer boundary reads artifact and rules");
         }
 
         std::filesystem::remove_all(parent, ec);

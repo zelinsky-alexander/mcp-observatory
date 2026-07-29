@@ -167,6 +167,11 @@ def main(binary: str) -> None:
     with tempfile.TemporaryDirectory(prefix="mcpo-analyze-cli-") as temp:
         root = pathlib.Path(temp)
         database = seed_database(binary, root)
+        rules = (
+            pathlib.Path(__file__).resolve().parent.parent
+            / "rules"
+            / "artifact-static-analysis-v1.json"
+        )
 
         # 1 exact resolution success path prep
         package_json = json.dumps(
@@ -222,6 +227,8 @@ def main(binary: str) -> None:
             "demo-npm",
             "--evidence-root",
             str(evidence),
+            "--rules",
+            str(rules),
             "--npm-registry-url",
             base,
             "--allow-in-process-worker",
@@ -342,6 +349,62 @@ def main(binary: str) -> None:
             "reused_existing=true",
         ):
             require(key in text.stdout, f"missing {key}", text)
+
+        # When the fixed analyzer image is already available, exercise the real
+        # UID 65532 Docker boundary under the portal launcher's restrictive
+        # umask. The unit suite always checks the exact staging modes; this
+        # integration check is skipped on hosts without a ready Docker daemon.
+        docker_ready = subprocess.run(
+            ["/usr/bin/docker", "image", "inspect", "debian:bookworm-slim"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+            check=False,
+        )
+        if docker_ready.returncode == 0:
+            restricted = subprocess.run(
+                [
+                    "/bin/sh",
+                    "-c",
+                    'umask 077; exec "$@"',
+                    "sh",
+                    binary,
+                    "analyze",
+                    "package",
+                    "--database",
+                    str(database),
+                    "--server",
+                    "io.example/demo-npm",
+                    "--version",
+                    "1.0.1",
+                    "--package",
+                    "demo-npm",
+                    "--evidence-root",
+                    str(evidence),
+                    "--rules",
+                    str(rules),
+                    "--npm-registry-url",
+                    base,
+                    "--force",
+                    "--format",
+                    "json",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=180,
+                check=False,
+            )
+            require(
+                restricted.returncode == 0,
+                "UID 65532 analyzer must read both mounts under umask 077",
+                restricted,
+            )
+            require(
+                json.loads(restricted.stdout)["reused_existing"] is False,
+                "restricted analyzer regression must execute a fresh container",
+                restricted,
+            )
 
         # 2 ambiguous rejection
         ambiguous = run(
