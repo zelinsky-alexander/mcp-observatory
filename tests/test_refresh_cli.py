@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline periodic Registry refresh tests."""
 
+from datetime import datetime, timedelta
 import http.server
 import json
 import os
@@ -238,6 +239,13 @@ def main():
         )
 
         connection = sqlite3.connect(database)
+        baseline_completed_at = connection.execute(
+            "SELECT completed_at FROM snapshots ORDER BY id LIMIT 1"
+        ).fetchone()[0]
+        tied_completed_at = (
+            datetime.fromisoformat(baseline_completed_at.replace("Z", "+00:00"))
+            + timedelta(seconds=1)
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
         template = connection.execute(
             "SELECT started_at,registry_base_url,collector_name,collector_version,"
             "collector_git_commit,bundle_version,source_bundle_path,pages,"
@@ -251,7 +259,7 @@ def main():
                 "collector_git_commit,bundle_version,source_bundle_path,pages,"
                 "records_received,unique_server_versions,imported_at)"
                 " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (digest, "2026-07-29T01:02:03Z", *template),
+                (digest, tied_completed_at, *template),
             )
         connection.commit()
         connection.close()
@@ -274,7 +282,7 @@ def main():
         require(derived.returncode == 0, "derived refresh failed", derived)
         summary = json.loads(derived.stdout)
         require(
-            summary["updated_since"] == "2026-07-29T01:02:03Z"
+            summary["updated_since"] == tied_completed_at
             and summary["base_snapshot_sha256"] == "b" * 64,
             "latest snapshot or ID tie-break selection is wrong",
             derived,
@@ -284,7 +292,7 @@ def main():
             and summary["received_records"] == 2
             and all(
                 request[1].get("updated_since")
-                == ["2026-07-29T01:02:03Z"]
+                == [tied_completed_at]
                 for request in Handler.requests
             )
             and Handler.requests[1][1].get("cursor") == ["second"],
@@ -295,7 +303,7 @@ def main():
         require(
             manifest["bundle_version"] == 2
             and manifest["collection_mode"] == "incremental"
-            and manifest["updated_since"] == "2026-07-29T01:02:03Z"
+            and manifest["updated_since"] == tied_completed_at
             and manifest["base_snapshot_sha256"] == "b" * 64,
             "incremental manifest provenance is wrong",
         )
