@@ -1457,6 +1457,76 @@ int main() {
     }
 
     {
+        // Exact PyPI release parsing selects only the minimal supported sdist.
+        std::string error;
+        mcpo::ArtifactDescriptor artifact;
+        mcpo::AcquisitionLimits limits;
+        require(
+            mcpo::parse_pypi_release_metadata(
+                R"json({"info":{"name":"Demo_Package","version":"2.0.0"},"urls":[{"filename":"demo_package-2.0.0-py3-none-any.whl","packagetype":"bdist_wheel","url":"https://files.pythonhosted.org/demo.whl","size":100,"digests":{"sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"yanked":false},{"filename":"demo_package-2.0.0.tar.gz","packagetype":"sdist","url":"https://files.pythonhosted.org/demo.tar.gz","size":200,"digests":{"sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"yanked":false}]})json",
+                "demo-package",
+                "2.0.0",
+                limits,
+                artifact,
+                error),
+            "PyPI exact release metadata should select its tar-gzip sdist");
+        require(
+            artifact.registry == mcpo::ArtifactRegistry::pypi &&
+                artifact.filename == "demo_package-2.0.0.tar.gz" &&
+                artifact.published_size == 200U,
+            "PyPI artifact descriptor fields");
+        require(
+            !mcpo::parse_pypi_release_metadata(
+                R"json({"info":{"name":"demo","version":"2.0.1"},"urls":[]})json",
+                "demo",
+                "2.0.0",
+                limits,
+                artifact,
+                error),
+            "PyPI metadata version mismatch should fail");
+        require(
+            !mcpo::parse_pypi_release_metadata(
+                R"json({"info":{"name":"demo","name":"other","version":"2.0.0"},"urls":[]})json",
+                "demo",
+                "2.0.0",
+                limits,
+                artifact,
+                error),
+            "duplicate PyPI metadata keys should fail");
+        require(
+            !mcpo::parse_pypi_release_metadata(
+                R"json({"info":{"name":"demo","version":"2.0.0"},"urls":[{"filename":"demo.tar.gz","packagetype":"sdist","url":"https://files.pythonhosted.org/demo.tar.gz","size":"200","digests":{"sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"yanked":false}]})json",
+                "demo",
+                "2.0.0",
+                limits,
+                artifact,
+                error),
+            "PyPI file size encoded as a string should fail");
+
+        require(
+            mcpo::verify_pypi_integrity(
+                "abc",
+                "BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD",
+                3U,
+                error),
+            "PyPI integrity should accept a matching case-insensitive SHA-256");
+        require(
+            !mcpo::verify_pypi_integrity(
+                "abc",
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+                4U,
+                error),
+            "PyPI integrity should reject a published size mismatch");
+        require(
+            !mcpo::verify_pypi_integrity(
+                "abd",
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+                3U,
+                error),
+            "PyPI integrity should reject a SHA-256 mismatch");
+    }
+
+    {
         const auto parent = std::filesystem::temp_directory_path() /
             ("mcpo-analyze-unit-" + std::to_string(getpid()));
         std::error_code ec;
@@ -1538,6 +1608,54 @@ int main() {
         require(!saw_docs_fetch, "documentation URL false positive");
         require(result.dependencies.size() >= 2U, "dependencies extracted");
         require(!result.has_native_code, "no native code in fixture");
+
+        std::filesystem::create_directories(parent / "mixed");
+        {
+            std::ofstream metadata(parent / "mixed" / "PKG-INFO");
+            metadata << "Metadata-Version: 2.1\n"
+                     << "Name: python-fixture\n"
+                     << "Version: 4.5.6\n"
+                     << "Requires-Dist: requests[security]>=2\n";
+        }
+        {
+            std::ofstream bundled_manifest(parent / "mixed" / "package.json");
+            bundled_manifest
+                << R"json({"name":"bundled-frontend","version":"99.0.0"})json";
+        }
+        require(
+            std::system(("tar -C '" + parent.string() +
+                         "' -czf '" + (parent / "mixed.tgz").string() +
+                         "' mixed").c_str()) == 0,
+            "create mixed PyPI fixture tarball");
+        std::ifstream mixed_input(parent / "mixed.tgz", std::ios::binary);
+        const std::string mixed_bytes(
+            (std::istreambuf_iterator<char>(mixed_input)),
+            std::istreambuf_iterator<char>());
+        mcpo::AnalyzerWorkerResult pypi_result;
+        require(
+            mcpo::analyze_package_tarball_bytes(
+                "pypi", mixed_bytes, rules_path, limits, pypi_result, error),
+            "PyPI worker should select PKG-INFO over bundled package.json");
+        require(
+            pypi_result.package_name == "python-fixture" &&
+                pypi_result.package_version == "4.5.6",
+            "PyPI worker identity should come from PKG-INFO");
+        require(
+            pypi_result.dependencies.size() == 1U &&
+                pypi_result.dependencies.front().dependency_name == "requests" &&
+                pypi_result.dependencies.front().declared_version ==
+                    "requests[security]>=2",
+            "PyPI dependency extras should not be part of the project name");
+        mcpo::AnalyzerWorkerResult missing_pypi_metadata;
+        require(
+            !mcpo::analyze_package_tarball_bytes(
+                "pypi",
+                bytes,
+                rules_path,
+                limits,
+                missing_pypi_metadata,
+                error),
+            "PyPI worker must reject a tarball without root PKG-INFO");
 
         // Rules are loaded from JSON: changing policy changes findings without
         // recompiling the analyzer.
@@ -1833,7 +1951,8 @@ int main() {
             bool staging_permissions_are_restricted = false;
             bool input_permissions_are_container_readable = false;
             mcpo::AnalyzeWorkerRunner worker =
-                [&](const std::filesystem::path& tarball,
+                [&](std::string_view registry_type,
+                    const std::filesystem::path& tarball,
                     const std::filesystem::path& staged_rules,
                     const mcpo::ArchiveLimits& worker_limits,
                     mcpo::AnalyzerWorkerResult& worker_result,
@@ -1862,8 +1981,9 @@ int main() {
                     worker_read_both_inputs =
                         artifact_input.good() && rules_input.good();
                     raw_json.clear();
-                    return worker_read_both_inputs &&
-                        mcpo::analyze_npm_tarball_bytes(
+                    return worker_read_both_inputs && registry_type == "npm" &&
+                        mcpo::analyze_package_tarball_bytes(
+                            registry_type,
                             std::string(
                                 std::istreambuf_iterator<char>(artifact_input),
                                 std::istreambuf_iterator<char>()),

@@ -38,18 +38,19 @@ void print_usage(std::ostream& out) {
         << "  mcp-observatory registry show DATABASE SERVER_NAME [OPTIONS]\n"
         << "  mcp-observatory registry list DATABASE [OPTIONS]\n"
         << "  mcp-observatory analyze package [OPTIONS]\n"
-        << "  mcp-observatory analyze-worker --tarball PATH [OPTIONS]\n"
+        << "  mcp-observatory analyze-worker --registry npm|pypi --tarball PATH [OPTIONS]\n"
         << "  mcp-observatory bundle validate DIRECTORY\n"
         << "\nanalyze package options:\n"
         << "  --database PATH               registry SQLite database\n"
         << "  --server IDENTIFIER           exact server identifier\n"
         << "  --version VERSION             exact server version\n"
-        << "  --package IDENTIFIER          exact npm package name\n"
+        << "  --package IDENTIFIER          exact npm or PyPI package name\n"
         << "  --evidence-root PATH          evidence root (default evidence)\n"
         << "  --rules PATH                  analysis rules JSON\n"
         << "  --format text|json            output format (default text)\n"
         << "  --force                       ignore completed-run deduplication\n"
         << "  --npm-registry-url URL        npm registry base URL\n"
+        << "  --pypi-registry-url URL       PyPI JSON API base URL\n"
         << "  --allow-in-process-worker     test-only: skip Docker worker\n"
         << "\nregistry collect runtime options:\n"
         << "  --request-timeout-seconds N   one HTTP attempt (default 60)\n"
@@ -735,6 +736,8 @@ int run_analyze_package(int argc, char** argv) {
             options.rules_path = std::string(value);
         else if (argument == "--npm-registry-url")
             options.npm_registry_url = std::string(value);
+        else if (argument == "--pypi-registry-url")
+            options.pypi_registry_url = std::string(value);
         else if (argument == "--format") {
             if (value == "text") options.format = mcpo::AnalyzeOutputFormat::text;
             else if (value == "json") options.format = mcpo::AnalyzeOutputFormat::json;
@@ -772,6 +775,7 @@ int run_analyze_package(int argc, char** argv) {
 }
 
 int run_analyze_worker(int argc, char** argv) {
+    std::string registry_type;
     std::filesystem::path tarball;
     std::filesystem::path rules_path{mcpo::default_package_rules_path};
     mcpo::ArchiveLimits limits;
@@ -782,7 +786,13 @@ int run_analyze_worker(int argc, char** argv) {
             return 1;
         }
         const std::string_view value(argv[++index]);
-        if (argument == "--tarball") tarball = std::string(value);
+        if (argument == "--registry") {
+            if (value != "npm" && value != "pypi") {
+                std::cerr << "analyze-worker registry must be npm or pypi\n";
+                return 1;
+            }
+            registry_type = value;
+        } else if (argument == "--tarball") tarball = std::string(value);
         else if (argument == "--rules") rules_path = std::string(value);
         else if (argument == "--maximum-files") {
             if (!parse_size(value, limits.maximum_files)) return 1;
@@ -797,12 +807,12 @@ int run_analyze_worker(int argc, char** argv) {
             return 1;
         }
     }
-    if (tarball.empty()) {
-        std::cerr << "analyze-worker requires --tarball\n";
+    if (registry_type.empty() || tarball.empty()) {
+        std::cerr << "analyze-worker requires --registry and --tarball\n";
         return 1;
     }
     return mcpo::analyze_worker_main(
-        tarball, rules_path, limits, std::cout, std::cerr);
+        registry_type, tarball, rules_path, limits, std::cout, std::cerr);
 }
 
 int run_bundle_validate(const char* path) {

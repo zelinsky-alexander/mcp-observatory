@@ -83,6 +83,12 @@ def seed_database(binary, root: pathlib.Path):
                     "identifier": "demo-npm",
                     "version": "1.0.1",
                     "transport": {"type": "stdio"},
+                },
+                {
+                    "registryType": "npm",
+                    "identifier": "demo-npm",
+                    "version": "1.0.1",
+                    "transport": {"type": "streamable-http"},
                 }
             ],
         },
@@ -94,8 +100,8 @@ def seed_database(binary, root: pathlib.Path):
                 {
                     "registryType": "npm",
                     "identifier": "same-name",
-                    "version": "1.0.0",
-                    "transport": {"type": "stdio"},
+                    "version": "2.0.0",
+                    "transport": {"type": "streamable-http"},
                 },
                 {
                     "registryType": "npm",
@@ -131,7 +137,7 @@ def seed_database(binary, root: pathlib.Path):
             ],
         },
     ]
-    # Ambiguous case needs two package rows with same identifier; explorer stores by position.
+    # Ambiguous case needs two artifact versions with the same package identifier.
     bundle = root / "bundle"
     make_bundle(bundle, specs, "2026-07-27T00:00:00Z")
     database = root / "registry.sqlite"
@@ -204,12 +210,59 @@ def main(binary: str) -> None:
         }
         server, base = serve_npm({})
         metadata["dist"]["tarball"] = f"{base}/demo-npm/-/demo-npm-1.0.1.tgz"
+        pypi_sdist = make_tarball(
+            root,
+            {
+                "demo_pypi-2.0.0/PKG-INFO": (
+                    b"Metadata-Version: 2.1\n"
+                    b"Name: Demo_PyPI\n"
+                    b"Version: 2.0.0\n"
+                    b"License: MIT\n"
+                    b"Requires-Dist: mcp>=1.0\n"
+                ),
+                "demo_pypi-2.0.0/demo_pypi/server.py": (
+                    b"from pathlib import Path\n"
+                    b"def main():\n"
+                    b"    return Path.cwd()\n"
+                ),
+            },
+        )
+        pypi_digest = sha256(pypi_sdist)
+        pypi_metadata = {
+            "info": {"name": "Demo_PyPI", "version": "2.0.0"},
+            "urls": [
+                {
+                    "filename": "demo_pypi-2.0.0-py3-none-any.whl",
+                    "packagetype": "bdist_wheel",
+                    "url": f"{base}/packages/demo_pypi-2.0.0.whl",
+                    "size": 1,
+                    "digests": {"sha256": "0" * 64},
+                    "yanked": False,
+                },
+                {
+                    "filename": "demo_pypi-2.0.0.tar.gz",
+                    "packagetype": "sdist",
+                    "url": f"{base}/packages/demo_pypi-2.0.0.tar.gz",
+                    "size": len(pypi_sdist),
+                    "digests": {"sha256": pypi_digest},
+                    "yanked": False,
+                },
+            ],
+        }
         NpmHandler.catalog = {
             "/demo-npm/1.0.1": (
                 json.dumps(metadata).encode(),
                 "application/json",
             ),
             "/demo-npm/-/demo-npm-1.0.1.tgz": (tarball, "application/octet-stream"),
+            "/pypi/demo-pypi/2.0.0/json": (
+                json.dumps(pypi_metadata).encode(),
+                "application/json",
+            ),
+            "/packages/demo_pypi-2.0.0.tar.gz": (
+                pypi_sdist,
+                "application/octet-stream",
+            ),
         }
 
         evidence = root / "evidence"
@@ -238,6 +291,7 @@ def main(binary: str) -> None:
         require(first.returncode == 0, "analyze package failed", first)
         payload = json.loads(first.stdout)
         require(payload["status"] == "completed", "status")
+        require(payload["analyzer_version"] == "1.1.0", "analyzer version")
         require(payload["integrity_verified"] is True, "integrity")
         require(payload["package_version"] == "1.0.1", "version")
         require(payload["reused_existing"] is False, "first run reused")
@@ -252,6 +306,15 @@ def main(binary: str) -> None:
             connection.execute("SELECT schema_version FROM schema_info").fetchone()
             == (2,),
             "schema migrated to 2",
+        )
+        require(
+            connection.execute(
+                "SELECT p.position FROM analysis_runs ar "
+                "JOIN packages p ON p.id=ar.package_id WHERE ar.id=?",
+                (run_id,),
+            ).fetchone()
+            == (0,),
+            "equivalent transport rows should select the lowest package position",
         )
         require(
             connection.execute(
@@ -426,8 +489,8 @@ def main(binary: str) -> None:
         require(ambiguous.returncode == 5, "ambiguous should fail", ambiguous)
         require("ambiguous" in ambiguous.stderr.lower(), "ambiguous message", ambiguous)
 
-        # 3 unsupported registry
-        unsupported = run(
+        # 3 exact PyPI sdist acquisition, integrity verification, and reuse
+        pypi = run(
             binary,
             "analyze",
             "package",
@@ -441,13 +504,83 @@ def main(binary: str) -> None:
             "demo-pypi",
             "--evidence-root",
             str(evidence),
+            "--rules",
+            str(rules),
+            "--pypi-registry-url",
+            f"{base}/pypi",
             "--allow-in-process-worker",
+            "--format",
+            "json",
         )
-        require(unsupported.returncode == 5, "unsupported should fail", unsupported)
+        require(pypi.returncode == 0, "PyPI analysis should complete", pypi)
+        pypi_payload = json.loads(pypi.stdout)
+        require(pypi_payload["registry_type"] == "pypi", "PyPI registry output")
+        require(pypi_payload["integrity_verified"] is True, "PyPI integrity")
         require(
-            "unsupported" in unsupported.stderr.lower(),
-            "unsupported message",
-            unsupported,
+            pypi_payload["artifact_sha256"] == pypi_digest,
+            "PyPI artifact digest",
+            pypi,
+        )
+        pypi_run_id = pypi_payload["analysis_run_id"]
+        pypi_evidence = (
+            evidence
+            / "artifacts"
+            / "sha256"
+            / pypi_digest[:2]
+            / pypi_digest
+        )
+        require(
+            (pypi_evidence / "registry-metadata.json").is_file(),
+            "PyPI registry metadata evidence",
+        )
+        connection = sqlite3.connect(database)
+        require(
+            connection.execute(
+                "SELECT registry_type,published_integrity "
+                "FROM analysis_artifacts WHERE analysis_run_id=?",
+                (pypi_run_id,),
+            ).fetchone()
+            == ("pypi", f"sha256:{pypi_digest}"),
+            "PyPI artifact database row",
+        )
+        require(
+            connection.execute(
+                "SELECT COUNT(*) FROM analysis_dependencies WHERE analysis_run_id=? "
+                "AND dependency_name='mcp'",
+                (pypi_run_id,),
+            ).fetchone()[0]
+            == 1,
+            "PyPI Requires-Dist dependency",
+        )
+        connection.close()
+
+        pypi_reused = run(
+            binary,
+            "analyze",
+            "package",
+            "--database",
+            str(database),
+            "--server",
+            "io.example/pypi-only",
+            "--version",
+            "2.0.0",
+            "--package",
+            "demo-pypi",
+            "--evidence-root",
+            str(evidence),
+            "--rules",
+            str(rules),
+            "--pypi-registry-url",
+            f"{base}/pypi",
+            "--allow-in-process-worker",
+            "--format",
+            "json",
+        )
+        require(pypi_reused.returncode == 0, "PyPI reuse should complete", pypi_reused)
+        require(
+            json.loads(pypi_reused.stdout)["reused_existing"] is True,
+            "PyPI completed run should be reused",
+            pypi_reused,
         )
 
         # 4 missing exact package version
@@ -514,6 +647,8 @@ def main(binary: str) -> None:
         worker = run(
             binary,
             "analyze-worker",
+            "--registry",
+            "npm",
             "--tarball",
             str(evidence_dir / "artifact.tgz"),
         )

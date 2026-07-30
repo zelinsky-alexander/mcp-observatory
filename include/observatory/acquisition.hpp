@@ -54,6 +54,11 @@ struct AcquisitionLimits {
 [[nodiscard]] std::string_view artifact_registry_name(ArtifactRegistry registry) noexcept;
 [[nodiscard]] std::string_view archive_format_name(ArtifactArchiveFormat format) noexcept;
 
+[[nodiscard]] bool normalize_pypi_project_name(
+    std::string_view package_name,
+    std::string& normalized_name,
+    std::string& error);
+
 [[nodiscard]] bool make_npm_artifact_descriptor(
     const NpmArtifactInput& input,
     const AcquisitionLimits& limits,
@@ -66,6 +71,14 @@ struct AcquisitionLimits {
     const std::vector<PypiReleaseFile>& files,
     const AcquisitionLimits& limits,
     std::vector<ArtifactDescriptor>& descriptors,
+    std::string& error);
+
+[[nodiscard]] bool select_pypi_sdist_artifact(
+    std::string_view package_name,
+    std::string_view package_version,
+    const std::vector<PypiReleaseFile>& files,
+    const AcquisitionLimits& limits,
+    ArtifactDescriptor& descriptor,
     std::string& error);
 
 }  // namespace mcpo

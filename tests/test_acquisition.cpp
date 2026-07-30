@@ -83,5 +83,77 @@ int main() {
                 "non-HTTPS PyPI URL should fail closed");
     }
 
+    {
+        std::string normalized;
+        require(mcpo::normalize_pypi_project_name(
+                    "Friendly_Bard...Tools", normalized, error),
+                "valid PyPI project name should normalize");
+        require(normalized == "friendly-bard-tools",
+                "PyPI project normalization should collapse separators and lowercase ASCII");
+        require(!mcpo::normalize_pypi_project_name("-demo", normalized, error),
+                "PyPI project name may not begin with a separator");
+        require(!mcpo::normalize_pypi_project_name("demo/name", normalized, error),
+                "PyPI project name should reject unsupported characters");
+    }
+
+    {
+        std::vector<mcpo::PypiReleaseFile> files{
+            {"demo-2.0.0-py3-none-any.whl", "bdist_wheel",
+             "https://files.pythonhosted.org/demo.whl", std::string(digest), 1024U, false},
+            {"demo-2.0.0.zip", "sdist",
+             "https://files.pythonhosted.org/demo.zip", std::string(digest), 1024U, false},
+            {"demo-2.0.0.tar.gz", "sdist",
+             "https://files.pythonhosted.org/demo.tar.gz", std::string(digest), 2048U, false},
+            {"demo-2.0.0-old.tar.gz", "sdist",
+             "https://files.pythonhosted.org/old.tar.gz", std::string(digest), 2048U, true},
+        };
+        mcpo::ArtifactDescriptor descriptor;
+        require(mcpo::select_pypi_sdist_artifact(
+                    "Demo_Package", "2.0.0", files, limits, descriptor, error),
+                "one non-yanked tar-gzip sdist should be selected");
+        require(descriptor.package_name == "demo-package",
+                "selected PyPI descriptor should use the normalized project name");
+        require(descriptor.filename == "demo-2.0.0.tar.gz",
+                "wheel, zip, and yanked artifacts should not be selected");
+    }
+
+    {
+        std::vector<mcpo::PypiReleaseFile> files{
+            {"demo-2.0.0.tar.gz", "sdist",
+             "https://files.pythonhosted.org/demo.tar.gz", std::string(digest), 2048U, false},
+            {"demo-2.0.0.tgz", "sdist",
+             "https://files.pythonhosted.org/demo.tgz", std::string(digest), 2048U, false},
+        };
+        mcpo::ArtifactDescriptor descriptor;
+        require(!mcpo::select_pypi_sdist_artifact(
+                    "demo", "2.0.0", files, limits, descriptor, error),
+                "ambiguous tar-gzip sdists should fail closed");
+    }
+
+    {
+        std::vector<mcpo::PypiReleaseFile> files{
+            {"demo-2.0.0-py3-none-any.whl", "bdist_wheel",
+             "https://files.pythonhosted.org/demo.whl", std::string(digest), 1024U, false},
+            {"demo-2.0.0.tar.gz", "sdist",
+             "https://files.pythonhosted.org/demo.tar.gz", std::string(digest),
+             limits.maximum_artifact_bytes + 1U, false},
+        };
+        mcpo::ArtifactDescriptor descriptor;
+        require(!mcpo::select_pypi_sdist_artifact(
+                    "demo", "2.0.0", files, limits, descriptor, error),
+                "oversized tar-gzip sdist should fail closed");
+    }
+
+    {
+        std::vector<mcpo::PypiReleaseFile> files(
+            limits.maximum_release_files + 1U,
+            {"demo-2.0.0.whl", "bdist_wheel",
+             "https://files.pythonhosted.org/demo.whl", std::string(digest), 1024U, false});
+        mcpo::ArtifactDescriptor descriptor;
+        require(!mcpo::select_pypi_sdist_artifact(
+                    "demo", "2.0.0", files, limits, descriptor, error),
+                "excessive PyPI release file count should fail before selection");
+    }
+
     return 0;
 }

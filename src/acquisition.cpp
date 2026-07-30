@@ -8,13 +8,26 @@
 namespace mcpo {
 namespace {
 
+bool ascii_alphanumeric(char character) {
+    return (character >= 'a' && character <= 'z') ||
+        (character >= 'A' && character <= 'Z') ||
+        (character >= '0' && character <= '9');
+}
+
 bool valid_https_url(std::string_view value) {
-    if (!value.starts_with("https://") || value.size() <= 8U) return false;
+    const bool secure = value.starts_with("https://") && value.size() > 8U;
+    const bool loopback =
+        value.starts_with("http://127.0.0.1:") ||
+        value.starts_with("http://localhost:");
+    if (!secure && !loopback) return false;
     if (value.find('#') != std::string_view::npos) return false;
-    const auto authority_end = value.find('/', 8U);
-    const auto authority = value.substr(8U, authority_end == std::string_view::npos
-        ? value.size() - 8U
-        : authority_end - 8U);
+    const std::size_t scheme_length = secure ? 8U : 7U;
+    const auto authority_end = value.find('/', scheme_length);
+    const auto authority = value.substr(
+        scheme_length,
+        authority_end == std::string_view::npos
+            ? value.size() - scheme_length
+            : authority_end - scheme_length);
     return !authority.empty() && authority.find('@') == std::string_view::npos;
 }
 
@@ -82,6 +95,11 @@ bool pypi_format(const PypiReleaseFile& file, ArtifactArchiveFormat& format) {
     return false;
 }
 
+bool pypi_tar_gzip_sdist(const PypiReleaseFile& file) {
+    return file.package_type == "sdist" &&
+        (file.filename.ends_with(".tar.gz") || file.filename.ends_with(".tgz"));
+}
+
 }  // namespace
 
 std::string_view artifact_registry_name(ArtifactRegistry registry) noexcept {
@@ -98,6 +116,40 @@ std::string_view archive_format_name(ArtifactArchiveFormat format) noexcept {
         case ArtifactArchiveFormat::zip: return "zip";
     }
     return "unknown";
+}
+
+bool normalize_pypi_project_name(
+    std::string_view package_name,
+    std::string& normalized_name,
+    std::string& error) {
+    normalized_name.clear();
+    if (package_name.empty() || package_name.size() > 512U ||
+        !ascii_alphanumeric(package_name.front()) ||
+        !ascii_alphanumeric(package_name.back())) {
+        error = "PyPI project name must be a bounded name beginning and ending with a letter or digit";
+        return false;
+    }
+
+    bool separator = false;
+    for (const char character : package_name) {
+        if (ascii_alphanumeric(character)) {
+            normalized_name.push_back(character >= 'A' && character <= 'Z'
+                ? static_cast<char>(character - 'A' + 'a')
+                : character);
+            separator = false;
+            continue;
+        }
+        if (character != '.' && character != '_' && character != '-') {
+            normalized_name.clear();
+            error = "PyPI project name contains an unsupported character";
+            return false;
+        }
+        if (!separator) {
+            normalized_name.push_back('-');
+            separator = true;
+        }
+    }
+    return true;
 }
 
 bool make_npm_artifact_descriptor(
@@ -177,6 +229,54 @@ bool make_pypi_artifact_descriptors(
         error = "PyPI release has no supported non-yanked wheel or source distribution";
         return false;
     }
+    return true;
+}
+
+bool select_pypi_sdist_artifact(
+    std::string_view package_name,
+    std::string_view package_version,
+    const std::vector<PypiReleaseFile>& files,
+    const AcquisitionLimits& limits,
+    ArtifactDescriptor& descriptor,
+    std::string& error) {
+    if (files.size() > limits.maximum_release_files) {
+        error = "PyPI release contains too many files";
+        return false;
+    }
+
+    std::string normalized_name;
+    if (!normalize_pypi_project_name(package_name, normalized_name, error)) {
+        return false;
+    }
+
+    const PypiReleaseFile* selected = nullptr;
+    for (const auto& file : files) {
+        if (file.yanked || !pypi_tar_gzip_sdist(file)) continue;
+        if (!validate_common(normalized_name, package_version, file.filename, file.url,
+                             file.sha256, file.size, limits, error)) {
+            return false;
+        }
+        if (selected != nullptr) {
+            error = "PyPI release has multiple supported non-yanked tar-gzip source distributions";
+            return false;
+        }
+        selected = &file;
+    }
+    if (selected == nullptr) {
+        error = "PyPI release has no supported non-yanked tar-gzip source distribution";
+        return false;
+    }
+
+    descriptor = {
+        ArtifactRegistry::pypi,
+        ArtifactArchiveFormat::tar_gzip,
+        std::move(normalized_name),
+        std::string(package_version),
+        selected->filename,
+        selected->url,
+        selected->sha256,
+        selected->size,
+    };
     return true;
 }
 

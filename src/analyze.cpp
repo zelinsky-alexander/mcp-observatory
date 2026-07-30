@@ -1368,6 +1368,7 @@ std::string classify_file_type(std::string_view path, std::string_view bytes) {
     if (ext == ".js" || ext == ".mjs" || ext == ".cjs") return "javascript";
     if (path.ends_with(".d.ts")) return "typescript_declaration";
     if (ext == ".ts") return "typescript";
+    if (ext == ".py" || ext == ".pyi") return "python";
     if (ext == ".map") return "source_map";
     if (ext == ".sh" || ext == ".bash") return "shell_script";
     if (ext == ".ps1" || ext == ".psm1") return "powershell_script";
@@ -1830,6 +1831,104 @@ bool parse_npm_version_metadata(
     return true;
 }
 
+bool parse_pypi_release_metadata(
+    std::string_view json_text,
+    std::string_view expected_name,
+    std::string_view expected_version,
+    const AcquisitionLimits& limits,
+    ArtifactDescriptor& descriptor,
+    std::string& error) {
+    Json root;
+    JsonParser parser(json_text);
+    if (!parser.parse(root, error)) return false;
+    const auto* object = as_object(root);
+    if (object == nullptr) {
+        error = "PyPI release metadata must be an object";
+        return false;
+    }
+
+    const auto info_it = object->find("info");
+    const auto urls_it = object->find("urls");
+    const auto* info =
+        info_it == object->end() ? nullptr : as_object(info_it->second);
+    const auto* urls =
+        urls_it == object->end() ? nullptr : as_array(urls_it->second);
+    if (info == nullptr || urls == nullptr) {
+        error = "PyPI release metadata requires info and urls";
+        return false;
+    }
+    if (urls->size() > limits.maximum_release_files) {
+        error = "PyPI release contains too many files";
+        return false;
+    }
+
+    const std::string name = object_string(*info, "name");
+    const std::string version = object_string(*info, "version");
+    if (name.empty() || version.empty()) {
+        error = "PyPI release metadata missing name or version";
+        return false;
+    }
+    std::string normalized_name;
+    std::string normalized_expected;
+    if (!normalize_pypi_project_name(name, normalized_name, error) ||
+        !normalize_pypi_project_name(expected_name, normalized_expected, error)) {
+        return false;
+    }
+    if (normalized_name != normalized_expected || version != expected_version) {
+        error = "PyPI release metadata identity mismatch";
+        return false;
+    }
+
+    std::vector<PypiReleaseFile> files;
+    files.reserve(urls->size());
+    for (const Json& item : *urls) {
+        const auto* file = as_object(item);
+        if (file == nullptr) {
+            error = "PyPI release file must be an object";
+            return false;
+        }
+        const std::string filename = object_string(*file, "filename");
+        const std::string package_type = object_string(*file, "packagetype");
+        const std::string url = object_string(*file, "url");
+        const auto size_it = file->find("size");
+        const std::string* size_text =
+            size_it == file->end() ? nullptr : as_number_text(size_it->second);
+        const auto digests_it = file->find("digests");
+        const auto* digests =
+            digests_it == file->end() ? nullptr : as_object(digests_it->second);
+        const std::string sha256 =
+            digests == nullptr ? std::string{} : object_string(*digests, "sha256");
+        const auto yanked_it = file->find("yanked");
+        const bool* yanked = yanked_it == file->end()
+            ? nullptr
+            : std::get_if<bool>(&yanked_it->second.value);
+        std::uint64_t size{};
+        if (filename.empty() || package_type.empty() || url.empty() ||
+            size_text == nullptr || size_text->empty() || digests == nullptr ||
+            sha256.empty() || yanked == nullptr) {
+            error = "PyPI release file is missing a required field";
+            return false;
+        }
+        const auto converted = std::from_chars(
+            size_text->data(), size_text->data() + size_text->size(), size);
+        if (converted.ec != std::errc{} ||
+            converted.ptr != size_text->data() + size_text->size()) {
+            error = "PyPI release file size must be a non-negative integer";
+            return false;
+        }
+        files.push_back({
+            filename,
+            package_type,
+            url,
+            sha256,
+            size,
+            *yanked,
+        });
+    }
+    return select_pypi_sdist_artifact(
+        normalized_expected, expected_version, files, limits, descriptor, error);
+}
+
 bool verify_npm_integrity(
     std::string_view artifact_bytes,
     std::string_view published_integrity,
@@ -1873,7 +1972,46 @@ bool verify_npm_integrity(
     return false;
 }
 
-bool analyze_npm_tarball_bytes(
+bool verify_pypi_integrity(
+    std::string_view artifact_bytes,
+    std::string_view published_sha256,
+    std::uint64_t published_size,
+    std::string& error) {
+    if (artifact_bytes.size() != published_size) {
+        error = "PyPI artifact size does not match release metadata";
+        return false;
+    }
+    if (published_sha256.size() != 64U ||
+        !std::all_of(
+            published_sha256.begin(),
+            published_sha256.end(),
+            [](char character) {
+                return (character >= '0' && character <= '9') ||
+                    (character >= 'a' && character <= 'f') ||
+                    (character >= 'A' && character <= 'F');
+            })) {
+        error = "invalid PyPI SHA-256 digest";
+        return false;
+    }
+    std::string actual;
+    if (!sha256_hex(artifact_bytes, actual, error)) return false;
+    if (!std::equal(
+            actual.begin(),
+            actual.end(),
+            published_sha256.begin(),
+            [](char left, char right) {
+                if (right >= 'A' && right <= 'F')
+                    right = static_cast<char>(right - 'A' + 'a');
+                return left == right;
+            })) {
+        error = "PyPI SHA-256 integrity mismatch";
+        return false;
+    }
+    return true;
+}
+
+bool analyze_package_tarball_bytes(
+    std::string_view registry_type,
     std::string_view tarball_bytes,
     const std::filesystem::path& rules_path,
     const ArchiveLimits& limits,
@@ -1897,7 +2035,9 @@ bool analyze_npm_tarball_bytes(
     std::ostringstream inventory;
     inventory << "{\"files\":[";
     bool first = true;
-    std::optional<std::string> manifest_text;
+    std::optional<std::string> package_json_text;
+    std::optional<std::string> pypi_metadata_text;
+    std::string pypi_metadata_path;
     for (const TarMember& member : members) {
         if (member.typeflag == '2' || member.typeflag == '1') {
             if (link_escapes_root(member.path, member.linkname)) {
@@ -1913,14 +2053,74 @@ bool analyze_npm_tarball_bytes(
         if ((member.typeflag == '0' || member.typeflag == '\0') &&
             (member.path == "package/package.json" ||
              member.path.ends_with("/package.json")) &&
-            !manifest_text)
-            manifest_text = member.data;
+            !package_json_text)
+            package_json_text = member.data;
+        if ((member.typeflag == '0' || member.typeflag == '\0') &&
+            member.path.ends_with("/PKG-INFO") &&
+            std::count(member.path.begin(), member.path.end(), '/') == 1 &&
+            !pypi_metadata_text) {
+            pypi_metadata_text = member.data;
+            pypi_metadata_path = member.path;
+        }
     }
     inventory << "]}";
     result.archive_inventory_json = inventory.str();
 
-    if (!manifest_text) {
-        error = "package.json missing from npm tarball";
+    std::optional<std::string> manifest_text;
+    std::string manifest_subject;
+    std::vector<std::pair<std::string, std::string>> pypi_dependencies;
+    if (registry_type == "npm") {
+        if (!package_json_text) {
+            error = "package.json missing from npm tarball";
+            return false;
+        }
+        manifest_text = std::move(package_json_text);
+        manifest_subject = rules.package_metadata_subject_path;
+    } else if (registry_type == "pypi") {
+        if (!pypi_metadata_text) {
+            error = "root PKG-INFO missing from PyPI source distribution";
+            return false;
+        }
+        std::string name;
+        std::string version;
+        std::string license;
+        std::string repository;
+        std::istringstream metadata_stream(*pypi_metadata_text);
+        std::string line;
+        while (std::getline(metadata_stream, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            const auto colon = line.find(':');
+            if (colon == std::string::npos) continue;
+            const std::string key = line.substr(0U, colon);
+            std::string value = line.substr(colon + 1U);
+            while (!value.empty() && (value.front() == ' ' || value.front() == '\t'))
+                value.erase(value.begin());
+            if (key == "Name" && name.empty()) name = value;
+            else if (key == "Version" && version.empty()) version = value;
+            else if (key == "License" && license.empty()) license = value;
+            else if ((key == "Home-page" || key == "Project-URL") &&
+                     repository.empty())
+                repository = value;
+            else if (key == "Requires-Dist") {
+                const auto separator = value.find_first_of("[ (;<>=!~");
+                const std::string dependency_name = value.substr(0U, separator);
+                if (!dependency_name.empty())
+                    pypi_dependencies.emplace_back(dependency_name, value);
+            }
+        }
+        if (name.empty() || version.empty()) {
+            error = "PyPI PKG-INFO missing Name or Version";
+            return false;
+        }
+        std::ostringstream synthesized;
+        synthesized << "{\"name\":" << json_escape(name)
+                    << ",\"version\":" << json_escape(version)
+                    << ",\"license\":" << json_escape(license)
+                    << ",\"repository\":" << json_escape(repository) << '}';
+        manifest_text = synthesized.str();
+        manifest_subject = pypi_metadata_path;
+    } else {
+        error = "unsupported package registry for analyzer worker";
         return false;
     }
     result.package_manifest_json = *manifest_text;
@@ -2000,6 +2200,14 @@ bool analyze_npm_tarball_bytes(
         error = "invalid dependency object in package.json";
         return false;
     }
+    for (const auto& [name, declaration] : pypi_dependencies) {
+        AnalysisDependency dependency;
+        dependency.dependency_type = "runtime";
+        dependency.dependency_name = name;
+        dependency.declared_version = declaration;
+        dependency.direct = true;
+        result.dependencies.push_back(std::move(dependency));
+    }
 
     {
         AnalysisFinding meta;
@@ -2008,7 +2216,7 @@ bool analyze_npm_tarball_bytes(
         meta.severity = rules.package_metadata.severity;
         meta.confidence = rules.package_metadata.confidence;
         meta.title = rules.package_metadata.title;
-        meta.subject_path = rules.package_metadata_subject_path;
+        meta.subject_path = manifest_subject;
         meta.evidence = bound_snippet(
             result.package_name + "@" + result.package_version,
             limits.maximum_evidence_snippet_bytes);
@@ -2078,6 +2286,16 @@ bool analyze_npm_tarball_bytes(
     summary << "]}";
     result.summary_json = summary.str();
     return true;
+}
+
+bool analyze_npm_tarball_bytes(
+    std::string_view tarball_bytes,
+    const std::filesystem::path& rules_path,
+    const ArchiveLimits& limits,
+    AnalyzerWorkerResult& result,
+    std::string& error) {
+    return analyze_package_tarball_bytes(
+        "npm", tarball_bytes, rules_path, limits, result, error);
 }
 
 namespace {
@@ -2458,7 +2676,7 @@ bool parse_analyzer_worker_json(
     return true;
 }
 
-AnalyzeError resolve_exact_npm_package(
+AnalyzeError resolve_exact_package(
     const std::filesystem::path& database_path,
     std::string_view server_identifier,
     std::string_view server_version,
@@ -2478,7 +2696,7 @@ AnalyzeError resolve_exact_npm_package(
             "JOIN server_versions sv ON sv.id=p.server_version_id "
             "WHERE sv.server_identifier=?1 AND sv.server_version=?2 "
             "AND p.identifier=?3 "
-            "ORDER BY p.id;",
+            "ORDER BY p.position,p.id;",
             error) ||
         !query.bind_text(1, server_identifier, error) ||
         !query.bind_text(2, server_version, error) ||
@@ -2508,10 +2726,23 @@ AnalyzeError resolve_exact_npm_package(
         return AnalyzeError::package_not_found;
     }
     if (matches.size() > 1U) {
-        error = "ambiguous package selection for server/version/package";
-        return AnalyzeError::ambiguous_package;
+        const ResolvedPackage& canonical = matches.front();
+        const bool same_artifact = std::all_of(
+            matches.begin() + 1,
+            matches.end(),
+            [&canonical](const ResolvedPackage& candidate) {
+                return candidate.registry_type == canonical.registry_type &&
+                    candidate.package_identifier ==
+                        canonical.package_identifier &&
+                    candidate.package_version == canonical.package_version;
+            });
+        if (!same_artifact) {
+            error = "ambiguous package selection for server/version/package";
+            return AnalyzeError::ambiguous_package;
+        }
     }
-    if (matches.front().registry_type != "npm") {
+    if (matches.front().registry_type != "npm" &&
+        matches.front().registry_type != "pypi") {
         error = "unsupported registry type for package analysis v1: " +
             matches.front().registry_type;
         return AnalyzeError::unsupported_registry;
@@ -2525,6 +2756,7 @@ AnalyzeError resolve_exact_npm_package(
 }
 
 int analyze_worker_main(
+    std::string_view registry_type,
     const std::filesystem::path& tarball,
     const std::filesystem::path& rules_path,
     const ArchiveLimits& limits,
@@ -2537,7 +2769,8 @@ int analyze_worker_main(
         return 2;
     }
     AnalyzerWorkerResult result;
-    if (!analyze_npm_tarball_bytes(bytes, rules_path, limits, result, error)) {
+    if (!analyze_package_tarball_bytes(
+            registry_type, bytes, rules_path, limits, result, error)) {
         err << error << '\n';
         return 3;
     }
@@ -2601,6 +2834,7 @@ bool default_download(
 }
 
 bool in_process_worker(
+    std::string_view registry_type,
     const std::filesystem::path& tarball,
     const std::filesystem::path& rules_path,
     const ArchiveLimits& limits,
@@ -2610,8 +2844,8 @@ bool in_process_worker(
     std::string bytes;
     if (!read_file_bytes(tarball, limits.maximum_tarball_bytes, bytes, error))
         return false;
-    if (!analyze_npm_tarball_bytes(
-            bytes, rules_path, limits, result, error))
+    if (!analyze_package_tarball_bytes(
+            registry_type, bytes, rules_path, limits, result, error))
         return false;
     raw_json = worker_result_to_json(result);
     return true;
@@ -2619,6 +2853,7 @@ bool in_process_worker(
 
 bool docker_worker(
     const AnalyzePackageOptions& options,
+    std::string_view registry_type,
     const std::filesystem::path& tarball,
     const std::filesystem::path& rules_path,
     AnalyzerWorkerResult& result,
@@ -2676,6 +2911,8 @@ bool docker_worker(
         "debian:bookworm-slim",
         "/opt/mcp-observatory",
         "analyze-worker",
+        "--registry",
+        std::string(registry_type),
         "--tarball",
         "/in/artifact.tgz",
         "--rules",
@@ -2806,6 +3043,7 @@ std::string format_analyze_text(
         << "reused_existing=" << (reused ? "true" : "false") << '\n'
         << "server_identifier=" << package.server_identifier << '\n'
         << "server_version=" << package.server_version << '\n'
+        << "registry_type=" << package.registry_type << '\n'
         << "package_identifier=" << package.package_identifier << '\n'
         << "package_version=" << package.package_version.value_or("") << '\n'
         << "artifact_sha256=" << artifact_sha256 << '\n'
@@ -2844,6 +3082,7 @@ std::string format_analyze_json(
         << ",\"reused_existing\":" << (reused ? "true" : "false")
         << ",\"server_identifier\":" << json_escape(package.server_identifier)
         << ",\"server_version\":" << json_escape(package.server_version)
+        << ",\"registry_type\":" << json_escape(package.registry_type)
         << ",\"package_identifier\":" << json_escape(package.package_identifier)
         << ",\"package_version\":"
         << json_escape(package.package_version.value_or(""))
@@ -3055,7 +3294,7 @@ AnalyzePackageResult analyze_package(
 
     ResolvedPackage package;
     std::string error;
-    const AnalyzeError resolved = resolve_exact_npm_package(
+    const AnalyzeError resolved = resolve_exact_package(
         options.database,
         options.server_identifier,
         options.server_version,
@@ -3076,6 +3315,7 @@ AnalyzePackageResult analyze_package(
     if (!worker_fn) {
         if (options.allow_in_process_worker) {
             worker_fn = [&options](
+                            std::string_view registry_type,
                             const std::filesystem::path& tarball,
                             const std::filesystem::path& rules_path,
                             const ArchiveLimits& limits,
@@ -3083,6 +3323,7 @@ AnalyzePackageResult analyze_package(
                             std::string& raw_json,
                             std::string& error_text) {
                 return in_process_worker(
+                    registry_type,
                     tarball,
                     rules_path,
                     limits,
@@ -3093,6 +3334,7 @@ AnalyzePackageResult analyze_package(
         }
         else
             worker_fn = [&options](
+                            std::string_view registry_type,
                             const std::filesystem::path& tarball,
                             const std::filesystem::path& rules_path,
                             const ArchiveLimits&,
@@ -3101,6 +3343,7 @@ AnalyzePackageResult analyze_package(
                             std::string& error_text) {
                 return docker_worker(
                     options,
+                    registry_type,
                     tarball,
                     rules_path,
                     result,
@@ -3121,15 +3364,26 @@ AnalyzePackageResult analyze_package(
         return failure_result(AnalyzeError::incompatible_schema, error);
 
     const std::string version = *package.package_version;
-    std::string metadata_url = options.npm_registry_url;
+    std::string metadata_url =
+        package.registry_type == "pypi"
+            ? options.pypi_registry_url
+            : options.npm_registry_url;
     while (!metadata_url.empty() && metadata_url.back() == '/')
         metadata_url.pop_back();
     metadata_url += "/";
-    for (char c : package.package_identifier) {
-        if (c == '/') metadata_url += "%2F";
-        else metadata_url.push_back(c);
+    if (package.registry_type == "pypi") {
+        std::string normalized_name;
+        if (!normalize_pypi_project_name(
+                package.package_identifier, normalized_name, error))
+            return failure_result(AnalyzeError::validation, error);
+        metadata_url += normalized_name + "/" + version + "/json";
+    } else {
+        for (char c : package.package_identifier) {
+            if (c == '/') metadata_url += "%2F";
+            else metadata_url.push_back(c);
+        }
+        metadata_url += "/" + version;
     }
-    metadata_url += "/" + version;
 
     std::string metadata_body;
     if (!download_fn(
@@ -3148,13 +3402,38 @@ AnalyzePackageResult analyze_package(
         return failure_result(AnalyzeError::download, error);
     }
 
-    NpmDistMetadata metadata;
-    if (!parse_npm_version_metadata(
-            metadata_body,
-            package.package_identifier,
-            version,
-            metadata,
-            error)) {
+    std::string artifact_url;
+    std::string published_integrity;
+    std::uint64_t published_size{};
+    if (package.registry_type == "pypi") {
+        ArtifactDescriptor descriptor;
+        AcquisitionLimits acquisition_limits;
+        acquisition_limits.maximum_artifact_bytes =
+            static_cast<std::uint64_t>(options.limits.maximum_tarball_bytes);
+        if (parse_pypi_release_metadata(
+                metadata_body,
+                package.package_identifier,
+                version,
+                acquisition_limits,
+                descriptor,
+                error)) {
+            artifact_url = descriptor.download_url;
+            published_integrity = "sha256:" + descriptor.sha256;
+            published_size = descriptor.published_size;
+        }
+    } else {
+        NpmDistMetadata metadata;
+        if (parse_npm_version_metadata(
+                metadata_body,
+                package.package_identifier,
+                version,
+                metadata,
+                error)) {
+            artifact_url = metadata.tarball_url;
+            published_integrity = metadata.integrity;
+        }
+    }
+    if (artifact_url.empty()) {
         std::int64_t run_id{};
         Transaction tx(database);
         if (tx.begin(error) &&
@@ -3164,10 +3443,26 @@ AnalyzePackageResult analyze_package(
             tx.commit(error);
         return failure_result(AnalyzeError::validation, error);
     }
+    if (package.registry_type == "pypi" &&
+        (options.pypi_registry_url.starts_with("http://127.0.0.1:") ||
+         options.pypi_registry_url.starts_with("http://localhost:"))) {
+        const auto origin = [](std::string_view url) {
+            const auto scheme = url.find("://");
+            const auto slash = scheme == std::string_view::npos
+                ? std::string_view::npos
+                : url.find('/', scheme + 3U);
+            return slash == std::string_view::npos ? url : url.substr(0U, slash);
+        };
+        if (origin(options.pypi_registry_url) != origin(artifact_url)) {
+            return failure_result(
+                AnalyzeError::validation,
+                "insecure loopback PyPI artifact URL must match registry origin");
+        }
+    }
 
     std::string artifact_bytes;
     if (!download_fn(
-            metadata.tarball_url,
+            artifact_url,
             options.download_timeout,
             options.limits.maximum_tarball_bytes,
             artifact_bytes,
@@ -3182,7 +3477,7 @@ AnalyzePackageResult analyze_package(
                 "download_tarball",
                 error,
                 std::nullopt,
-                metadata.integrity,
+                published_integrity,
                 run_id,
                 error))
             tx.commit(error);
@@ -3326,7 +3621,15 @@ AnalyzePackageResult analyze_package(
         }
     }
 
-    if (!verify_npm_integrity(artifact_bytes, metadata.integrity, error)) {
+    const bool integrity_ok =
+        package.registry_type == "pypi"
+            ? verify_pypi_integrity(
+                  artifact_bytes,
+                  published_integrity.substr(std::string_view("sha256:").size()),
+                  published_size,
+                  error)
+            : verify_npm_integrity(artifact_bytes, published_integrity, error);
+    if (!integrity_ok) {
         std::int64_t run_id{};
         Transaction tx(database);
         if (tx.begin(error) &&
@@ -3337,7 +3640,7 @@ AnalyzePackageResult analyze_package(
                 "integrity",
                 error,
                 artifact_sha256,
-                metadata.integrity,
+                published_integrity,
                 run_id,
                 error))
             tx.commit(error);
@@ -3381,6 +3684,7 @@ AnalyzePackageResult analyze_package(
     AnalyzerWorkerResult worker_result;
     std::string raw_json;
     if (!worker_fn(
+            package.registry_type,
             staged_tarball,
             staged_rules,
             options.limits,
@@ -3397,7 +3701,7 @@ AnalyzePackageResult analyze_package(
                 "analyze_container",
                 error,
                 artifact_sha256,
-                metadata.integrity,
+                published_integrity,
                 run_id,
                 error))
             tx.commit(error);
@@ -3416,6 +3720,29 @@ AnalyzePackageResult analyze_package(
             AnalyzeError::validation,
             "analyzer worker ruleset_version does not match host ruleset");
     }
+    bool worker_identity_matches =
+        worker_result.package_version == version;
+    if (package.registry_type == "pypi") {
+        std::string expected_name;
+        std::string worker_name;
+        worker_identity_matches =
+            worker_identity_matches &&
+            normalize_pypi_project_name(
+                package.package_identifier, expected_name, error) &&
+            normalize_pypi_project_name(
+                worker_result.package_name, worker_name, error) &&
+            expected_name == worker_name;
+    } else {
+        worker_identity_matches =
+            worker_identity_matches &&
+            worker_result.package_name == package.package_identifier;
+    }
+    if (!worker_identity_matches) {
+        std::filesystem::remove_all(staging, ec);
+        return failure_result(
+            AnalyzeError::validation,
+            error.empty() ? "analyzed package identity mismatch" : error);
+    }
 
     const auto evidence_directory =
         evidence_dir_for(options.evidence_root, artifact_sha256);
@@ -3424,7 +3751,7 @@ AnalyzePackageResult analyze_package(
         !write_file_bytes(
             evidence_directory / "analysis-rules.json", rules_json, error) ||
         !write_file_bytes(
-            evidence_directory / "npm-metadata.json", metadata_body, error) ||
+            evidence_directory / "registry-metadata.json", metadata_body, error) ||
         !write_file_bytes(
             evidence_directory / "archive-inventory.json",
             worker_result.archive_inventory_json,
@@ -3513,7 +3840,7 @@ AnalyzePackageResult analyze_package(
         !insert_run.bind_text(7, started, error) ||
         !insert_run.bind_text(8, started, error) ||
         !insert_run.bind_text(9, artifact_sha256, error) ||
-        !insert_run.bind_text(10, metadata.integrity, error) ||
+        !insert_run.bind_text(10, published_integrity, error) ||
         !insert_run.bind_text(11, "debian:bookworm-slim", error) ||
         !insert_run.bind_null(12, error) ||
         !insert_run.bind_text(13, "none", error) ||
@@ -3534,18 +3861,19 @@ AnalyzePackageResult analyze_package(
             "analysis_run_id,registry_type,package_identifier,package_version,"
             "source_url,local_relative_path,byte_size,sha256,published_integrity,"
             "integrity_verified,downloaded_at)"
-            " VALUES(?1,'npm',?2,?3,?4,?5,?6,?7,?8,1,?9);",
+            " VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,1,?10);",
             error) ||
         !insert_artifact.bind_int64(1, run_id, error) ||
-        !insert_artifact.bind_text(2, package.package_identifier, error) ||
-        !insert_artifact.bind_text(3, version, error) ||
-        !insert_artifact.bind_text(4, metadata.tarball_url, error) ||
-        !insert_artifact.bind_text(5, relative_posix(relative_artifact), error) ||
+        !insert_artifact.bind_text(2, package.registry_type, error) ||
+        !insert_artifact.bind_text(3, package.package_identifier, error) ||
+        !insert_artifact.bind_text(4, version, error) ||
+        !insert_artifact.bind_text(5, artifact_url, error) ||
+        !insert_artifact.bind_text(6, relative_posix(relative_artifact), error) ||
         !insert_artifact.bind_int64(
-            6, static_cast<sqlite3_int64>(artifact_bytes.size()), error) ||
-        !insert_artifact.bind_text(7, artifact_sha256, error) ||
-        !insert_artifact.bind_text(8, metadata.integrity, error) ||
-        !insert_artifact.bind_text(9, started, error) ||
+            7, static_cast<sqlite3_int64>(artifact_bytes.size()), error) ||
+        !insert_artifact.bind_text(8, artifact_sha256, error) ||
+        !insert_artifact.bind_text(9, published_integrity, error) ||
+        !insert_artifact.bind_text(10, started, error) ||
         !insert_artifact.step_done(database, error)) {
         std::filesystem::remove_all(staging, ec);
         return failure_result(AnalyzeError::database, error);
@@ -3672,7 +4000,7 @@ AnalyzePackageResult analyze_package(
     const std::vector<std::tuple<std::string, std::string, std::string>> evidence_specs{
         {"artifact", "artifact.tgz", "application/gzip"},
         {"analysis_rules", "analysis-rules.json", "application/json"},
-        {"npm_metadata", "npm-metadata.json", "application/json"},
+        {"registry_metadata", "registry-metadata.json", "application/json"},
         {"archive_inventory", "archive-inventory.json", "application/json"},
         {"package_manifest", "package-manifest.json", "application/json"},
         {"files", "files.jsonl", "application/x-ndjson"},

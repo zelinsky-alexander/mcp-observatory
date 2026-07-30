@@ -1,5 +1,7 @@
 #pragma once
 
+#include "observatory/acquisition.hpp"
+
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -15,8 +17,9 @@
 namespace mcpo {
 
 inline constexpr std::string_view package_analyzer_name = "mcp-observatory-static";
-inline constexpr std::string_view package_analyzer_version = "1.0.0";
+inline constexpr std::string_view package_analyzer_version = "1.1.0";
 inline constexpr std::string_view default_npm_registry_url = "https://registry.npmjs.org";
+inline constexpr std::string_view default_pypi_registry_url = "https://pypi.org/pypi";
 inline constexpr std::string_view default_package_rules_path =
     "rules/artifact-static-analysis-v1.json";
 
@@ -58,6 +61,7 @@ struct AnalyzePackageOptions {
     AnalyzeOutputFormat format{AnalyzeOutputFormat::text};
     bool force{};
     std::string npm_registry_url{default_npm_registry_url};
+    std::string pypi_registry_url{default_pypi_registry_url};
     std::filesystem::path rules_path{default_package_rules_path};
     ArchiveLimits limits{};
     std::chrono::seconds download_timeout{60};
@@ -169,6 +173,7 @@ using AnalyzeDownloadTransport = std::function<bool(
     std::string& error)>;
 
 using AnalyzeWorkerRunner = std::function<bool(
+    std::string_view registry_type,
     const std::filesystem::path& tarball,
     const std::filesystem::path& rules_path,
     const ArchiveLimits& limits,
@@ -176,7 +181,7 @@ using AnalyzeWorkerRunner = std::function<bool(
     std::string& raw_json,
     std::string& error)>;
 
-[[nodiscard]] AnalyzeError resolve_exact_npm_package(
+[[nodiscard]] AnalyzeError resolve_exact_package(
     const std::filesystem::path& database,
     std::string_view server_identifier,
     std::string_view server_version,
@@ -191,12 +196,34 @@ using AnalyzeWorkerRunner = std::function<bool(
     NpmDistMetadata& metadata,
     std::string& error);
 
+[[nodiscard]] bool parse_pypi_release_metadata(
+    std::string_view json_text,
+    std::string_view expected_name,
+    std::string_view expected_version,
+    const AcquisitionLimits& limits,
+    ArtifactDescriptor& descriptor,
+    std::string& error);
+
 [[nodiscard]] bool verify_npm_integrity(
     std::string_view artifact_bytes,
     std::string_view published_integrity,
     std::string& error);
 
+[[nodiscard]] bool verify_pypi_integrity(
+    std::string_view artifact_bytes,
+    std::string_view published_sha256,
+    std::uint64_t published_size,
+    std::string& error);
+
 [[nodiscard]] bool analyze_npm_tarball_bytes(
+    std::string_view tarball_bytes,
+    const std::filesystem::path& rules_path,
+    const ArchiveLimits& limits,
+    AnalyzerWorkerResult& result,
+    std::string& error);
+
+[[nodiscard]] bool analyze_package_tarball_bytes(
+    std::string_view registry_type,
     std::string_view tarball_bytes,
     const std::filesystem::path& rules_path,
     const ArchiveLimits& limits,
@@ -215,6 +242,7 @@ using AnalyzeWorkerRunner = std::function<bool(
     AnalyzeWorkerRunner worker = {});
 
 [[nodiscard]] int analyze_worker_main(
+    std::string_view registry_type,
     const std::filesystem::path& tarball,
     const std::filesystem::path& rules_path,
     const ArchiveLimits& limits,

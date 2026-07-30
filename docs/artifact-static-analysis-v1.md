@@ -3,18 +3,18 @@
 ## Trust model
 
 `mcp-observatory analyze package` performs bounded static inspection of one
-exact npm-backed MCP server package artifact. Download of npm metadata and the
-published tarball may use the network. Archive extraction and code inspection
-run inside a disposable Docker container with no network, a read-only root
-filesystem, dropped capabilities, no-new-privileges, a non-root user, and
-bounded memory, CPU, PID, and file-descriptor limits.
+exact npm package or PyPI source-distribution artifact. Download of registry
+metadata and the published tarball may use the network. Archive extraction and
+code inspection run inside a disposable Docker container with no network, a
+read-only root filesystem, dropped capabilities, no-new-privileges, a non-root
+user, and bounded memory, CPU, PID, and file-descriptor limits.
 
 The host process never mounts the SQLite database or a writable evidence
 directory into the analyzer container. The container emits bounded JSON on
 stdout. The host validates that JSON and performs all database writes.
 
-No package entry point is executed. No npm lifecycle script is executed.
-`npm install` is never invoked.
+No package entry point or lifecycle script is executed. Package installation is
+never invoked.
 
 > No static analysis result proves that an MCP server is non-malicious. The result
 > describes observed properties of one exact artifact digest under one analyzer
@@ -24,10 +24,15 @@ No package entry point is executed. No npm lifecycle script is executed.
 
 Static analysis can observe:
 
-- package metadata and declared lifecycle scripts;
+- npm `package.json` metadata and declared lifecycle scripts;
+- PyPI `PKG-INFO` identity and `Requires-Dist` declarations;
 - file-type inventory including native binaries and nested archives;
 - textual Node built-in imports and selected risk-relevant APIs;
-- published npm integrity verification for the exact downloaded bytes.
+- published registry integrity verification for the exact downloaded bytes.
+
+The current text detectors recognize Node/JavaScript APIs. PyPI support adds
+bounded archive inventory, native-file classification, metadata extraction,
+and integrity verification; it does not yet detect Python-specific risky APIs.
 
 It cannot prove absence of malice, cannot evaluate runtime behavior, cannot
 confirm that dependencies are safe, and cannot replace dynamic inspection or
@@ -52,6 +57,7 @@ Also supported:
 - `--rules PATH` to select a versioned analysis-policy JSON document
 - `--force` to ignore completed-run deduplication
 - `--npm-registry-url URL` for offline fixtures or alternate registries
+- `--pypi-registry-url URL` for offline fixtures or alternate registries
 - archive size/count limits: `--maximum-files`,
   `--maximum-total-uncompressed-bytes`, `--maximum-individual-file-bytes`,
   `--maximum-tarball-bytes`
@@ -60,7 +66,7 @@ Also supported:
 Internal container entrypoint:
 
 ```bash
-mcp-observatory analyze-worker --tarball /in/artifact.tgz
+mcp-observatory analyze-worker --registry npm --tarball /in/artifact.tgz
 ```
 
 ## Database records
@@ -94,7 +100,7 @@ Finalized evidence is stored under a digest path:
 <evidence-root>/artifacts/sha256/<aa>/<sha256>/
   artifact.tgz
   analysis-rules.json
-  npm-metadata.json
+  registry-metadata.json
   archive-inventory.json
   package-manifest.json
   files.jsonl
@@ -140,8 +146,10 @@ content carrying that version.
 
 ## Current limitation
 
-v1 supports `registryType = npm` only, requires an exact package version, and
-rejects ambiguous package selection. Unsupported registries fail closed.
+v1 supports `registryType = npm` and tar-gzip PyPI source distributions,
+requires an exact package version, and rejects ambiguous package or PyPI sdist
+selection. Wheels, zip sdists, yanked files, and unsupported registries fail
+closed. Python-specific source detectors are not yet implemented.
 
 ## Future Web UI query surface
 
