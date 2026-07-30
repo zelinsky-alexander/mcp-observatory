@@ -192,11 +192,20 @@ def main(binary: str) -> None:
             }
         ).encode()
         server_js = b"import fs from 'node:fs';\nimport url from 'node:url';\n"
+        minified_js = (
+            b"\n" * 6
+            + b"const bundled='"
+            + b"x" * 100_000
+            + b"'; child_process.spawn('worker'); const tail='"
+            + b"y" * 100_000
+            + b"';\n"
+        )
         tarball = make_tarball(
             root,
             {
                 "package/package.json": package_json,
                 "package/dist/server.js": server_js,
+                "package/dist/minified.js": minified_js,
             },
         )
         integrity = sha512_integrity(tarball)
@@ -304,8 +313,8 @@ def main(binary: str) -> None:
         connection = sqlite3.connect(database)
         require(
             connection.execute("SELECT schema_version FROM schema_info").fetchone()
-            == (2,),
-            "schema migrated to 2",
+            == (3,),
+            "schema migrated to 3",
         )
         require(
             connection.execute(
@@ -341,6 +350,18 @@ def main(binary: str) -> None:
             "SELECT relative_path FROM analysis_evidence"
         ):
             require(not relative.startswith("/"), f"absolute evidence path {relative}")
+        finding_id = connection.execute(
+            "SELECT id FROM analysis_findings "
+            "WHERE analysis_run_id=? AND subject_path='package/dist/server.js' "
+            "ORDER BY id LIMIT 1",
+            (run_id,),
+        ).fetchone()[0]
+        large_finding_id = connection.execute(
+            "SELECT id FROM analysis_findings "
+            "WHERE analysis_run_id=? AND subject_path='package/dist/minified.js' "
+            "AND rule_id='risk-api:spawn' ORDER BY id LIMIT 1",
+            (run_id,),
+        ).fetchone()[0]
         connection.close()
 
         evidence_dir = (
@@ -356,6 +377,241 @@ def main(binary: str) -> None:
             "analysis rules evidence",
         )
         require((evidence_dir / "findings.jsonl").is_file(), "findings evidence")
+
+        source = run(
+            binary,
+            "evidence",
+            "finding-source",
+            "--database",
+            str(database),
+            "--evidence-root",
+            str(evidence),
+            "--finding-id",
+            str(finding_id),
+            "--format",
+            "json",
+        )
+        require(source.returncode == 0, "finding source failed", source)
+        source_payload = json.loads(source.stdout)
+        require(
+            source_payload["content"] == server_js.decode(),
+            "finding source content",
+            source,
+        )
+        require(
+            source_payload["subject_path"] == "package/dist/server.js",
+            "finding source path",
+            source,
+        )
+        require(
+            source_payload["displayed_byte_size"] == len(server_js)
+            and source_payload["start_line"] == 1
+            and source_payload["truncated_before"] is False
+            and source_payload["truncated_after"] is False,
+            "small finding source window metadata",
+            source,
+        )
+        large_source = run(
+            binary,
+            "evidence",
+            "finding-source",
+            "--database",
+            str(database),
+            "--evidence-root",
+            str(evidence),
+            "--finding-id",
+            str(large_finding_id),
+            "--format",
+            "json",
+        )
+        require(
+            large_source.returncode == 0,
+            "large finding source should return a bounded window",
+            large_source,
+        )
+        large_payload = json.loads(large_source.stdout)
+        require(
+            large_payload["byte_size"] == len(minified_js)
+            and large_payload["displayed_byte_size"] <= 128 * 1024
+            and large_payload["start_line"] == 7
+            and large_payload["truncated_before"] is True
+            and large_payload["truncated_after"] is True
+            and large_payload["starts_mid_line"] is True
+            and large_payload["ends_mid_line"] is True,
+            "large finding source window metadata",
+            large_source,
+        )
+        require(
+            "child_process.spawn" in large_payload["content"],
+            "large finding source window is not centered on the finding symbol",
+            large_source,
+        )
+        downloaded_source = run(
+            binary,
+            "evidence",
+            "finding-source",
+            "--database",
+            str(database),
+            "--evidence-root",
+            str(evidence),
+            "--finding-id",
+            str(large_finding_id),
+            "--format",
+            "raw",
+        )
+        require(
+            downloaded_source.returncode == 0
+            and downloaded_source.stdout.encode() == minified_js,
+            "raw finding source must return the complete verified file",
+            downloaded_source,
+        )
+        missing_source = run(
+            binary,
+            "evidence",
+            "finding-source",
+            "--database",
+            str(database),
+            "--evidence-root",
+            str(evidence),
+            "--finding-id",
+            "999999",
+        )
+        require(
+            missing_source.returncode == 5,
+            "missing finding source should fail",
+            missing_source,
+        )
+        tampered_evidence = root / "tampered-evidence"
+        shutil.copytree(evidence, tampered_evidence)
+        tampered_artifact = (
+            tampered_evidence
+            / "artifacts"
+            / "sha256"
+            / artifact_sha[:2]
+            / artifact_sha
+            / "artifact.tgz"
+        )
+        tampered_artifact.write_bytes(
+            tampered_artifact.read_bytes() + b"tampered"
+        )
+        tampered_source = run(
+            binary,
+            "evidence",
+            "finding-source",
+            "--database",
+            str(database),
+            "--evidence-root",
+            str(tampered_evidence),
+            "--finding-id",
+            str(finding_id),
+        )
+        require(
+            tampered_source.returncode == 7,
+            "tampered finding source should fail closed",
+            tampered_source,
+        )
+
+        schema_v2_database = root / "schema-v2.sqlite"
+        shutil.copy2(database, schema_v2_database)
+        migration = sqlite3.connect(schema_v2_database)
+        migration.execute("DROP TABLE analysis_finding_reviews")
+        migration.execute(
+            "UPDATE schema_info SET schema_version=2 WHERE singleton=1"
+        )
+        migration.commit()
+        migration.close()
+        migrated_review = run(
+            binary,
+            "review",
+            "finding",
+            "--database",
+            str(schema_v2_database),
+            "--finding-id",
+            str(finding_id),
+            "--expected-disposition",
+            "unreviewed",
+            "--disposition",
+            "reviewed-benign",
+            "--reviewer",
+            "migration-test",
+            "--format",
+            "json",
+        )
+        require(
+            migrated_review.returncode == 0,
+            "schema-v2 review migration failed",
+            migrated_review,
+        )
+        migration = sqlite3.connect(schema_v2_database)
+        require(
+            migration.execute(
+                "SELECT schema_version FROM schema_info"
+            ).fetchone()
+            == (3,),
+            "review did not migrate schema to 3",
+        )
+        migration.close()
+
+        reviewed = run(
+            binary,
+            "review",
+            "finding",
+            "--database",
+            str(database),
+            "--finding-id",
+            str(finding_id),
+            "--expected-disposition",
+            "unreviewed",
+            "--disposition",
+            "expected",
+            "--reviewer",
+            "offline-test",
+            "--format",
+            "json",
+        )
+        require(reviewed.returncode == 0, "finding review failed", reviewed)
+        review_payload = json.loads(reviewed.stdout)
+        require(
+            review_payload["previous_disposition"] == "unreviewed"
+            and review_payload["disposition"] == "expected",
+            "review transition",
+            reviewed,
+        )
+        stale_review = run(
+            binary,
+            "review",
+            "finding",
+            "--database",
+            str(database),
+            "--finding-id",
+            str(finding_id),
+            "--expected-disposition",
+            "unreviewed",
+            "--disposition",
+            "false-positive",
+            "--reviewer",
+            "offline-test",
+        )
+        require(stale_review.returncode == 7, "stale review should conflict", stale_review)
+        connection = sqlite3.connect(database)
+        require(
+            connection.execute(
+                "SELECT disposition FROM analysis_findings WHERE id=?",
+                (finding_id,),
+            ).fetchone()
+            == ("expected",),
+            "review updates current disposition",
+        )
+        require(
+            connection.execute(
+                "SELECT previous_disposition,disposition,reviewer "
+                "FROM analysis_finding_reviews WHERE finding_id=?",
+                (finding_id,),
+            ).fetchone()
+            == ("unreviewed", "expected", "offline-test"),
+            "review audit row",
+        )
+        connection.close()
 
         # 25 deduplication
         second = run(

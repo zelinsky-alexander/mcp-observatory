@@ -3121,13 +3121,14 @@ bool ensure_schema_migrated(Database& database, std::string& error) {
         return false;
     }
     const sqlite3_int64 version = schema.integer(0);
-    if (version == 2) return true;
-    if (version != 1) {
+    if (version == 3) return true;
+    if (version != 1 && version != 2) {
         error = "unsupported schema version";
         return false;
     }
-    // Re-open through explorer index path is heavy; duplicate migration SQL here.
-    static constexpr std::string_view analysis_sql = R"SQL(
+    if (version == 1) {
+        // Re-open through explorer index path is heavy; duplicate migration SQL here.
+        static constexpr std::string_view analysis_sql = R"SQL(
 CREATE TABLE IF NOT EXISTS analysis_runs(
     id INTEGER PRIMARY KEY,
     server_version_id INTEGER NOT NULL REFERENCES server_versions(id) ON DELETE RESTRICT,
@@ -3224,11 +3225,29 @@ CREATE INDEX IF NOT EXISTS analysis_files_run ON analysis_files(analysis_run_id)
 CREATE INDEX IF NOT EXISTS analysis_dependencies_run ON analysis_dependencies(analysis_run_id);
 CREATE INDEX IF NOT EXISTS analysis_evidence_run ON analysis_evidence(analysis_run_id);
 )SQL";
-    if (!database.execute(analysis_sql, error)) return false;
+        if (!database.execute(analysis_sql, error)) return false;
+    }
+    static constexpr std::string_view review_sql = R"SQL(
+CREATE TABLE IF NOT EXISTS analysis_finding_reviews(
+    id INTEGER PRIMARY KEY,
+    finding_id INTEGER NOT NULL REFERENCES analysis_findings(id) ON DELETE CASCADE,
+    previous_disposition TEXT NOT NULL CHECK(previous_disposition IN (
+        'unreviewed','expected','reviewed-benign','mitigated',
+        'suspicious','confirmed-risk','false-positive')),
+    disposition TEXT NOT NULL CHECK(disposition IN (
+        'expected','reviewed-benign','mitigated',
+        'suspicious','confirmed-risk','false-positive')),
+    reviewer TEXT NOT NULL CHECK(length(reviewer) BETWEEN 1 AND 200),
+    reviewed_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS analysis_finding_reviews_finding
+ON analysis_finding_reviews(finding_id, id);
+)SQL";
+    if (!database.execute(review_sql, error)) return false;
     Statement bump;
     return bump.prepare(
                database,
-               "UPDATE schema_info SET schema_version=2 WHERE singleton=1;",
+               "UPDATE schema_info SET schema_version=3 WHERE singleton=1;",
                error) &&
         bump.step_done(database, error);
 }
@@ -4054,6 +4073,471 @@ AnalyzePackageResult analyze_package(
                   "completed",
                   false);
     return ok;
+}
+
+FindingOperationResult read_finding_source(
+    const FindingSourceOptions& options) {
+    const auto failure = [](FindingOperationError code, std::string message) {
+        FindingOperationResult result;
+        result.error = code;
+        result.output = std::move(message);
+        return result;
+    };
+    if (options.database.empty() || options.evidence_root.empty() ||
+        options.finding_id <= 0 || options.maximum_source_bytes == 0U) {
+        return failure(
+            FindingOperationError::invalid_arguments,
+            "database, evidence root, and a positive finding id are required");
+    }
+
+    Database database;
+    std::string error;
+    if (!database.open(
+            options.database, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, error) ||
+        !database.execute("PRAGMA query_only = ON;", error)) {
+        return failure(FindingOperationError::database, error);
+    }
+    Statement schema;
+    if (!schema.prepare(
+            database,
+            "SELECT schema_version FROM schema_info WHERE singleton=1;",
+            error) ||
+        schema.step() != SQLITE_ROW) {
+        return failure(FindingOperationError::incompatible_schema, error);
+    }
+    const sqlite3_int64 schema_version = schema.integer(0);
+    if (schema_version != 2 && schema_version != 3) {
+        return failure(
+            FindingOperationError::incompatible_schema,
+            "finding source requires Observatory schema version 2 or 3");
+    }
+
+    Statement select;
+    if (!select.prepare(
+            database,
+            "SELECT af.analysis_run_id,af.subject_path,af.line_number,"
+            "ar.artifact_sha256,f.byte_size,f.sha256,"
+            "ae.relative_path,ae.sha256,ae.byte_size,af.evidence,af.symbol "
+            "FROM analysis_findings af "
+            "JOIN analysis_runs ar ON ar.id=af.analysis_run_id "
+            "LEFT JOIN analysis_files f "
+            "ON f.analysis_run_id=af.analysis_run_id "
+            "AND f.archive_path=af.subject_path "
+            "LEFT JOIN analysis_evidence ae "
+            "ON ae.analysis_run_id=af.analysis_run_id "
+            "AND ae.evidence_type='artifact' "
+            "WHERE af.id=?1 ORDER BY ae.id LIMIT 1;",
+            error) ||
+        !select.bind_int64(1, options.finding_id, error)) {
+        return failure(FindingOperationError::database, error);
+    }
+    const int selected = select.step();
+    if (selected == SQLITE_DONE) {
+        return failure(
+            FindingOperationError::finding_not_found, "finding not found");
+    }
+    if (selected != SQLITE_ROW) {
+        return failure(
+            FindingOperationError::database,
+            sqlite_message(database.get(), "read finding source metadata"));
+    }
+    if (select.is_null(3) || select.is_null(4) || select.is_null(5) ||
+        select.is_null(6) || select.is_null(7) || select.is_null(8)) {
+        return failure(
+            FindingOperationError::evidence,
+            "finding source is not backed by a finalized artifact and file record");
+    }
+
+    const sqlite3_int64 run_id = select.integer(0);
+    const std::string subject_path = select.text(1);
+    const std::optional<sqlite3_int64> line_number =
+        select.is_null(2) ? std::nullopt :
+                            std::optional<sqlite3_int64>(select.integer(2));
+    const std::string artifact_sha256 = select.text(3);
+    const sqlite3_int64 recorded_file_size = select.integer(4);
+    const std::string recorded_file_sha256 = select.text(5);
+    const std::string evidence_relative_path = select.text(6);
+    const std::string evidence_sha256 = select.text(7);
+    const sqlite3_int64 evidence_size = select.integer(8);
+    const std::string finding_evidence =
+        select.is_null(9) ? std::string{} : select.text(9);
+    const std::string finding_symbol =
+        select.is_null(10) ? std::string{} : select.text(10);
+
+    const auto valid_digest = [](std::string_view digest) {
+        return digest.size() == 64U &&
+            std::all_of(digest.begin(), digest.end(), [](char c) {
+                return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+            });
+    };
+    if (!valid_digest(artifact_sha256) ||
+        !valid_digest(recorded_file_sha256) ||
+        !valid_digest(evidence_sha256)) {
+        return failure(
+            FindingOperationError::evidence,
+            "finding source metadata contains an invalid SHA-256 digest");
+    }
+    const std::string expected_relative =
+        "artifacts/sha256/" + artifact_sha256.substr(0U, 2U) + "/" +
+        artifact_sha256 + "/artifact.tgz";
+    if (evidence_relative_path != expected_relative ||
+        evidence_sha256 != artifact_sha256 || evidence_size < 0 ||
+        static_cast<std::uint64_t>(evidence_size) >
+            options.limits.maximum_tarball_bytes) {
+        return failure(
+            FindingOperationError::evidence,
+            "artifact evidence metadata does not match its digest path");
+    }
+
+    std::error_code path_error;
+    const std::filesystem::path evidence_root =
+        std::filesystem::canonical(options.evidence_root, path_error);
+    if (path_error || !std::filesystem::is_directory(evidence_root)) {
+        return failure(
+            FindingOperationError::io,
+            "evidence root is not an accessible directory");
+    }
+    std::filesystem::path artifact_path = evidence_root;
+    const std::filesystem::path relative_artifact(expected_relative);
+    for (const auto& component : relative_artifact) {
+        artifact_path /= component;
+        const auto status =
+            std::filesystem::symlink_status(artifact_path, path_error);
+        if (path_error || std::filesystem::is_symlink(status)) {
+            return failure(
+                FindingOperationError::evidence,
+                "artifact evidence path contains a missing or symbolic-link component");
+        }
+    }
+    if (!std::filesystem::is_regular_file(artifact_path)) {
+        return failure(
+            FindingOperationError::evidence,
+            "artifact evidence is not a regular file");
+    }
+
+    std::string artifact_bytes;
+    if (!read_file_bytes(
+            artifact_path,
+            options.limits.maximum_tarball_bytes,
+            artifact_bytes,
+            error)) {
+        return failure(FindingOperationError::io, error);
+    }
+    if (artifact_bytes.size() != static_cast<std::size_t>(evidence_size)) {
+        return failure(
+            FindingOperationError::evidence,
+            "artifact evidence size does not match the catalog");
+    }
+    std::string actual_artifact_sha256;
+    if (!sha256_hex(artifact_bytes, actual_artifact_sha256, error)) {
+        return failure(FindingOperationError::io, error);
+    }
+    if (actual_artifact_sha256 != artifact_sha256) {
+        return failure(
+            FindingOperationError::evidence,
+            "artifact evidence digest does not match the catalog");
+    }
+
+    constexpr std::size_t tar_overhead_allowance = 8U * 1024U * 1024U;
+    if (options.limits.maximum_total_uncompressed_bytes >
+        std::numeric_limits<std::size_t>::max() - tar_overhead_allowance) {
+        return failure(
+            FindingOperationError::limit_exceeded,
+            "configured archive limit is too large");
+    }
+    std::string tar_bytes;
+    if (!gunzip_bytes(
+            artifact_bytes,
+            options.limits.maximum_total_uncompressed_bytes +
+                tar_overhead_allowance,
+            tar_bytes,
+            error)) {
+        return failure(FindingOperationError::evidence, error);
+    }
+    std::vector<TarMember> members;
+    if (!parse_ustar(tar_bytes, options.limits, members, error)) {
+        return failure(FindingOperationError::evidence, error);
+    }
+    const TarMember* source = nullptr;
+    for (const TarMember& member : members) {
+        if (member.path != subject_path) continue;
+        if (source != nullptr) {
+            return failure(
+                FindingOperationError::evidence,
+                "archive contains duplicate finding source members");
+        }
+        source = &member;
+    }
+    if (source == nullptr || (source->typeflag != '0' && source->typeflag != '\0')) {
+        return failure(
+            FindingOperationError::evidence,
+            "finding source is not a regular archive member");
+    }
+    if (recorded_file_size < 0 ||
+        source->data.size() != static_cast<std::size_t>(recorded_file_size)) {
+        return failure(
+            FindingOperationError::evidence,
+            "finding source size does not match the catalog");
+    }
+    std::string actual_file_sha256;
+    if (!sha256_hex(source->data, actual_file_sha256, error)) {
+        return failure(FindingOperationError::io, error);
+    }
+    if (actual_file_sha256 != recorded_file_sha256) {
+        return failure(
+            FindingOperationError::evidence,
+            "finding source digest does not match the catalog");
+    }
+    if (!valid_utf8(source->data) ||
+        source->data.find('\0') != std::string::npos) {
+        return failure(
+            FindingOperationError::evidence,
+            "finding source is not displayable UTF-8 text");
+    }
+
+    if (options.raw_output) {
+        FindingOperationResult result;
+        result.output = source->data;
+        return result;
+    }
+
+    std::size_t display_start = 0U;
+    std::size_t display_end = source->data.size();
+    if (source->data.size() > options.maximum_source_bytes) {
+        std::size_t anchor = 0U;
+        if (line_number) {
+            std::size_t current_line = 1U;
+            std::size_t line_start = 0U;
+            while (current_line < static_cast<std::size_t>(*line_number) &&
+                   line_start < source->data.size()) {
+                const std::size_t newline =
+                    source->data.find('\n', line_start);
+                if (newline == std::string::npos) {
+                    line_start = source->data.size();
+                    break;
+                }
+                line_start = newline + 1U;
+                ++current_line;
+            }
+            const std::size_t newline =
+                source->data.find('\n', line_start);
+            const std::size_t line_end =
+                newline == std::string::npos ? source->data.size() : newline;
+            anchor = line_start + (line_end - line_start) / 2U;
+            std::string needle =
+                finding_symbol.empty() ? finding_evidence : finding_symbol;
+            if (needle.ends_with("...")) needle.resize(needle.size() - 3U);
+            if (!needle.empty()) {
+                const std::size_t match =
+                    source->data.find(needle, line_start);
+                if (match != std::string::npos && match < line_end)
+                    anchor = match + needle.size() / 2U;
+            }
+        }
+        const std::size_t half = options.maximum_source_bytes / 2U;
+        display_start = anchor > half ? anchor - half : 0U;
+        display_end = std::min(
+            source->data.size(),
+            display_start + options.maximum_source_bytes);
+        if (display_end == source->data.size() &&
+            display_end > options.maximum_source_bytes) {
+            display_start = display_end - options.maximum_source_bytes;
+        }
+        const auto continuation = [](unsigned char byte) {
+            return (byte & 0xc0U) == 0x80U;
+        };
+        while (display_start < display_end &&
+               continuation(static_cast<unsigned char>(
+                   source->data[display_start])))
+            ++display_start;
+        while (display_end > display_start &&
+               display_end < source->data.size() &&
+               continuation(static_cast<unsigned char>(
+                   source->data[display_end])))
+            --display_end;
+    }
+    const bool truncated_before = display_start > 0U;
+    const bool truncated_after = display_end < source->data.size();
+    const bool starts_mid_line =
+        truncated_before && source->data[display_start - 1U] != '\n';
+    const bool ends_mid_line =
+        truncated_after && display_end > 0U &&
+        source->data[display_end - 1U] != '\n';
+    const std::size_t start_line =
+        1U + static_cast<std::size_t>(std::count(
+                 source->data.begin(),
+                 source->data.begin() +
+                     static_cast<std::ptrdiff_t>(display_start),
+                 '\n'));
+    const std::string_view displayed(
+        source->data.data() + display_start,
+        display_end - display_start);
+
+    std::ostringstream output;
+    if (options.format == AnalyzeOutputFormat::json) {
+        output << "{\"status\":\"completed\",\"finding_id\":"
+               << options.finding_id << ",\"analysis_run_id\":" << run_id
+               << ",\"subject_path\":" << json_escape(subject_path)
+               << ",\"line_number\":";
+        if (line_number) output << *line_number;
+        else output << "null";
+        output << ",\"sha256\":" << json_escape(actual_file_sha256)
+               << ",\"byte_size\":" << source->data.size()
+               << ",\"displayed_byte_size\":" << displayed.size()
+               << ",\"start_line\":" << start_line
+               << ",\"truncated_before\":"
+               << (truncated_before ? "true" : "false")
+               << ",\"truncated_after\":"
+               << (truncated_after ? "true" : "false")
+               << ",\"starts_mid_line\":"
+               << (starts_mid_line ? "true" : "false")
+               << ",\"ends_mid_line\":"
+               << (ends_mid_line ? "true" : "false")
+               << ",\"content\":" << json_escape(displayed) << "}\n";
+    } else {
+        output << "finding_id=" << options.finding_id << '\n'
+               << "analysis_run_id=" << run_id << '\n'
+               << "subject_path=" << subject_path << '\n'
+               << "line_number=";
+        if (line_number) output << *line_number;
+        output << "\nsha256=" << actual_file_sha256
+               << "\ndisplayed_byte_size=" << displayed.size()
+               << "\nstart_line=" << start_line
+               << "\ntruncated_before="
+               << (truncated_before ? "true" : "false")
+               << "\ntruncated_after="
+               << (truncated_after ? "true" : "false") << "\n\n"
+               << displayed;
+    }
+    FindingOperationResult result;
+    result.output = output.str();
+    return result;
+}
+
+FindingOperationResult review_finding(
+    const ReviewFindingOptions& options) {
+    const auto failure = [](FindingOperationError code, std::string message) {
+        FindingOperationResult result;
+        result.error = code;
+        result.output = std::move(message);
+        return result;
+    };
+    static const std::set<std::string_view> all_dispositions{
+        "unreviewed", "expected", "reviewed-benign", "mitigated",
+        "suspicious", "confirmed-risk", "false-positive"};
+    static const std::set<std::string_view> review_dispositions{
+        "expected", "reviewed-benign", "mitigated",
+        "suspicious", "confirmed-risk", "false-positive"};
+    if (options.database.empty() || options.finding_id <= 0 ||
+        !all_dispositions.contains(options.expected_disposition) ||
+        !review_dispositions.contains(options.disposition) ||
+        options.reviewer.empty() || options.reviewer.size() > 200U ||
+        !valid_utf8(options.reviewer)) {
+        return failure(
+            FindingOperationError::invalid_arguments,
+            "review requires a positive finding id, allowed dispositions, "
+            "and a reviewer of at most 200 UTF-8 bytes");
+    }
+
+    Database database;
+    std::string error;
+    if (!database.open(
+            options.database,
+            SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI,
+            error)) {
+        return failure(FindingOperationError::database, error);
+    }
+    Transaction transaction(database);
+    if (!transaction.begin(error)) {
+        return failure(FindingOperationError::database, error);
+    }
+    if (!ensure_schema_migrated(database, error)) {
+        return failure(FindingOperationError::incompatible_schema, error);
+    }
+
+    Statement current;
+    if (!current.prepare(
+            database,
+            "SELECT disposition FROM analysis_findings WHERE id=?1;",
+            error) ||
+        !current.bind_int64(1, options.finding_id, error)) {
+        return failure(FindingOperationError::database, error);
+    }
+    const int selected = current.step();
+    if (selected == SQLITE_DONE) {
+        return failure(
+            FindingOperationError::finding_not_found, "finding not found");
+    }
+    if (selected != SQLITE_ROW) {
+        return failure(
+            FindingOperationError::database,
+            sqlite_message(database.get(), "read finding disposition"));
+    }
+    const std::string previous = current.text(0);
+    if (previous != options.expected_disposition ||
+        previous == options.disposition) {
+        return failure(
+            FindingOperationError::conflict,
+            "finding disposition changed or already has the requested disposition");
+    }
+
+    const std::string reviewed_at = utc_now();
+    Statement insert;
+    if (!insert.prepare(
+            database,
+            "INSERT INTO analysis_finding_reviews("
+            "finding_id,previous_disposition,disposition,reviewer,reviewed_at)"
+            " VALUES(?1,?2,?3,?4,?5);",
+            error) ||
+        !insert.bind_int64(1, options.finding_id, error) ||
+        !insert.bind_text(2, previous, error) ||
+        !insert.bind_text(3, options.disposition, error) ||
+        !insert.bind_text(4, options.reviewer, error) ||
+        !insert.bind_text(5, reviewed_at, error) ||
+        !insert.step_done(database, error)) {
+        return failure(FindingOperationError::database, error);
+    }
+    const sqlite3_int64 review_id = sqlite3_last_insert_rowid(database.get());
+    Statement update;
+    if (!update.prepare(
+            database,
+            "UPDATE analysis_findings SET disposition=?1 "
+            "WHERE id=?2 AND disposition=?3;",
+            error) ||
+        !update.bind_text(1, options.disposition, error) ||
+        !update.bind_int64(2, options.finding_id, error) ||
+        !update.bind_text(3, previous, error) ||
+        !update.step_done(database, error)) {
+        return failure(FindingOperationError::database, error);
+    }
+    if (sqlite3_changes(database.get()) != 1) {
+        return failure(
+            FindingOperationError::conflict,
+            "finding disposition changed during review");
+    }
+    if (!transaction.commit(error)) {
+        return failure(FindingOperationError::database, error);
+    }
+
+    std::ostringstream output;
+    if (options.format == AnalyzeOutputFormat::json) {
+        output << "{\"status\":\"completed\",\"review_id\":" << review_id
+               << ",\"finding_id\":" << options.finding_id
+               << ",\"previous_disposition\":" << json_escape(previous)
+               << ",\"disposition\":" << json_escape(options.disposition)
+               << ",\"reviewer\":" << json_escape(options.reviewer)
+               << ",\"reviewed_at\":" << json_escape(reviewed_at) << "}\n";
+    } else {
+        output << "status=completed\nreview_id=" << review_id
+               << "\nfinding_id=" << options.finding_id
+               << "\nprevious_disposition=" << previous
+               << "\ndisposition=" << options.disposition
+               << "\nreviewer=" << options.reviewer
+               << "\nreviewed_at=" << reviewed_at << '\n';
+    }
+    FindingOperationResult result;
+    result.output = output.str();
+    return result;
 }
 
 }  // namespace mcpo

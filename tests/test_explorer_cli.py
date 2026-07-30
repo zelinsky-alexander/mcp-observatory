@@ -254,7 +254,7 @@ def main():
         connection = sqlite3.connect(database)
         require(
             connection.execute("SELECT schema_version FROM schema_info").fetchone()
-            == (2,),
+            == (3,),
             "schema version is wrong",
         )
         require(

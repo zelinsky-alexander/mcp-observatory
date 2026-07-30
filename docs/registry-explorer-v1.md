@@ -76,10 +76,10 @@ new immutable historical variant, not an identity conflict.
 
 ## Schema
 
-`schema_info` contains one singleton row with `schema_version=2`, the creating
+`schema_info` contains one singleton row with `schema_version=3`, the creating
 program version, and `search_mode` (`fts5` or `like`). Unsupported versions and
 missing required tables are rejected. Existing schema version 1 catalogs are
-migrated to version 2 on the first write that needs analysis tables; read-only
+migrated to version 3 on the first write that needs analysis or review tables; read-only
 explorer commands still accept version 1.
 
 `snapshots` preserves the snapshot digest, start/completion timestamps,

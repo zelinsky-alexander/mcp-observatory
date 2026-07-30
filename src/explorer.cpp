@@ -274,7 +274,7 @@ bool initialize_schema(
             error = "schema_info must contain exactly one row";
             return false;
         }
-        if (version != 1 && version != registry_explorer_schema_version) {
+        if (version < 1 || version > registry_explorer_schema_version) {
             error = "unsupported registry explorer schema version " +
                 std::to_string(version);
             return false;
@@ -397,6 +397,18 @@ CREATE TABLE analysis_evidence(
     media_type TEXT NOT NULL,
     UNIQUE(analysis_run_id, relative_path)
 );
+CREATE TABLE analysis_finding_reviews(
+    id INTEGER PRIMARY KEY,
+    finding_id INTEGER NOT NULL REFERENCES analysis_findings(id) ON DELETE CASCADE,
+    previous_disposition TEXT NOT NULL CHECK(previous_disposition IN (
+        'unreviewed','expected','reviewed-benign','mitigated',
+        'suspicious','confirmed-risk','false-positive')),
+    disposition TEXT NOT NULL CHECK(disposition IN (
+        'expected','reviewed-benign','mitigated',
+        'suspicious','confirmed-risk','false-positive')),
+    reviewer TEXT NOT NULL CHECK(length(reviewer) BETWEEN 1 AND 200),
+    reviewed_at TEXT NOT NULL
+);
 CREATE INDEX analysis_runs_package ON analysis_runs(package_id, status);
 CREATE INDEX analysis_runs_artifact ON analysis_runs(
     artifact_sha256, analyzer_version, ruleset_version, status);
@@ -405,6 +417,8 @@ CREATE INDEX analysis_findings_rule ON analysis_findings(rule_id);
 CREATE INDEX analysis_files_run ON analysis_files(analysis_run_id);
 CREATE INDEX analysis_dependencies_run ON analysis_dependencies(analysis_run_id);
 CREATE INDEX analysis_evidence_run ON analysis_evidence(analysis_run_id);
+CREATE INDEX analysis_finding_reviews_finding
+ON analysis_finding_reviews(finding_id, id);
 )SQL";
             if (!database.execute(analysis_sql, error)) return false;
             Statement bump;
@@ -425,6 +439,46 @@ CREATE INDEX analysis_evidence_run ON analysis_evidence(analysis_run_id);
                 if (!present) {
                     error = "incompatible registry explorer schema: missing table " +
                         std::string(table);
+                    return false;
+                }
+            }
+            if (version == 2 && allow_migration) {
+                if (!database.execute(
+                        R"SQL(
+CREATE TABLE analysis_finding_reviews(
+    id INTEGER PRIMARY KEY,
+    finding_id INTEGER NOT NULL REFERENCES analysis_findings(id) ON DELETE CASCADE,
+    previous_disposition TEXT NOT NULL CHECK(previous_disposition IN (
+        'unreviewed','expected','reviewed-benign','mitigated',
+        'suspicious','confirmed-risk','false-positive')),
+    disposition TEXT NOT NULL CHECK(disposition IN (
+        'expected','reviewed-benign','mitigated',
+        'suspicious','confirmed-risk','false-positive')),
+    reviewer TEXT NOT NULL CHECK(length(reviewer) BETWEEN 1 AND 200),
+    reviewed_at TEXT NOT NULL
+);
+CREATE INDEX analysis_finding_reviews_finding
+ON analysis_finding_reviews(finding_id, id);
+)SQL",
+                        error))
+                    return false;
+                Statement bump;
+                if (!bump.prepare(
+                        database,
+                        "UPDATE schema_info SET schema_version=?1 WHERE singleton=1;",
+                        error) ||
+                    !bump.bind_int64(1, registry_explorer_schema_version, error) ||
+                    !bump.step_done(database, error))
+                    return false;
+            } else if (version == registry_explorer_schema_version) {
+                bool present{};
+                if (!has_table(
+                        database, "analysis_finding_reviews", present, error))
+                    return false;
+                if (!present) {
+                    error =
+                        "incompatible registry explorer schema: missing table "
+                        "analysis_finding_reviews";
                     return false;
                 }
             }
@@ -626,6 +680,18 @@ CREATE TABLE analysis_evidence(
     media_type TEXT NOT NULL,
     UNIQUE(analysis_run_id, relative_path)
 );
+CREATE TABLE analysis_finding_reviews(
+    id INTEGER PRIMARY KEY,
+    finding_id INTEGER NOT NULL REFERENCES analysis_findings(id) ON DELETE CASCADE,
+    previous_disposition TEXT NOT NULL CHECK(previous_disposition IN (
+        'unreviewed','expected','reviewed-benign','mitigated',
+        'suspicious','confirmed-risk','false-positive')),
+    disposition TEXT NOT NULL CHECK(disposition IN (
+        'expected','reviewed-benign','mitigated',
+        'suspicious','confirmed-risk','false-positive')),
+    reviewer TEXT NOT NULL CHECK(length(reviewer) BETWEEN 1 AND 200),
+    reviewed_at TEXT NOT NULL
+);
 CREATE INDEX analysis_runs_package ON analysis_runs(package_id, status);
 CREATE INDEX analysis_runs_artifact ON analysis_runs(
     artifact_sha256, analyzer_version, ruleset_version, status);
@@ -634,6 +700,8 @@ CREATE INDEX analysis_findings_rule ON analysis_findings(rule_id);
 CREATE INDEX analysis_files_run ON analysis_files(analysis_run_id);
 CREATE INDEX analysis_dependencies_run ON analysis_dependencies(analysis_run_id);
 CREATE INDEX analysis_evidence_run ON analysis_evidence(analysis_run_id);
+CREATE INDEX analysis_finding_reviews_finding
+ON analysis_finding_reviews(finding_id, id);
 )SQL";
     if (!database.execute(schema_sql, error)) return false;
 

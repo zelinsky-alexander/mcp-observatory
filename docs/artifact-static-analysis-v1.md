@@ -79,9 +79,13 @@ Schema version 2 extends the explorer catalog with:
 - `analysis_files`
 - `analysis_dependencies`
 - `analysis_evidence`
+- `analysis_finding_reviews` (schema version 3)
 
 Existing schema version 1 databases are migrated on the first write that needs
-analysis tables. Completed runs are immutable. Failed attempts still insert an
+analysis tables. Schema version 2 databases are migrated on the next
+Observatory write that requires the current schema. Completed analyzer output is immutable; the human review disposition is
+the only finding field changed after analysis, and every change has an
+append-only audit row. Failed attempts still insert an
 `analysis_runs` row with `status=failed`, `error_stage`, and a bounded
 `error_message`.
 
@@ -91,6 +95,22 @@ Finding dispositions start as `unreviewed`. Allowed values:
 `confirmed-risk`, `false-positive`.
 
 Severities: `info`, `low`, `medium`, `high`, `critical`.
+
+Record an explicit review transition with optimistic concurrency:
+
+```bash
+mcp-observatory review finding \
+  --database db/local-registry.sqlite \
+  --finding-id 598 \
+  --expected-disposition unreviewed \
+  --disposition expected \
+  --reviewer local-reviewer \
+  --format json
+```
+
+Review never assigns a generic safety verdict. The new disposition must be one
+of the documented review values, the expected disposition must still match,
+and the disposition update and audit insertion occur in one transaction.
 
 ## Evidence layout
 
@@ -109,6 +129,26 @@ Finalized evidence is stored under a digest path:
   analysis-summary.json
   analyzer.log
 ```
+
+Read the verified text member associated with an existing finding:
+
+```bash
+mcp-observatory evidence finding-source \
+  --database db/local-registry.sqlite \
+  --evidence-root evidence \
+  --finding-id 598 \
+  --format json
+```
+
+The command resolves the archive path from the finding ID, requires matching
+`analysis_files` and `analysis_evidence` records, verifies artifact and member
+digests and sizes, rejects non-regular or duplicate members, and bounds archive
+and displayed source bytes. Files larger than the display limit return a
+verified window centered on the finding symbol or evidence, with explicit
+leading/trailing truncation metadata. It never extracts the archive or executes
+package content. After the bounded view indicates truncation, `--format raw`
+returns the complete verified UTF-8 member for a controlled download; the
+archive and individual-file analysis limits still apply.
 
 Database evidence rows store relative paths only, with SHA-256, byte size, and
 media type.
@@ -151,13 +191,14 @@ requires an exact package version, and rejects ambiguous package or PyPI sdist
 selection. Wheels, zip sdists, yanked files, and unsupported registries fail
 closed. Python-specific source detectors are not yet implemented.
 
-## Future Web UI query surface
+## Web UI query surface
 
 A later UI should join `analysis_runs` to `packages` and `server_versions`,
 filter by `status`, `artifact_sha256`, severity aggregates from
-`analysis_findings`, and open evidence through relative paths under the
-configured evidence root. Do not treat `disposition` or severity as a safety
-verdict.
+`analysis_findings`, and invoke the bounded finding-source interface with an
+existing internal finding ID. Review writes must use the audited review
+interface rather than direct UI writes to SQLite. Do not treat `disposition` or
+severity as a safety verdict.
 
 ## Optional live smoke test
 

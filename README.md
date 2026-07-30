@@ -72,6 +72,20 @@ ctest --preset dev-debug
   --rules ./rules/artifact-static-analysis-v1.json \
   --evidence-root ./evidence
 
+./build/dev-debug/mcp-observatory evidence finding-source \
+  --database ./db/local-registry.sqlite \
+  --evidence-root ./evidence \
+  --finding-id 598 \
+  --format json
+
+./build/dev-debug/mcp-observatory review finding \
+  --database ./db/local-registry.sqlite \
+  --finding-id 598 \
+  --expected-disposition unreviewed \
+  --disposition expected \
+  --reviewer local-reviewer \
+  --format json
+
 ./build/dev-debug/mcp-observatory bundle validate ./official-run
 ```
 

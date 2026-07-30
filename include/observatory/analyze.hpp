@@ -43,6 +43,18 @@ enum class AnalyzeError {
 
 enum class AnalyzeOutputFormat { text, json };
 
+enum class FindingOperationError {
+    none,
+    invalid_arguments,
+    database,
+    incompatible_schema,
+    finding_not_found,
+    conflict,
+    evidence,
+    limit_exceeded,
+    io,
+};
+
 struct ArchiveLimits {
     std::size_t maximum_files{10'000U};
     std::size_t maximum_total_uncompressed_bytes{64U * 1024U * 1024U};
@@ -165,6 +177,33 @@ struct AnalyzePackageResult {
     [[nodiscard]] bool ok() const noexcept { return error == AnalyzeError::none; }
 };
 
+struct FindingSourceOptions {
+    std::filesystem::path database;
+    std::filesystem::path evidence_root{"evidence"};
+    std::int64_t finding_id{};
+    AnalyzeOutputFormat format{AnalyzeOutputFormat::text};
+    bool raw_output{};
+    ArchiveLimits limits{};
+    std::size_t maximum_source_bytes{128U * 1024U};
+};
+
+struct ReviewFindingOptions {
+    std::filesystem::path database;
+    std::int64_t finding_id{};
+    std::string expected_disposition;
+    std::string disposition;
+    std::string reviewer;
+    AnalyzeOutputFormat format{AnalyzeOutputFormat::text};
+};
+
+struct FindingOperationResult {
+    FindingOperationError error{FindingOperationError::none};
+    std::string output;
+    [[nodiscard]] bool ok() const noexcept {
+        return error == FindingOperationError::none;
+    }
+};
+
 using AnalyzeDownloadTransport = std::function<bool(
     const std::string& url,
     std::chrono::steady_clock::duration timeout,
@@ -240,6 +279,12 @@ using AnalyzeWorkerRunner = std::function<bool(
     const AnalyzePackageOptions& options,
     AnalyzeDownloadTransport download = {},
     AnalyzeWorkerRunner worker = {});
+
+[[nodiscard]] FindingOperationResult read_finding_source(
+    const FindingSourceOptions& options);
+
+[[nodiscard]] FindingOperationResult review_finding(
+    const ReviewFindingOptions& options);
 
 [[nodiscard]] int analyze_worker_main(
     std::string_view registry_type,

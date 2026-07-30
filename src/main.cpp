@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -38,6 +39,8 @@ void print_usage(std::ostream& out) {
         << "  mcp-observatory registry show DATABASE SERVER_NAME [OPTIONS]\n"
         << "  mcp-observatory registry list DATABASE [OPTIONS]\n"
         << "  mcp-observatory analyze package [OPTIONS]\n"
+        << "  mcp-observatory evidence finding-source [OPTIONS]\n"
+        << "  mcp-observatory review finding [OPTIONS]\n"
         << "  mcp-observatory analyze-worker --registry npm|pypi --tarball PATH [OPTIONS]\n"
         << "  mcp-observatory bundle validate DIRECTORY\n"
         << "\nanalyze package options:\n"
@@ -52,6 +55,18 @@ void print_usage(std::ostream& out) {
         << "  --npm-registry-url URL        npm registry base URL\n"
         << "  --pypi-registry-url URL       PyPI JSON API base URL\n"
         << "  --allow-in-process-worker     test-only: skip Docker worker\n"
+        << "\nevidence finding-source options:\n"
+        << "  --database PATH               registry SQLite database\n"
+        << "  --evidence-root PATH          finalized evidence root\n"
+        << "  --finding-id ID               existing analysis finding id\n"
+        << "  --format text|json|raw        output format (default text)\n"
+        << "\nreview finding options:\n"
+        << "  --database PATH               registry SQLite database\n"
+        << "  --finding-id ID               existing analysis finding id\n"
+        << "  --expected-disposition VALUE  optimistic concurrency value\n"
+        << "  --disposition VALUE           explicit review disposition\n"
+        << "  --reviewer VALUE              bounded reviewer identity\n"
+        << "  --format text|json            output format (default text)\n"
         << "\nregistry collect runtime options:\n"
         << "  --request-timeout-seconds N   one HTTP attempt (default 60)\n"
         << "  --stall-timeout-seconds N     no durable page completion (default 300)\n"
@@ -698,6 +713,118 @@ int analyze_exit(mcpo::AnalyzeError error) {
     return 2;
 }
 
+int finding_operation_exit(mcpo::FindingOperationError error) {
+    switch (error) {
+        case mcpo::FindingOperationError::none: return 0;
+        case mcpo::FindingOperationError::invalid_arguments: return 1;
+        case mcpo::FindingOperationError::database: return 2;
+        case mcpo::FindingOperationError::io: return 3;
+        case mcpo::FindingOperationError::finding_not_found: return 5;
+        case mcpo::FindingOperationError::incompatible_schema: return 6;
+        case mcpo::FindingOperationError::conflict:
+        case mcpo::FindingOperationError::evidence: return 7;
+        case mcpo::FindingOperationError::limit_exceeded: return 8;
+    }
+    return 2;
+}
+
+bool parse_finding_id(std::string_view text, std::int64_t& value) {
+    std::uint64_t parsed{};
+    if (!parse_u64(text, parsed) || parsed == 0U ||
+        parsed > static_cast<std::uint64_t>(
+                     std::numeric_limits<std::int64_t>::max()))
+        return false;
+    value = static_cast<std::int64_t>(parsed);
+    return true;
+}
+
+int run_finding_source(int argc, char** argv) {
+    mcpo::FindingSourceOptions options;
+    for (int index = 3; index < argc; ++index) {
+        const std::string_view argument(argv[index]);
+        if (index + 1 >= argc) {
+            std::cerr << "missing value for " << argument << '\n';
+            return 1;
+        }
+        const std::string_view value(argv[++index]);
+        if (argument == "--database") options.database = std::string(value);
+        else if (argument == "--evidence-root")
+            options.evidence_root = std::string(value);
+        else if (argument == "--finding-id") {
+            if (!parse_finding_id(value, options.finding_id)) {
+                std::cerr << "invalid finding id\n";
+                return 1;
+            }
+        } else if (argument == "--format") {
+            if (value == "text") options.format = mcpo::AnalyzeOutputFormat::text;
+            else if (value == "json")
+                options.format = mcpo::AnalyzeOutputFormat::json;
+            else if (value == "raw")
+                options.raw_output = true;
+            else {
+                std::cerr << "invalid evidence format\n";
+                return 1;
+            }
+        } else {
+            std::cerr << "unknown evidence finding-source option: "
+                      << argument << '\n';
+            return 1;
+        }
+    }
+    const mcpo::FindingOperationResult result =
+        mcpo::read_finding_source(options);
+    if (!result.ok()) {
+        std::cerr << result.output << '\n';
+        return finding_operation_exit(result.error);
+    }
+    std::cout << result.output;
+    return 0;
+}
+
+int run_review_finding(int argc, char** argv) {
+    mcpo::ReviewFindingOptions options;
+    for (int index = 3; index < argc; ++index) {
+        const std::string_view argument(argv[index]);
+        if (index + 1 >= argc) {
+            std::cerr << "missing value for " << argument << '\n';
+            return 1;
+        }
+        const std::string_view value(argv[++index]);
+        if (argument == "--database") options.database = std::string(value);
+        else if (argument == "--finding-id") {
+            if (!parse_finding_id(value, options.finding_id)) {
+                std::cerr << "invalid finding id\n";
+                return 1;
+            }
+        } else if (argument == "--expected-disposition")
+            options.expected_disposition = std::string(value);
+        else if (argument == "--disposition")
+            options.disposition = std::string(value);
+        else if (argument == "--reviewer")
+            options.reviewer = std::string(value);
+        else if (argument == "--format") {
+            if (value == "text") options.format = mcpo::AnalyzeOutputFormat::text;
+            else if (value == "json")
+                options.format = mcpo::AnalyzeOutputFormat::json;
+            else {
+                std::cerr << "invalid review format\n";
+                return 1;
+            }
+        } else {
+            std::cerr << "unknown review finding option: " << argument << '\n';
+            return 1;
+        }
+    }
+    const mcpo::FindingOperationResult result =
+        mcpo::review_finding(options);
+    if (!result.ok()) {
+        std::cerr << result.output << '\n';
+        return finding_operation_exit(result.error);
+    }
+    std::cout << result.output;
+    return 0;
+}
+
 int run_analyze_package(int argc, char** argv) {
     mcpo::AnalyzePackageOptions options;
     char self_buffer[4096]{};
@@ -1020,6 +1147,12 @@ int main(int argc, char** argv) {
     if (argc >= 3 && std::string_view(argv[1]) == "analyze" &&
         std::string_view(argv[2]) == "package")
         return run_analyze_package(argc, argv);
+    if (argc >= 3 && std::string_view(argv[1]) == "evidence" &&
+        std::string_view(argv[2]) == "finding-source")
+        return run_finding_source(argc, argv);
+    if (argc >= 3 && std::string_view(argv[1]) == "review" &&
+        std::string_view(argv[2]) == "finding")
+        return run_review_finding(argc, argv);
     if (argc >= 2 && std::string_view(argv[1]) == "analyze-worker")
         return run_analyze_worker(argc, argv);
 
