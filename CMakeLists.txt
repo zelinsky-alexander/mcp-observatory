@@ -85,4 +85,9 @@ if(MCPO_BUILD_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_analyze_cli.py
             $<TARGET_FILE:mcp-observatory>
     )
+    add_test(
+        NAME mcpo_runtime_discovery_tests
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_runtime_discovery.py
+    )
 endif()

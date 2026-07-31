@@ -2,8 +2,9 @@
 """Contained npm MCP runtime discovery and version-to-version tool drift.
 
 This dependency-free MVP deliberately supports exact npm versions and stdio only.
-It never invokes tools. Network is used only by a disposable cache-population
-container. Installation and runtime discovery both run with --network none.
+It never invokes tools. The host verifies npm metadata and the exact artifact, a
+disposable container populates the package cache, and installation plus runtime
+discovery run with --network none.
 """
 
 from __future__ import annotations
@@ -14,12 +15,15 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import shutil
+import re
+import selectors
+import signal
 import sqlite3
 import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import urllib.parse
 import urllib.request
 from typing import Any
@@ -65,19 +69,126 @@ def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def run(argv: list[str], *, timeout: int, maximum_output: int = 1_048_576) -> subprocess.CompletedProcess[bytes]:
-    completed = subprocess.run(
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def run(
+    argv: list[str],
+    *,
+    timeout: int,
+    maximum_output: int = 1_048_576,
+    container_id_file: Path | None = None,
+) -> subprocess.CompletedProcess[bytes]:
+    if timeout <= 0 or maximum_output <= 0:
+        fail("child timeout and output limit must be positive")
+    process = subprocess.Popen(
         argv,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        timeout=timeout,
-        check=False,
+        close_fds=True,
+        start_new_session=True,
         env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LANG": "C.UTF-8"},
     )
-    if len(completed.stdout) > maximum_output or len(completed.stderr) > maximum_output:
-        fail("child output exceeded configured limit")
-    return completed
+    assert process.stdout is not None and process.stderr is not None
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+    selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+    output = {"stdout": bytearray(), "stderr": bytearray()}
+    deadline = time.monotonic() + timeout
+    failure = ""
+    try:
+        while selector.get_map() or process.poll() is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                failure = f"child process exceeded {timeout} seconds"
+                break
+            for key, _ in selector.select(timeout=min(0.25, remaining)):
+                chunk = os.read(key.fileobj.fileno(), 8192)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    key.fileobj.close()
+                    continue
+                target = output[key.data]
+                if len(target) + len(chunk) > maximum_output:
+                    failure = "child output exceeded configured limit"
+                    break
+                target.extend(chunk)
+            if failure:
+                break
+        if failure:
+            _terminate_group(process)
+            if container_id_file is not None:
+                _remove_container(container_id_file)
+            fail(failure)
+        if process.poll() is None:
+            process.wait(timeout=3)
+    finally:
+        selector.close()
+        for stream in (process.stdout, process.stderr):
+            if not stream.closed:
+                stream.close()
+        if container_id_file is not None:
+            container_id_file.unlink(missing_ok=True)
+    return subprocess.CompletedProcess(
+        argv, process.returncode, bytes(output["stdout"]), bytes(output["stderr"])
+    )
+
+
+def _terminate_group(process: subprocess.Popen[bytes]) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=3)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait(timeout=3)
+
+
+def _remove_container(container_id_file: Path) -> None:
+    try:
+        container_id = container_id_file.read_text(encoding="ascii")[:128].strip()
+    except OSError:
+        return
+    if not re.fullmatch(r"[0-9a-f]{12,64}", container_id):
+        return
+    try:
+        subprocess.run(
+            ["docker", "rm", "-f", container_id],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=15,
+            check=False,
+            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LANG": "C.UTF-8"},
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def run_docker(
+    argv: list[str], *, timeout: int, container_id_file: Path
+) -> subprocess.CompletedProcess[bytes]:
+    if argv[:2] != ["docker", "run"]:
+        fail("internal Docker argument vector is invalid")
+    container_id_file.unlink(missing_ok=True)
+    return run(
+        [*argv[:2], "--cidfile", str(container_id_file), *argv[2:]],
+        timeout=timeout,
+        container_id_file=container_id_file,
+    )
 
 
 def resolve_package(db: sqlite3.Connection, server: str, version: str, package: str) -> sqlite3.Row:
@@ -176,7 +287,7 @@ def populate_cache(image: str, cache: Path, package: str, version: str, timeout:
         image, "npm", "cache", "add", f"{package}@{version}", "--cache", "/npm-cache",
         "--no-audit", "--no-fund",
     ]
-    result = run(argv, timeout=timeout)
+    result = run_docker(argv, timeout=timeout, container_id_file=cache.parent / "cache.cid")
     if result.returncode != 0:
         fail("cache population failed: " + result.stderr.decode("utf-8", "replace")[-2000:])
 
@@ -192,7 +303,7 @@ def offline_install(image: str, cache: Path, work: Path, package: str, version: 
         image, "npm", "install", "--offline", "--ignore-scripts", "--omit=dev",
         "--no-audit", "--no-fund", "--cache", "/npm-cache",
     ]
-    result = run(argv, timeout=timeout)
+    result = run_docker(argv, timeout=timeout, container_id_file=work.parent / "install.cid")
     if result.returncode != 0:
         fail("offline install failed: " + result.stderr.decode("utf-8", "replace")[-2000:])
 
@@ -210,10 +321,15 @@ def inspect_runtime(image: str, work: Path, guard: Path, package: str, bin_entry
         image, "/opt/mcp-native-guard", "inspect", "--timeout", str(min(timeout, 300)), "--",
         "node", command,
     ]
-    result = run(argv, timeout=timeout + 15)
+    result = run_docker(argv, timeout=timeout + 15, container_id_file=work.parent / "runtime.cid")
     if result.returncode != 0:
         fail("mcp-native-guard inspect failed: " + result.stderr.decode("utf-8", "replace")[-2000:])
     inventory = json.loads(result.stdout)
+    validate_inventory(inventory)
+    return inventory
+
+
+def validate_inventory(inventory: Any) -> None:
     if not isinstance(inventory, dict) or inventory.get("inventory_version") != 1:
         fail("guard returned an unsupported inventory")
     tools = inventory.get("tools")
@@ -226,7 +342,6 @@ def inspect_runtime(image: str, work: Path, guard: Path, package: str, bin_entry
         if tool["name"] in names:
             fail("guard inventory contains duplicate tool names")
         names.add(tool["name"])
-    return inventory
 
 
 def persist(db: sqlite3.Connection, row: sqlite3.Row, artifact_sha: str, profile_sha: str,
@@ -290,7 +405,7 @@ def main() -> int:
         print(canonical(compare(db, args.older_run_id, args.newer_run_id)))
         return 0
     row = resolve_package(db, args.server, args.version, args.package)
-    metadata, metadata_bytes = npm_metadata(row["package_identifier"], row["package_version"])
+    metadata, _ = npm_metadata(row["package_identifier"], row["package_version"])
     artifact_bytes, _ = download_artifact(metadata)
     artifact_sha = sha256_bytes(artifact_bytes)
     guard = Path(args.guard_binary).resolve()
@@ -305,19 +420,24 @@ def main() -> int:
         artifact = root / "artifact.tgz"
         artifact.write_bytes(artifact_bytes)
         bin_entry = package_bin(artifact, row["package_identifier"])
+        guard_sha256 = sha256_file(guard)
         profile = {
             "profile_version": 1, "registry": "npm", "transport": "stdio",
             "package": row["package_identifier"], "version": row["package_version"],
             "bin": bin_entry, "install_scripts": False, "runtime_network": "none",
-            "image": args.runtime_image,
+            "image": args.runtime_image, "guard_sha256": guard_sha256,
         }
         profile_sha = sha256_bytes(canonical(profile).encode())
         populate_cache(args.runtime_image, cache, row["package_identifier"], row["package_version"], args.timeout)
         offline_install(args.runtime_image, cache, work, row["package_identifier"], row["package_version"], args.timeout)
         inventory = inspect_runtime(args.runtime_image, work, guard, row["package_identifier"], bin_entry, args.timeout)
-        run_id = persist(db, row, artifact_sha, profile_sha, args.runtime_image, "0.1", inventory, Path(args.evidence_root))
+        run_id = persist(
+            db, row, artifact_sha, profile_sha, args.runtime_image,
+            "sha256:" + guard_sha256, inventory, Path(args.evidence_root)
+        )
     print(canonical({"status": "completed", "runtime_observation_run_id": run_id,
                      "artifact_sha256": artifact_sha, "launch_profile_sha256": profile_sha,
+                     "guard_sha256": guard_sha256,
                      "tool_count": len(inventory["tools"])}))
     return 0
 

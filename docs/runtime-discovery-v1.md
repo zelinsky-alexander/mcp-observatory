@@ -5,7 +5,7 @@ exact npm stdio package already present in the Observatory catalog.
 
 ## Security phases
 
-1. The host resolves and verifies the exact npm artifact.
+1. The host fetches npm metadata, resolves, downloads, and verifies the exact artifact.
 2. A disposable container populates an npm cache. This is the only phase with
    registry network access.
 3. A second disposable container runs `npm install --offline --ignore-scripts`
@@ -13,6 +13,10 @@ exact npm stdio package already present in the Observatory catalog.
 4. A third disposable, read-only, non-root container starts the installed package
    under `mcp-native-guard inspect` with no network.
 5. The host validates and persists the deterministic inventory. No tool is invoked.
+
+Child output is drained with a fixed memory bound. A timeout terminates the local
+process group and force-removes the exact Docker container recorded through its
+private cidfile.
 
 The Docker socket, database, and evidence root are never mounted into the runtime
 container. The current MVP requires a Linux `mcp-native-guard` binary compatible
@@ -38,6 +42,11 @@ The command creates `runtime_observation_runs` and
 ```text
 evidence/runtime/sha256/<prefix>/<artifact-sha256>/<launch-profile-sha256>/inventory.json
 ```
+
+Successful stdout is one JSON object containing `status`,
+`runtime_observation_run_id`, `artifact_sha256`, `launch_profile_sha256`,
+`guard_sha256`, and `tool_count`. The recorded guard identity is the executable's
+SHA-256 digest rather than a caller-supplied version label.
 
 ## Compare
 
