@@ -25,3 +25,4 @@ evidence/
 /tests/__pycache__
 /tests/smoke_analyze_color_engine.sh
 Testing/
+__pycache__

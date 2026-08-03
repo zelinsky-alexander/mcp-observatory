@@ -23,7 +23,7 @@ Requirements:
 - A C++20 compiler such as Clang 17+ or GCC 13+
 - `/usr/bin/curl` and `/usr/bin/openssl` for registry collection and hashing
 - SQLite 3 development files for the local Registry explorer
-- Python 3 for the offline loopback HTTP tests
+- Python 3 for maintenance scripts and the offline loopback HTTP tests
 
 On Ubuntu/WSL, SQLite development files are provided by `libsqlite3-dev`.
 
@@ -311,6 +311,12 @@ mcp-observatory registry refresh \
 Current limitations: refresh requires an indexed baseline; it does not infer
 removals, construct a merged current-state snapshot, download packages,
 execute servers, invoke MCP tools, or manage scheduling or retention.
+
+For production-style refresh through a validated staging database, atomic
+publication, shared writer locking, verified backup/restore, machine-readable
+status, AWS/Linux `systemd` examples, and failure recovery, see
+[docs/registry-maintenance.md](docs/registry-maintenance.md). The repository
+provides examples only and does not install or enable the timer.
 
 ## Local Registry Explorer v0.1
 

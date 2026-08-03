@@ -26,6 +26,7 @@ endif()
 add_library(mcpo_core STATIC
     src/acquisition.cpp
     src/analyze.cpp
+    src/catalog_lock.cpp
     src/explorer.cpp
     src/history.cpp
     src/inventory.cpp
@@ -78,6 +79,13 @@ if(MCPO_BUILD_TESTS)
         COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_refresh_cli.py
             $<TARGET_FILE:mcp-observatory>
+    )
+    add_test(
+        NAME mcpo_registry_maintenance_tests
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_registry_maintenance.py
+            $<TARGET_FILE:mcp-observatory>
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/registry_maintenance.py
     )
     add_test(
         NAME mcpo_analyze_cli_tests
