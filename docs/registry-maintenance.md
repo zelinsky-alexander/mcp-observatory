@@ -24,9 +24,17 @@ published catalog lock:
 4. Validate `_SUCCESS`, the bundle, staged SQLite integrity, foreign keys,
    latest snapshot digest, page count, and record count.
 5. Create and verify a pre-publication backup and its SHA-256 metadata.
-6. Flush staging and atomically replace the published database with `rename`;
+6. Retain the newest refresh backups, removing older backup and metadata pairs.
+7. Flush staging and atomically replace the published database with `rename`;
    then flush the containing directory.
-7. Atomically update `last-success.json`.
+8. Atomically update `last-success.json`.
+
+The daily script retains two refresh backups by default. Set
+`MCPO_BACKUP_RETENTION_COUNT` to a positive integer to change the limit. The
+equivalent maintenance command option is `--backup-retention-count`. Pruning
+runs only after the new backup and its verification metadata have been
+successfully created, and only applies to timestamped refresh backups for the
+same database. Manual and pre-restore backups are not affected.
 
 Normal failures remove staging. A forced power loss or `SIGKILL` can leave a
 dot-prefixed staging file, but cannot partly overwrite the published file.
@@ -72,8 +80,13 @@ scripts/restore_registry_catalog.sh \
 
 Restore verifies the metadata digest, source integrity, staged copy, and
 expected snapshot before atomic replacement. When the current database is
-valid, it also creates a verified `pre-restore` backup beside it. Restart the
-timer only after read-only queries and `last-success.json` have been reviewed.
+valid, it must create a verified, uniquely named `pre-restore` backup beside
+it; any backup or metadata failure aborts before replacement. If current
+database validation fails, restore may proceed without that backup. It emits a
+warning on standard error and reports `pre_restore_backup.state` as `skipped`
+with the validation failure in its JSON result. A successful recovery backup
+is reported with state `created` and both paths. Restart the timer only after
+read-only queries and `last-success.json` have been reviewed.
 
 ## Failure recovery
 

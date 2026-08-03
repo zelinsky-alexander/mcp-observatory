@@ -14,6 +14,7 @@ Environment=MCPO_BINARY=/opt/mcp-observatory/build/release/mcp-observatory
 Environment=MCPO_DATABASE=/var/lib/mcp-observatory/local-registry.sqlite
 Environment=MCPO_REFRESH_RUNTIME_DIR=/var/lib/mcp-observatory/registry-refresh
 Environment=MCPO_LOCAL_TIMEZONE=UTC
+Environment=MCPO_BACKUP_RETENTION_COUNT=2
 ExecStart=/opt/mcp-observatory/scripts/daily_registry_refresh.sh
 StateDirectory=mcp-observatory
 StateDirectoryMode=0700

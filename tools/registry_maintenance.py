@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 import subprocess
 import sys
@@ -20,6 +21,7 @@ from zoneinfo import ZoneInfo
 
 
 STATUS_SCHEMA_VERSION = 1
+DEFAULT_BACKUP_RETENTION_COUNT = 2
 
 
 class MaintenanceError(RuntimeError):
@@ -192,6 +194,35 @@ def publish_backup(source: Path, destination: Path) -> dict:
             temporary.unlink(missing_ok=True)
 
 
+def prune_refresh_backups(
+    backup_directory: Path, database_name: str, retention_count: int
+) -> None:
+    name_pattern = re.compile(
+        re.escape(database_name)
+        + r"\.\d{8}T\d{6}Z-[0-9a-f]{8}\.sqlite\Z"
+    )
+    backups = sorted(
+        entry
+        for entry in backup_directory.iterdir()
+        if name_pattern.fullmatch(entry.name) is not None
+        and (entry.is_file() or entry.is_symlink())
+    )
+    removed = False
+    for backup in backups[:-retention_count]:
+        Path(f"{backup}.json").unlink(missing_ok=True)
+        backup.unlink()
+        removed = True
+    if removed:
+        fsync_directory(backup_directory)
+
+
+def positive_integer(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return parsed
+
+
 def load_status(path: Path) -> dict:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -325,6 +356,14 @@ def refresh(args: argparse.Namespace) -> int:
             if staged["counts"]["received_records"] != refresh_result.get("received_records"):
                 raise MaintenanceError("validation_failure", "staged record count does not match result")
             publish_backup(database, backup)
+            try:
+                prune_refresh_backups(
+                    backup.parent, database.name, args.backup_retention_count
+                )
+            except OSError as error:
+                raise MaintenanceError(
+                    "retention_failure", f"backup retention failed: {error}"
+                ) from error
             fsync_file(stage)
             os.replace(stage, database)
             fsync_directory(database.parent)
@@ -417,19 +456,59 @@ def restore_command(args: argparse.Namespace) -> int:
         sqlite_backup(source, stage)
         validate_database(stage, snapshot_digest)
         with writer_lock(database):
-            if database.exists():
-                recovery = database.with_name(
-                    f"{database.name}.pre-restore-{stamp(utc_now())}.sqlite"
+            try:
+                validate_database(database)
+            except MaintenanceError as validation_error:
+                if validation_error.category not in {
+                    "database_missing",
+                    "integrity_failure",
+                    "validation_failure",
+                }:
+                    raise
+                warning = (
+                    "pre-restore backup skipped because the live database is "
+                    f"invalid: {validation_error.category}: {validation_error}"
                 )
-                try:
-                    publish_backup(database, recovery)
-                except MaintenanceError:
-                    # A corrupt live database must not prevent a verified restore.
-                    pass
+                print(f"warning: {warning}", file=sys.stderr)
+                pre_restore_backup = {
+                    "state": "skipped",
+                    "warning": warning,
+                    "live_database_validation": {
+                        "category": validation_error.category,
+                        "message": str(validation_error),
+                    },
+                }
+            else:
+                recovery_token = f"{stamp(utc_now())}-{uuid.uuid4().hex[:8]}"
+                recovery = database.with_name(
+                    f"{database.name}.pre-restore-{recovery_token}.sqlite"
+                )
+                recovery_metadata = Path(f"{recovery}.json")
+                if recovery.exists() or recovery_metadata.exists():
+                    raise MaintenanceError(
+                        "backup_failure",
+                        f"pre-restore backup destination already exists: {recovery}",
+                    )
+                publish_backup(database, recovery)
+                pre_restore_backup = {
+                    "state": "created",
+                    "path": str(recovery),
+                    "metadata_path": str(recovery_metadata),
+                }
             fsync_file(stage)
             os.replace(stage, database)
             fsync_directory(database.parent)
-        print(json.dumps({"state": "restored", "snapshot_digest": snapshot_digest}, sort_keys=True, separators=(",", ":")))
+        print(
+            json.dumps(
+                {
+                    "state": "restored",
+                    "snapshot_digest": snapshot_digest,
+                    "pre_restore_backup": pre_restore_backup,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
         return 0
     except (MaintenanceError, OSError) as error:
         if not isinstance(error, MaintenanceError):
@@ -449,6 +528,11 @@ def parser() -> argparse.ArgumentParser:
     refresh_parser.add_argument("--database", type=Path, required=True)
     refresh_parser.add_argument("--runtime-dir", type=Path, required=True)
     refresh_parser.add_argument("--timezone", default="UTC")
+    refresh_parser.add_argument(
+        "--backup-retention-count",
+        type=positive_integer,
+        default=DEFAULT_BACKUP_RETENTION_COUNT,
+    )
     refresh_parser.add_argument("refresh_arguments", nargs=argparse.REMAINDER)
     refresh_parser.set_defaults(handler=refresh)
     backup_parser = subcommands.add_parser("backup")

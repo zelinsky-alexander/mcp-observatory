@@ -10,12 +10,14 @@ binary="${MCPO_BINARY:-$project_dir/build/release/mcp-observatory}"
 database="${MCPO_DATABASE:-$project_dir/db/local-registry.sqlite}"
 runtime_dir="${MCPO_REFRESH_RUNTIME_DIR:-$project_dir/runtime/registry-refresh}"
 local_timezone="${MCPO_LOCAL_TIMEZONE:-UTC}"
+backup_retention_count="${MCPO_BACKUP_RETENTION_COUNT:-2}"
 
 exec python3 "$project_dir/tools/registry_maintenance.py" refresh \
     --binary "$binary" \
     --database "$database" \
     --runtime-dir "$runtime_dir" \
     --timezone "$local_timezone" \
+    --backup-retention-count "$backup_retention_count" \
     -- \
     --request-timeout-seconds 60 \
     --stall-timeout-seconds 300 \
