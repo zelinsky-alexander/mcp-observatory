@@ -1,4 +1,5 @@
 #include "observatory/analyze.hpp"
+#include "observatory/catalog_lock.hpp"
 
 #include <sqlite3.h>
 
@@ -462,6 +463,9 @@ public:
     }
 
     bool open(const std::filesystem::path& path, int flags, std::string& error) {
+        if ((flags & SQLITE_OPEN_READWRITE) != 0 &&
+            !writer_lock_.acquire(path, error))
+            return false;
         const int result = sqlite3_open_v2(path.c_str(), &handle_, flags, nullptr);
         if (result != SQLITE_OK) {
             error = sqlite_message(handle_, "open database " + path.string());
@@ -486,6 +490,7 @@ public:
     sqlite3* get() const noexcept { return handle_; }
 
 private:
+    CatalogWriterLock writer_lock_;
     sqlite3* handle_{};
 };
 
