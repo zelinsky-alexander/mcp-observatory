@@ -1,25 +1,25 @@
 [Unit]
 Description=MCP Observatory incremental registry refresh
-Documentation=file:/opt/mcp-observatory/docs/registry-maintenance.md
+Documentation=file:/opt/mcp-observatory/current/docs/registry-maintenance.md
 Wants=network-online.target
 After=network-online.target
 OnSuccess=mcp-observatory-static-analysis.service
 
 [Service]
 Type=oneshot
-User=mcp-observatory
-Group=mcp-observatory
-WorkingDirectory=/opt/mcp-observatory
-Environment=MCPO_PROJECT_DIR=/opt/mcp-observatory
-Environment=MCPO_BINARY=/opt/mcp-observatory/build/release/mcp-observatory
-Environment=MCPO_DATABASE=/var/lib/mcp-observatory/local-registry.sqlite
+User=mcp-refresh
+Group=mcp-refresh
+SupplementaryGroups=mcp-catalog
+WorkingDirectory=/opt/mcp-observatory/current
+Environment=MCPO_PROJECT_DIR=/opt/mcp-observatory/current
+Environment=MCPO_BINARY=/opt/mcp-observatory/current/build/release/mcp-observatory
+Environment=MCPO_DATABASE=/var/lib/mcp-observatory/catalog/local-registry.sqlite
 Environment=MCPO_REFRESH_RUNTIME_DIR=/var/lib/mcp-observatory/registry-refresh
-Environment=MCPO_LOCAL_TIMEZONE=UTC
+Environment=MCPO_LOCAL_TIMEZONE=Asia/Jerusalem
 Environment=MCPO_BACKUP_RETENTION_COUNT=2
-ExecStart=/opt/mcp-observatory/scripts/daily_registry_refresh.sh
-StateDirectory=mcp-observatory
-StateDirectoryMode=0700
-UMask=0077
+Environment=MCPO_CATALOG_GROUP=mcp-catalog
+ExecStart=/bin/bash /opt/mcp-observatory/current/scripts/daily_registry_refresh.sh
+UMask=0027
 
 NoNewPrivileges=yes
 PrivateDevices=yes
