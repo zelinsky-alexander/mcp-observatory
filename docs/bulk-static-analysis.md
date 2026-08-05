@@ -64,8 +64,9 @@ Important bounds:
 - each analyzer child has a wall-clock timeout and bounded combined output;
 - the scheduler and Observatory writers share the catalog's
   `<database>.writer.lock` advisory lock;
-- package identifiers, versions, and server identifiers always come from the
-  catalog, never from an HTTP request or shell expansion;
+- package record IDs always come from the catalog and are passed through the
+  exact `--package-id` analyzer selector, never from an HTTP request or shell
+  expansion;
 - analyzer commands use a fixed argument vector with no shell.
 
 ## Automatic operation
@@ -162,6 +163,8 @@ starts. Errors and reasons are stored as bounded text. Successful child output i
 not trusted by itself: the referenced `analysis_runs` row, artifact digest,
 analyzer identity, and ruleset identity are verified in SQLite before the package
 is marked completed.
+
+Registry HTTP 404 responses and registry identity mismatches are terminal `unresolvable` outcomes. PyPI releases without a supported non-yanked tar-gzip source distribution are terminal `unsupported` outcomes. The scheduler preserves these states across later synchronization runs instead of consuming retries.
 
 ## Coverage interpretation
 

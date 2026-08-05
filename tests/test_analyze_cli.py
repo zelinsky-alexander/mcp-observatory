@@ -745,6 +745,95 @@ def main(binary: str) -> None:
         require(ambiguous.returncode == 5, "ambiguous should fail", ambiguous)
         require("ambiguous" in ambiguous.stderr.lower(), "ambiguous message", ambiguous)
 
+        # Exact package-id selection bypasses an ambiguous identity triplet.
+        connection = sqlite3.connect(database)
+        selected_package_id = connection.execute(
+            "SELECT id FROM packages WHERE identifier='same-name' AND version='1.0.0'"
+        ).fetchone()[0]
+        connection.close()
+        exact_package_json = json.dumps(
+            {"name": "same-name", "version": "1.0.0", "main": "index.js"}
+        ).encode()
+        exact_tarball = make_tarball(
+            root,
+            {
+                "package/package.json": exact_package_json,
+                "package/index.js": b"export const value = 1;\n",
+            },
+        )
+        exact_metadata = {
+            "name": "same-name",
+            "version": "1.0.0",
+            "dist": {
+                "tarball": f"{base}/same-name/-/same-name-1.0.0.tgz",
+                "integrity": sha512_integrity(exact_tarball),
+            },
+        }
+        NpmHandler.catalog["/same-name/1.0.0"] = (
+            json.dumps(exact_metadata).encode(),
+            "application/json",
+        )
+        NpmHandler.catalog["/same-name/-/same-name-1.0.0.tgz"] = (
+            exact_tarball,
+            "application/octet-stream",
+        )
+        by_id = run(
+            binary,
+            "analyze",
+            "package",
+            "--database",
+            str(database),
+            "--package-id",
+            str(selected_package_id),
+            "--evidence-root",
+            str(evidence),
+            "--rules",
+            str(rules),
+            "--npm-registry-url",
+            base,
+            "--allow-in-process-worker",
+            "--format",
+            "json",
+        )
+        require(by_id.returncode == 0, "package-id analysis should complete", by_id)
+        by_id_payload = json.loads(by_id.stdout)
+        require(
+            by_id_payload["package_identifier"] == "same-name"
+            and by_id_payload["package_version"] == "1.0.0",
+            "package-id selected the wrong record",
+            by_id,
+        )
+        connection = sqlite3.connect(database)
+        require(
+            connection.execute(
+                "SELECT package_id FROM analysis_runs WHERE id=?",
+                (by_id_payload["analysis_run_id"],),
+            ).fetchone()
+            == (selected_package_id,),
+            "package-id analysis run is attached to the wrong package record",
+        )
+        connection.close()
+        conflicting_selector = run(
+            binary,
+            "analyze",
+            "package",
+            "--database",
+            str(database),
+            "--package-id",
+            str(selected_package_id),
+            "--server",
+            "io.example/ambiguous",
+            "--version",
+            "1.0.0",
+            "--package",
+            "same-name",
+        )
+        require(
+            conflicting_selector.returncode == 1,
+            "package-id and identity triplet must be mutually exclusive",
+            conflicting_selector,
+        )
+
         # 3 exact PyPI sdist acquisition, integrity verification, and reuse
         pypi = run(
             binary,

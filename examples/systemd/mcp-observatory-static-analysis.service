@@ -14,6 +14,7 @@ Environment=MCPO_PROJECT_DIR=/opt/mcp-observatory/current
 Environment=MCPO_BINARY=/opt/mcp-observatory/current/build/release/mcp-observatory
 Environment=MCPO_DATABASE=/var/lib/mcp-observatory/catalog/local-registry.sqlite
 Environment=MCPO_EVIDENCE_ROOT=/var/lib/mcp-observatory/evidence
+Environment=TMPDIR=/var/lib/mcp-observatory/tmp
 Environment=MCPO_STATIC_ANALYSIS_RULES=/opt/mcp-observatory/current/rules/artifact-static-analysis-v1.json
 Environment=MCPO_STATIC_ANALYSIS_BATCH_SIZE=1000
 Environment=MCPO_STATIC_ANALYSIS_MAXIMUM_RUN_SECONDS=3000

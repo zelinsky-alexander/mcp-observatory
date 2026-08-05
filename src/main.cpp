@@ -45,6 +45,7 @@ void print_usage(std::ostream& out) {
         << "  mcp-observatory bundle validate DIRECTORY\n"
         << "\nanalyze package options:\n"
         << "  --database PATH               registry SQLite database\n"
+        << "  --package-id ID               exact package record id\n"
         << "  --server IDENTIFIER           exact server identifier\n"
         << "  --version VERSION             exact server version\n"
         << "  --package IDENTIFIER          exact npm or PyPI package name\n"
@@ -851,7 +852,14 @@ int run_analyze_package(int argc, char** argv) {
         }
         const std::string_view value(argv[++index]);
         if (argument == "--database") options.database = std::string(value);
-        else if (argument == "--server")
+        else if (argument == "--package-id") {
+            std::int64_t package_id{};
+            if (!parse_finding_id(value, package_id)) {
+                std::cerr << "invalid package id\n";
+                return 1;
+            }
+            options.package_id = package_id;
+        } else if (argument == "--server")
             options.server_identifier = std::string(value);
         else if (argument == "--version")
             options.server_version = std::string(value);
@@ -887,9 +895,17 @@ int run_analyze_package(int argc, char** argv) {
             return 1;
         }
     }
-    if (options.database.empty() || options.server_identifier.empty() ||
-        options.server_version.empty() || options.package_identifier.empty()) {
-        std::cerr << "analyze package requires --database --server --version --package\n";
+    const bool have_server = !options.server_identifier.empty();
+    const bool have_version = !options.server_version.empty();
+    const bool have_package = !options.package_identifier.empty();
+    const bool have_triplet = have_server && have_version && have_package;
+    const bool have_any_triplet = have_server || have_version || have_package;
+    if (options.database.empty() ||
+        (options.package_id.has_value() && have_any_triplet) ||
+        (!options.package_id.has_value() && !have_triplet)) {
+        std::cerr
+            << "analyze package requires --database and exactly one selector: "
+            << "--package-id or --server/--version/--package\n";
         return 1;
     }
     const mcpo::AnalyzePackageResult result = mcpo::analyze_package(options);

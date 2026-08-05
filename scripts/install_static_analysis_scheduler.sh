@@ -11,6 +11,7 @@ install_root="${MCPO_INSTALL_ROOT:-/opt/mcp-observatory/current}"
 state_root="${MCPO_STATE_ROOT:-/var/lib/mcp-observatory}"
 database="${MCPO_DATABASE:-$state_root/catalog/local-registry.sqlite}"
 evidence_root="${MCPO_EVIDENCE_ROOT:-$state_root/evidence}"
+tmp_root="${MCPO_STATIC_ANALYSIS_TMP_ROOT:-$state_root/tmp}"
 service_user="${MCPO_STATIC_ANALYSIS_USER:-mcp-refresh}"
 service_group="${MCPO_STATIC_ANALYSIS_GROUP:-mcp-refresh}"
 catalog_group="${MCPO_CATALOG_GROUP:-mcp-catalog}"
@@ -57,6 +58,7 @@ Options:
 
 Environment overrides:
   MCPO_INSTALL_ROOT, MCPO_STATE_ROOT, MCPO_DATABASE, MCPO_EVIDENCE_ROOT,
+  MCPO_STATIC_ANALYSIS_TMP_ROOT,
   MCPO_STATIC_ANALYSIS_USER, MCPO_STATIC_ANALYSIS_GROUP, MCPO_CATALOG_GROUP,
   MCPO_SYSTEMD_DIR, MCPO_CONFIG_DIR, MCPO_STATIC_ANALYSIS_BATCH_SIZE,
   MCPO_STATIC_ANALYSIS_MAXIMUM_RUN_SECONDS,
@@ -165,6 +167,7 @@ validate_host() {
         "MCPO_STATE_ROOT:$state_root" \
         "MCPO_DATABASE:$database" \
         "MCPO_EVIDENCE_ROOT:$evidence_root" \
+        "MCPO_STATIC_ANALYSIS_TMP_ROOT:$tmp_root" \
         "MCPO_STATIC_ANALYSIS_USER:$service_user" \
         "MCPO_STATIC_ANALYSIS_GROUP:$service_group" \
         "MCPO_CATALOG_GROUP:$catalog_group" \
@@ -185,6 +188,7 @@ MCPO_PROJECT_DIR=$install_root
 MCPO_BINARY=$install_root/build/release/mcp-observatory
 MCPO_DATABASE=$database
 MCPO_EVIDENCE_ROOT=$evidence_root
+TMPDIR=$tmp_root
 MCPO_STATIC_ANALYSIS_RULES=$install_root/rules/artifact-static-analysis-v1.json
 MCPO_STATIC_ANALYSIS_BATCH_SIZE=$batch_size
 MCPO_STATIC_ANALYSIS_MAXIMUM_RUN_SECONDS=$maximum_run_seconds
@@ -287,6 +291,7 @@ EOF
 
 prepare_state() {
     install -d -o "$service_user" -g "$catalog_group" -m 0750 "$evidence_root"
+    install -d -o "$service_user" -g "$catalog_group" -m 0750 "$tmp_root"
 }
 
 activate_units() {
@@ -306,6 +311,7 @@ show_result() {
     log "installed $systemd_dir/$refresh_service_name.d/static-analysis.conf"
     log "installed $config_dir/static-analysis.env"
     log "evidence directory: $evidence_root"
+    log "Docker-visible temporary directory: $tmp_root"
     log "timer status: $(systemctl is-enabled "$timer_name") / $(systemctl is-active "$timer_name")"
     if (( start_now == 1 )); then
         log "initial analysis run requested asynchronously"

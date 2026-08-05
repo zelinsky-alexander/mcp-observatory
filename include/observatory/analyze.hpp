@@ -66,6 +66,7 @@ struct ArchiveLimits {
 
 struct AnalyzePackageOptions {
     std::filesystem::path database;
+    std::optional<std::int64_t> package_id;
     std::string server_identifier;
     std::string server_version;
     std::string package_identifier;
@@ -225,6 +226,12 @@ using AnalyzeWorkerRunner = std::function<bool(
     std::string_view server_identifier,
     std::string_view server_version,
     std::string_view package_identifier,
+    ResolvedPackage& resolved,
+    std::string& error);
+
+[[nodiscard]] AnalyzeError resolve_package_by_id(
+    const std::filesystem::path& database,
+    std::int64_t package_id,
     ResolvedPackage& resolved,
     std::string& error);
 

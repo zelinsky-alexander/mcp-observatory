@@ -269,7 +269,9 @@ def synchronize(
         ).fetchone()
         if existing is not None and completed is None:
             old = str(existing["state"])
-            if old in {"failed", "running"} and state == "eligible":
+            if old in {
+                "failed", "running", "unsupported", "unresolvable"
+            } and state == "eligible":
                 state = old
                 code = str(existing["reason_code"] or "") or None
                 message = str(existing["reason_message"] or "") or None
@@ -319,11 +321,8 @@ def candidates(
     retry_seconds: int,
 ) -> list[sqlite3.Row]:
     return db.execute(
-        """SELECT s.package_id,sv.server_identifier,sv.server_version,
-                  p.identifier package_identifier
+        """SELECT s.package_id
            FROM static_analysis_schedule_state s
-           JOIN packages p ON p.id=s.package_id
-           JOIN server_versions sv ON sv.id=p.server_version_id
            WHERE s.profile_key=? AND s.state IN('eligible','failed')
              AND s.attempt_count<?
              AND (s.last_attempt_at IS NULL OR
@@ -337,6 +336,12 @@ def candidates(
 
 
 def run_child(argv: list[str], timeout: int, output_limit: int) -> subprocess.CompletedProcess[bytes]:
+    child_environment = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "LANG": "C.UTF-8",
+    }
+    if os.environ.get("TMPDIR"):
+        child_environment["TMPDIR"] = os.environ["TMPDIR"]
     process = subprocess.Popen(
         argv,
         stdin=subprocess.DEVNULL,
@@ -344,7 +349,7 @@ def run_child(argv: list[str], timeout: int, output_limit: int) -> subprocess.Co
         stderr=subprocess.PIPE,
         close_fds=True,
         start_new_session=True,
-        env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LANG": "C.UTF-8"},
+        env=child_environment,
     )
     assert process.stdout is not None and process.stderr is not None
     selector = selectors.DefaultSelector()
@@ -521,6 +526,52 @@ def claim_next(
             db.close()
 
 
+def classify_child_failure(returncode: int, stderr: str) -> tuple[str, str]:
+    lowered = stderr.lower()
+    if "requested url returned error: 404" in lowered:
+        return "unresolvable", "registry_not_found"
+    if "pypi release metadata identity mismatch" in lowered:
+        return "unresolvable", "registry_identity_mismatch"
+    if (
+        "no supported non-yanked tar-gzip source distribution"
+        in lowered
+    ):
+        return "unsupported", "unsupported_pypi_distribution"
+    if (
+        "ambiguous package selection" in lowered
+        or "exact package record not found" in lowered
+    ):
+        return "unresolvable", "artifact_unresolvable"
+    if returncode == 5:
+        if any(token in lowered for token in (
+            "unsupported", "wheel", "zip sdist", "yanked"
+        )):
+            return "unsupported", "artifact_unsupported"
+        return "unresolvable", "artifact_unresolvable"
+    return "failed", "analysis_failed"
+
+
+def reclassify_terminal_failures(db: sqlite3.Connection, key: str) -> None:
+    rules = (
+        ("unresolvable", "registry_not_found",
+         "requested url returned error: 404"),
+        ("unresolvable", "registry_identity_mismatch",
+         "pypi release metadata identity mismatch"),
+        ("unsupported", "unsupported_pypi_distribution",
+         "no supported non-yanked tar-gzip source distribution"),
+        ("unresolvable", "artifact_unresolvable",
+         "ambiguous package selection"),
+    )
+    for state, code, message_fragment in rules:
+        db.execute(
+            """UPDATE static_analysis_schedule_state
+               SET state=?,reason_code=?,updated_at=CURRENT_TIMESTAMP
+               WHERE profile_key=? AND state='failed'
+                 AND instr(lower(COALESCE(reason_message,'')),?)>0""",
+            (state, code, key, message_fragment),
+        )
+
+
 def analyze_claimed(
     database: Path,
     key: str,
@@ -535,12 +586,8 @@ def analyze_claimed(
         "package",
         "--database",
         str(database),
-        "--server",
-        str(item["server_identifier"]),
-        "--version",
-        str(item["server_version"]),
-        "--package",
-        str(item["package_identifier"]),
+        "--package-id",
+        str(package_id),
         "--evidence-root",
         str(Path(args.evidence_root).resolve()),
         "--rules",
@@ -573,20 +620,7 @@ def analyze_claimed(
             reused = bool(payload.get("reused_existing", False))
             state, code, message = "completed", None, None
         else:
-            lowered = stderr.lower()
-            if child.returncode == 5:
-                state = (
-                    "unsupported"
-                    if any(token in lowered for token in (
-                        "unsupported", "wheel", "zip sdist", "yanked"
-                    ))
-                    else "unresolvable"
-                )
-                code = (
-                    "artifact_unsupported"
-                    if state == "unsupported"
-                    else "artifact_unresolvable"
-                )
+            state, code = classify_child_failure(child.returncode, stderr)
             message = stderr or f"analysis child exited with status {child.returncode}"
     except (OSError, RuntimeError, ValueError, KeyError, json.JSONDecodeError) as exc:
         message = str(exc)
@@ -638,6 +672,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         try:
             with db:
                 register_profile(db, profile, key)
+                reclassify_terminal_failures(db, key)
                 synchronize(db, key, profile, args.stale_running_after_seconds)
         finally:
             db.close()
