@@ -61,9 +61,7 @@ CREATE TABLE IF NOT EXISTS static_analysis_schedule_state(
   PRIMARY KEY(profile_key,package_id)
 );
 CREATE INDEX IF NOT EXISTS static_analysis_schedule_state_lookup
-ON static_analysis_schedule_state(
-  profile_key,state,discovered_at,attempt_count,last_attempt_at,package_id
-);
+ON static_analysis_schedule_state(profile_key,state,attempt_count,last_attempt_at,package_id);
 """
 
 
@@ -140,10 +138,16 @@ def register_profile(db: sqlite3.Connection, profile: dict[str, str], key: str) 
         db.execute(
             "ALTER TABLE static_analysis_schedule_state ADD COLUMN discovered_at TEXT"
         )
-        db.execute(
-            """UPDATE static_analysis_schedule_state
-               SET discovered_at=CURRENT_TIMESTAMP WHERE discovered_at IS NULL"""
-        )
+    db.execute(
+        """UPDATE static_analysis_schedule_state
+           SET discovered_at=CURRENT_TIMESTAMP WHERE discovered_at IS NULL"""
+    )
+    db.execute(
+        """CREATE INDEX IF NOT EXISTS static_analysis_schedule_state_priority
+           ON static_analysis_schedule_state(
+             profile_key,state,discovered_at,attempt_count,last_attempt_at,package_id
+           )"""
+    )
     db.execute(
         """INSERT INTO static_analysis_schedule_profiles(
              profile_key,analysis_type,analyzer_name,analyzer_version,
