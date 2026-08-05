@@ -41,6 +41,40 @@ CREATE TABLE analysis_runs(
 """
 
 
+def write_rules(root: Path) -> Path:
+    rules = root / "rules.json"
+    rules.write_text(json.dumps({"ruleset_version": "1.0.0"}), encoding="utf-8")
+    return rules
+
+
+def scheduler_command(
+    database: Path,
+    fake: Path,
+    rules: Path,
+    evidence: Path,
+    *,
+    batch_size: int,
+) -> list[str]:
+    return [
+        sys.executable,
+        str(SCRIPT),
+        "--database",
+        str(database),
+        "--observatory-binary",
+        str(fake),
+        "--rules",
+        str(rules),
+        "--evidence-root",
+        str(evidence),
+        "--batch-size",
+        str(batch_size),
+        "--retry-failed-after-seconds",
+        "3600",
+        "--format",
+        "json",
+    ]
+
+
 class BulkStaticAnalysisTests(unittest.TestCase):
     def test_classifies_processes_and_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory(prefix="mcpo-bulk-static-") as temporary:
@@ -79,8 +113,7 @@ class BulkStaticAnalysisTests(unittest.TestCase):
             connection.commit()
             connection.close()
 
-            rules = root / "rules.json"
-            rules.write_text(json.dumps({"ruleset_version": "1.0.0"}), encoding="utf-8")
+            rules = write_rules(root)
             fake = root / "fake-observatory.py"
             fake.write_text(
                 """#!/usr/bin/env python3
@@ -117,24 +150,9 @@ print(json.dumps({
                 encoding="utf-8",
             )
             fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
-            command = [
-                sys.executable,
-                str(SCRIPT),
-                "--database",
-                str(database),
-                "--observatory-binary",
-                str(fake),
-                "--rules",
-                str(rules),
-                "--evidence-root",
-                str(evidence),
-                "--batch-size",
-                "10",
-                "--retry-failed-after-seconds",
-                "3600",
-                "--format",
-                "json",
-            ]
+            command = scheduler_command(
+                database, fake, rules, evidence, batch_size=10
+            )
 
             first = subprocess.run(command, text=True, capture_output=True, check=False)
             self.assertEqual(first.returncode, 0, first.stderr)
@@ -146,12 +164,24 @@ print(json.dumps({
             self.assertEqual(payload["never_attempted"], 0)
             self.assertEqual(payload["unique_artifacts_analyzed"], 2)
             self.assertEqual(payload["processed_in_batch"], 2)
-            self.assertEqual(calls.read_text(encoding="utf-8").splitlines(), ["pkg-ok", "pkg-fail"])
+            self.assertEqual(payload["remaining_queue_records"], 1)
+            self.assertEqual(payload["stop_reason"], "queue_empty")
+            self.assertGreaterEqual(payload["run_elapsed_seconds"], 0)
+            self.assertIsNotNone(payload["estimated_remaining_seconds"])
+            self.assertEqual(
+                calls.read_text(encoding="utf-8").splitlines(),
+                ["pkg-fail", "pkg-ok"],
+            )
 
             second = subprocess.run(command, text=True, capture_output=True, check=False)
             self.assertEqual(second.returncode, 0, second.stderr)
-            self.assertEqual(json.loads(second.stdout)["processed_in_batch"], 0)
-            self.assertEqual(calls.read_text(encoding="utf-8").splitlines(), ["pkg-ok", "pkg-fail"])
+            second_payload = json.loads(second.stdout)
+            self.assertEqual(second_payload["processed_in_batch"], 0)
+            self.assertEqual(second_payload["stop_reason"], "queue_empty")
+            self.assertEqual(
+                calls.read_text(encoding="utf-8").splitlines(),
+                ["pkg-fail", "pkg-ok"],
+            )
 
             connection = sqlite3.connect(database)
             states = dict(
@@ -169,6 +199,92 @@ print(json.dumps({
                     40: "unresolvable",
                     50: "completed",
                 },
+            )
+
+    def test_new_catalog_record_precedes_existing_backlog(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="mcpo-bulk-priority-") as temporary:
+            root = Path(temporary)
+            database = root / "catalog.sqlite"
+            calls = root / "calls.log"
+            connection = sqlite3.connect(database)
+            connection.executescript(SCHEMA)
+            connection.executemany(
+                "INSERT INTO server_versions VALUES(?,?,?)",
+                [(1, "srv-old-a", "1"), (2, "srv-old-b", "1")],
+            )
+            connection.executemany(
+                "INSERT INTO packages VALUES(?,?,?,?,?)",
+                [
+                    (10, 1, "npm", "pkg-old-a", "1"),
+                    (20, 2, "npm", "pkg-old-b", "1"),
+                ],
+            )
+            connection.commit()
+            connection.close()
+
+            rules = write_rules(root)
+            fake = root / "fake-observatory.py"
+            fake.write_text(
+                """#!/usr/bin/env python3
+import hashlib
+import json
+from pathlib import Path
+import sqlite3
+import sys
+package = sys.argv[sys.argv.index('--package') + 1]
+Path(%r).open('a', encoding='utf-8').write(package + '\\n')
+database = sys.argv[sys.argv.index('--database') + 1]
+db = sqlite3.connect(database)
+row = db.execute(
+    'SELECT server_version_id,id FROM packages WHERE identifier=?', (package,)
+).fetchone()
+run_id = db.execute('SELECT COALESCE(MAX(id), 900) + 1 FROM analysis_runs').fetchone()[0]
+digest = hashlib.sha256(package.encode()).hexdigest()
+db.execute(
+    "INSERT INTO analysis_runs VALUES(?,?,?,"
+    "'npm_package_static_v1','completed','mcp-observatory-static',"
+    "'1.1.0','1.0.0',?)",
+    (run_id, row[0], row[1], digest),
+)
+db.commit()
+db.close()
+print(json.dumps({
+    'status': 'completed', 'analysis_run_id': run_id,
+    'artifact_sha256': digest, 'reused_existing': False,
+}))
+"""
+                % str(calls),
+                encoding="utf-8",
+            )
+            fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+            command = scheduler_command(
+                database, fake, rules, root / "evidence", batch_size=1
+            )
+
+            first = subprocess.run(command, text=True, capture_output=True, check=False)
+            self.assertEqual(first.returncode, 0, first.stderr)
+            self.assertEqual(
+                calls.read_text(encoding="utf-8").splitlines(), ["pkg-old-b"]
+            )
+
+            connection = sqlite3.connect(database)
+            connection.execute(
+                "UPDATE static_analysis_schedule_state SET discovered_at='2026-01-01 00:00:00'"
+            )
+            connection.execute(
+                "INSERT INTO server_versions VALUES(3,'srv-new','2')"
+            )
+            connection.execute(
+                "INSERT INTO packages VALUES(30,3,'npm','pkg-new','2')"
+            )
+            connection.commit()
+            connection.close()
+
+            second = subprocess.run(command, text=True, capture_output=True, check=False)
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertEqual(
+                calls.read_text(encoding="utf-8").splitlines(),
+                ["pkg-old-b", "pkg-new"],
             )
 
 
