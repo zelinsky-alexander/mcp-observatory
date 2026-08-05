@@ -1,0 +1,13 @@
+[Unit]
+Description=Continue MCP Observatory static artifact backfill hourly
+
+[Timer]
+OnBootSec=10min
+OnCalendar=hourly
+RandomizedDelaySec=5min
+AccuracySec=1min
+Persistent=yes
+Unit=mcp-observatory-static-analysis.service
+
+[Install]
+WantedBy=timers.target
