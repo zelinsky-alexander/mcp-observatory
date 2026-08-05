@@ -1,13 +1,13 @@
 [Unit]
 Description=MCP Observatory bounded static artifact analysis
-Documentation=file:/opt/mcp-observatory/docs/bulk-static-analysis.md
+Documentation=file:/opt/mcp-observatory/current/docs/bulk-static-analysis.md
 Wants=network-online.target
 After=network-online.target mcp-observatory-refresh.service
 
 [Service]
 Type=oneshot
-User=mcp-analysis
-Group=mcp-analysis
+User=mcp-refresh
+Group=mcp-refresh
 SupplementaryGroups=mcp-catalog docker
 WorkingDirectory=/opt/mcp-observatory/current
 Environment=MCPO_PROJECT_DIR=/opt/mcp-observatory/current
