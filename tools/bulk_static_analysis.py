@@ -55,12 +55,15 @@ CREATE TABLE IF NOT EXISTS static_analysis_schedule_state(
   analysis_run_id INTEGER,
   artifact_sha256 TEXT,
   reused_existing INTEGER NOT NULL DEFAULT 0 CHECK(reused_existing IN(0,1)),
+  discovered_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   last_attempt_at TEXT,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY(profile_key,package_id)
 );
 CREATE INDEX IF NOT EXISTS static_analysis_schedule_state_lookup
-ON static_analysis_schedule_state(profile_key,state,attempt_count,last_attempt_at,package_id);
+ON static_analysis_schedule_state(
+  profile_key,state,discovered_at,attempt_count,last_attempt_at,package_id
+);
 """
 
 
@@ -79,6 +82,10 @@ def table_exists(db: sqlite3.Connection, name: str) -> bool:
     return db.execute(
         "SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?", (name,)
     ).fetchone() is not None
+
+
+def table_columns(db: sqlite3.Connection, name: str) -> set[str]:
+    return {str(row["name"]) for row in db.execute(f"PRAGMA table_info({name})")}
 
 
 @contextmanager
@@ -128,6 +135,15 @@ def load_profile(args: argparse.Namespace) -> tuple[dict[str, str], str]:
 
 def register_profile(db: sqlite3.Connection, profile: dict[str, str], key: str) -> None:
     db.executescript(SCHEMA)
+    columns = table_columns(db, "static_analysis_schedule_state")
+    if "discovered_at" not in columns:
+        db.execute(
+            "ALTER TABLE static_analysis_schedule_state ADD COLUMN discovered_at TEXT"
+        )
+        db.execute(
+            """UPDATE static_analysis_schedule_state
+               SET discovered_at=CURRENT_TIMESTAMP WHERE discovered_at IS NULL"""
+        )
     db.execute(
         """INSERT INTO static_analysis_schedule_profiles(
              profile_key,analysis_type,analyzer_name,analyzer_version,
@@ -241,7 +257,9 @@ def synchronize(
             run_id = None
             artifact = None
         existing = db.execute(
-            """SELECT state FROM static_analysis_schedule_state
+            """SELECT state,reason_code,reason_message,analysis_run_id,
+                      artifact_sha256
+               FROM static_analysis_schedule_state
                WHERE profile_key=? AND package_id=?""",
             (key, package_id),
         ).fetchone()
@@ -249,28 +267,35 @@ def synchronize(
             old = str(existing["state"])
             if old in {"failed", "running"} and state == "eligible":
                 state = old
-                code = "analysis_failed" if old == "failed" else None
-                message = None
-        db.execute(
-            """INSERT INTO static_analysis_schedule_state(
-                 profile_key,package_id,state,reason_code,reason_message,
-                 analysis_run_id,artifact_sha256)
-               VALUES(?,?,?,?,?,?,?)
-               ON CONFLICT(profile_key,package_id) DO UPDATE SET
-                 state=excluded.state,
-                 reason_code=CASE WHEN excluded.state='completed' THEN NULL
-                                  ELSE COALESCE(excluded.reason_code,
-                                    static_analysis_schedule_state.reason_code) END,
-                 reason_message=CASE WHEN excluded.state='completed' THEN NULL
-                                     ELSE COALESCE(excluded.reason_message,
-                                       static_analysis_schedule_state.reason_message) END,
-                 analysis_run_id=COALESCE(excluded.analysis_run_id,
-                   static_analysis_schedule_state.analysis_run_id),
-                 artifact_sha256=COALESCE(excluded.artifact_sha256,
-                   static_analysis_schedule_state.artifact_sha256),
-                 updated_at=CURRENT_TIMESTAMP""",
-            (key, package_id, state, code, message, run_id, artifact),
-        )
+                code = str(existing["reason_code"] or "") or None
+                message = str(existing["reason_message"] or "") or None
+                run_id = existing["analysis_run_id"]
+                artifact = existing["artifact_sha256"]
+        if existing is None:
+            db.execute(
+                """INSERT INTO static_analysis_schedule_state(
+                     profile_key,package_id,state,reason_code,reason_message,
+                     analysis_run_id,artifact_sha256)
+                   VALUES(?,?,?,?,?,?,?)""",
+                (key, package_id, state, code, message, run_id, artifact),
+            )
+            continue
+        desired = (state, code, message, run_id, artifact)
+        current = tuple(existing[name] for name in (
+            "state",
+            "reason_code",
+            "reason_message",
+            "analysis_run_id",
+            "artifact_sha256",
+        ))
+        if desired != current:
+            db.execute(
+                """UPDATE static_analysis_schedule_state
+                   SET state=?,reason_code=?,reason_message=?,analysis_run_id=?,
+                       artifact_sha256=?,updated_at=CURRENT_TIMESTAMP
+                   WHERE profile_key=? AND package_id=?""",
+                (*desired, key, package_id),
+            )
     db.execute(
         """UPDATE static_analysis_schedule_state
            SET state='failed',reason_code='interrupted',
@@ -299,8 +324,9 @@ def candidates(
              AND s.attempt_count<?
              AND (s.last_attempt_at IS NULL OR
                   s.last_attempt_at<=datetime('now',?))
-           ORDER BY CASE s.state WHEN 'eligible' THEN 0 ELSE 1 END,
-                    s.attempt_count,s.package_id
+           ORDER BY s.discovered_at DESC,
+                    CASE s.state WHEN 'eligible' THEN 0 ELSE 1 END,
+                    s.attempt_count,s.package_id DESC
            LIMIT ?""",
         (key, maximum_attempts, f"-{retry_seconds} seconds", batch_size),
     ).fetchall()
@@ -451,7 +477,156 @@ def summary(db: sqlite3.Connection, key: str) -> dict[str, Any]:
     return result
 
 
+def remaining_queue(
+    db: sqlite3.Connection,
+    key: str,
+    maximum_attempts: int,
+) -> int:
+    return int(
+        db.execute(
+            """SELECT COUNT(*) FROM static_analysis_schedule_state
+               WHERE profile_key=? AND state IN('eligible','failed','running')
+                 AND attempt_count<?""",
+            (key, maximum_attempts),
+        ).fetchone()[0]
+    )
+
+
+def claim_next(
+    database: Path,
+    key: str,
+    args: argparse.Namespace,
+) -> sqlite3.Row | None:
+    with writer_lock(database):
+        db = connect(database)
+        try:
+            selected = candidates(
+                db,
+                key,
+                1,
+                args.maximum_attempts,
+                args.retry_failed_after_seconds,
+            )
+            if not selected:
+                return None
+            item = selected[0]
+            with db:
+                set_running(db, key, int(item["package_id"]))
+            return item
+        finally:
+            db.close()
+
+
+def analyze_claimed(
+    database: Path,
+    key: str,
+    profile: dict[str, str],
+    item: sqlite3.Row,
+    args: argparse.Namespace,
+) -> None:
+    package_id = int(item["package_id"])
+    argv = [
+        str(Path(args.observatory_binary).resolve()),
+        "analyze",
+        "package",
+        "--database",
+        str(database),
+        "--server",
+        str(item["server_identifier"]),
+        "--version",
+        str(item["server_version"]),
+        "--package",
+        str(item["package_identifier"]),
+        "--evidence-root",
+        str(Path(args.evidence_root).resolve()),
+        "--rules",
+        str(Path(args.rules).resolve()),
+        "--format",
+        "json",
+    ]
+    if args.npm_registry_url:
+        argv += ["--npm-registry-url", args.npm_registry_url]
+    if args.pypi_registry_url:
+        argv += ["--pypi-registry-url", args.pypi_registry_url]
+
+    state, code, message = "failed", "analysis_failed", ""
+    run_id: int | None = None
+    artifact: str | None = None
+    reused = False
+    try:
+        child = run_child(
+            argv, args.child_timeout_seconds, args.maximum_child_output_bytes
+        )
+        stderr = child.stderr.decode("utf-8", "replace")
+        if child.returncode == 0:
+            payload = json.loads(child.stdout)
+            if payload.get("status") != "completed":
+                raise ValueError("analysis child did not report completed status")
+            run_id = int(payload["analysis_run_id"])
+            artifact = str(payload["artifact_sha256"])
+            if re.fullmatch(r"[0-9a-f]{64}", artifact) is None:
+                raise ValueError("analysis child returned invalid artifact digest")
+            reused = bool(payload.get("reused_existing", False))
+            state, code, message = "completed", None, None
+        else:
+            lowered = stderr.lower()
+            if child.returncode == 5:
+                state = (
+                    "unsupported"
+                    if any(token in lowered for token in (
+                        "unsupported", "wheel", "zip sdist", "yanked"
+                    ))
+                    else "unresolvable"
+                )
+                code = (
+                    "artifact_unsupported"
+                    if state == "unsupported"
+                    else "artifact_unresolvable"
+                )
+            message = stderr or f"analysis child exited with status {child.returncode}"
+    except (OSError, RuntimeError, ValueError, KeyError, json.JSONDecodeError) as exc:
+        message = str(exc)
+
+    with writer_lock(database):
+        db = connect(database)
+        try:
+            try:
+                with db:
+                    if state == "completed":
+                        assert run_id is not None and artifact is not None
+                        verify_run(db, run_id, artifact, profile)
+                    set_result(
+                        db,
+                        key,
+                        package_id,
+                        state,
+                        code,
+                        message,
+                        run_id,
+                        artifact,
+                        reused,
+                    )
+            except (ValueError, sqlite3.Error) as exc:
+                with db:
+                    set_result(
+                        db,
+                        key,
+                        package_id,
+                        "failed",
+                        "result_verification_failed",
+                        str(exc),
+                    )
+        finally:
+            db.close()
+
+
 def execute(args: argparse.Namespace) -> dict[str, Any]:
+    started = time.monotonic()
+    deadline = (
+        started + args.maximum_run_seconds
+        if args.maximum_run_seconds > 0
+        else None
+    )
     database = Path(args.database).resolve()
     profile, key = load_profile(args)
     with writer_lock(database):
@@ -460,129 +635,43 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             with db:
                 register_profile(db, profile, key)
                 synchronize(db, key, profile, args.stale_running_after_seconds)
-            selected = candidates(
-                db,
-                key,
-                args.batch_size,
-                args.maximum_attempts,
-                args.retry_failed_after_seconds,
-            )
         finally:
             db.close()
 
     processed = 0
-    for item in selected:
-        package_id = int(item["package_id"])
-        with writer_lock(database):
-            db = connect(database)
-            try:
-                with db:
-                    set_running(db, key, package_id)
-            finally:
-                db.close()
-
-        argv = [
-            str(Path(args.observatory_binary).resolve()),
-            "analyze",
-            "package",
-            "--database",
-            str(database),
-            "--server",
-            str(item["server_identifier"]),
-            "--version",
-            str(item["server_version"]),
-            "--package",
-            str(item["package_identifier"]),
-            "--evidence-root",
-            str(Path(args.evidence_root).resolve()),
-            "--rules",
-            str(Path(args.rules).resolve()),
-            "--format",
-            "json",
-        ]
-        if args.npm_registry_url:
-            argv += ["--npm-registry-url", args.npm_registry_url]
-        if args.pypi_registry_url:
-            argv += ["--pypi-registry-url", args.pypi_registry_url]
-
-        state, code, message = "failed", "analysis_failed", ""
-        run_id: int | None = None
-        artifact: str | None = None
-        reused = False
-        try:
-            child = run_child(
-                argv, args.child_timeout_seconds, args.maximum_child_output_bytes
-            )
-            stderr = child.stderr.decode("utf-8", "replace")
-            if child.returncode == 0:
-                payload = json.loads(child.stdout)
-                if payload.get("status") != "completed":
-                    raise ValueError("analysis child did not report completed status")
-                run_id = int(payload["analysis_run_id"])
-                artifact = str(payload["artifact_sha256"])
-                if re.fullmatch(r"[0-9a-f]{64}", artifact) is None:
-                    raise ValueError("analysis child returned invalid artifact digest")
-                reused = bool(payload.get("reused_existing", False))
-                state, code, message = "completed", None, None
-            else:
-                lowered = stderr.lower()
-                if child.returncode == 5:
-                    state = (
-                        "unsupported"
-                        if any(token in lowered for token in (
-                            "unsupported", "wheel", "zip sdist", "yanked"
-                        ))
-                        else "unresolvable"
-                    )
-                    code = (
-                        "artifact_unsupported"
-                        if state == "unsupported"
-                        else "artifact_unresolvable"
-                    )
-                message = stderr or f"analysis child exited with status {child.returncode}"
-        except (OSError, RuntimeError, ValueError, KeyError, json.JSONDecodeError) as exc:
-            message = str(exc)
-
-        with writer_lock(database):
-            db = connect(database)
-            try:
-                try:
-                    with db:
-                        if state == "completed":
-                            assert run_id is not None and artifact is not None
-                            verify_run(db, run_id, artifact, profile)
-                        set_result(
-                            db,
-                            key,
-                            package_id,
-                            state,
-                            code,
-                            message,
-                            run_id,
-                            artifact,
-                            reused,
-                        )
-                except (ValueError, sqlite3.Error) as exc:
-                    with db:
-                        set_result(
-                            db,
-                            key,
-                            package_id,
-                            "failed",
-                            "result_verification_failed",
-                            str(exc),
-                        )
-            finally:
-                db.close()
+    stop_reason = "batch_limit"
+    while processed < args.batch_size:
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= args.child_timeout_seconds:
+                stop_reason = "time_budget"
+                break
+        item = claim_next(database, key, args)
+        if item is None:
+            stop_reason = "queue_empty"
+            break
+        analyze_claimed(database, key, profile, item, args)
         processed += 1
 
+    elapsed = max(0.0, time.monotonic() - started)
     with writer_lock(database):
         db = connect(database)
         try:
             result = summary(db, key)
+            queued = remaining_queue(db, key, args.maximum_attempts)
         finally:
             db.close()
     result["processed_in_batch"] = processed
+    result["remaining_queue_records"] = queued
+    result["run_elapsed_seconds"] = round(elapsed, 3)
+    result["stop_reason"] = stop_reason
+    if processed > 0:
+        mean = elapsed / processed
+        result["mean_seconds_per_processed_record"] = round(mean, 3)
+        result["estimated_remaining_seconds"] = round(mean * queued)
+    else:
+        result["mean_seconds_per_processed_record"] = None
+        result["estimated_remaining_seconds"] = None
     return result
 
 
@@ -593,6 +682,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rules", default="rules/artifact-static-analysis-v1.json")
     parser.add_argument("--evidence-root", default="evidence")
     parser.add_argument("--batch-size", type=int, default=25)
+    parser.add_argument("--maximum-run-seconds", type=int, default=0)
     parser.add_argument("--maximum-attempts", type=int, default=3)
     parser.add_argument("--retry-failed-after-seconds", type=int, default=86400)
     parser.add_argument("--stale-running-after-seconds", type=int, default=3600)
@@ -614,6 +704,15 @@ def parse_args() -> argparse.Namespace:
     ):
         if getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
+    if args.maximum_run_seconds < 0:
+        parser.error("--maximum-run-seconds must be non-negative")
+    if (
+        args.maximum_run_seconds > 0
+        and args.maximum_run_seconds <= args.child_timeout_seconds
+    ):
+        parser.error(
+            "--maximum-run-seconds must exceed --child-timeout-seconds"
+        )
     if args.retry_failed_after_seconds < 0 or args.stale_running_after_seconds < 0:
         parser.error("retry and stale durations must be non-negative")
     return args
