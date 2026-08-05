@@ -24,6 +24,38 @@ jobs:
           ref: fix/static-analysis-production-hardening
           fetch-depth: 0
 
+      - name: Fix one-shot generator ambiguity
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('.github/scripts/apply_static_analysis_production_hardening.py')
+          text = path.read_text(encoding='utf-8')
+          helper_marker = '''def append_before(relative: str, marker: str, addition: str) -> None:
+          '''
+          helper = '''def replace_first(relative: str, old: str, new: str) -> None:
+              value = read(relative)
+              if old not in value:
+                  raise RuntimeError(f"{relative}: replacement target not found")
+              write(relative, value.replace(old, new, 1))
+
+
+          '''
+          if 'def replace_first(' not in text:
+              text = text.replace(helper_marker, helper + helper_marker, 1)
+          target = '''    replace_once(
+                  "tests/test_bulk_static_analysis.py",
+                  "    (row[0], row[1], %r),\\n",
+          '''
+          replacement = '''    replace_first(
+                  "tests/test_bulk_static_analysis.py",
+                  "    (row[0], row[1], %r),\\n",
+          '''
+          if target not in text:
+              raise SystemExit('ambiguous replacement call not found')
+          path.write_text(text.replace(target, replacement, 1), encoding='utf-8')
+          PY
+
       - name: Apply reviewed patch
         run: python3 .github/scripts/apply_static_analysis_production_hardening.py
 
