@@ -85,6 +85,19 @@ process. New package records discovered after a later refresh receive a newer
 maintenance timer continues draining the historical backlog after the newly
 published records are handled.
 
+Create the dedicated service account before installing the example unit:
+
+```bash
+sudo useradd --system --home /nonexistent --shell /usr/sbin/nologin mcp-analysis
+sudo usermod --append --groups mcp-catalog,docker mcp-analysis
+sudo install -d -o mcp-analysis -g mcp-catalog -m 0750 \
+  /var/lib/mcp-observatory/evidence
+```
+
+The catalog directory and database must remain group-writable by the analysis
+service while the public portal keeps read-only group access. Verify the deployed
+ownership and modes rather than applying the example commands blindly.
+
 Install the example units using paths appropriate for the deployment, then run:
 
 ```bash
