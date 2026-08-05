@@ -3,6 +3,7 @@ Description=MCP Observatory incremental registry refresh
 Documentation=file:/opt/mcp-observatory/docs/registry-maintenance.md
 Wants=network-online.target
 After=network-online.target
+OnSuccess=mcp-observatory-static-analysis.service
 
 [Service]
 Type=oneshot
