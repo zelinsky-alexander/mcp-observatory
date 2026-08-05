@@ -1,24 +1,27 @@
 [Unit]
-Description=MCP Observatory incremental registry refresh
-Documentation=file:/opt/mcp-observatory/current/docs/registry-maintenance.md
+Description=MCP Observatory bounded static artifact analysis
+Documentation=file:/opt/mcp-observatory/current/docs/bulk-static-analysis.md
 Wants=network-online.target
-After=network-online.target
-OnSuccess=mcp-observatory-static-analysis.service
+After=network-online.target mcp-observatory-refresh.service
 
 [Service]
 Type=oneshot
 User=mcp-refresh
 Group=mcp-refresh
-SupplementaryGroups=mcp-catalog
+SupplementaryGroups=mcp-catalog docker
 WorkingDirectory=/opt/mcp-observatory/current
 Environment=MCPO_PROJECT_DIR=/opt/mcp-observatory/current
 Environment=MCPO_BINARY=/opt/mcp-observatory/current/build/release/mcp-observatory
 Environment=MCPO_DATABASE=/var/lib/mcp-observatory/catalog/local-registry.sqlite
-Environment=MCPO_REFRESH_RUNTIME_DIR=/var/lib/mcp-observatory/registry-refresh
-Environment=MCPO_LOCAL_TIMEZONE=Asia/Jerusalem
-Environment=MCPO_BACKUP_RETENTION_COUNT=2
-Environment=MCPO_CATALOG_GROUP=mcp-catalog
-ExecStart=/bin/bash /opt/mcp-observatory/current/scripts/daily_registry_refresh.sh
+Environment=MCPO_EVIDENCE_ROOT=/var/lib/mcp-observatory/evidence
+Environment=MCPO_STATIC_ANALYSIS_RULES=/opt/mcp-observatory/current/rules/artifact-static-analysis-v1.json
+Environment=MCPO_STATIC_ANALYSIS_BATCH_SIZE=1000
+Environment=MCPO_STATIC_ANALYSIS_MAXIMUM_RUN_SECONDS=3000
+Environment=MCPO_STATIC_ANALYSIS_CHILD_TIMEOUT_SECONDS=300
+Environment=MCPO_STATIC_ANALYSIS_MAXIMUM_ATTEMPTS=3
+Environment=MCPO_STATIC_ANALYSIS_RETRY_FAILED_AFTER_SECONDS=86400
+Environment=MCPO_STATIC_ANALYSIS_STALE_RUNNING_AFTER_SECONDS=3600
+ExecStart=/bin/bash /opt/mcp-observatory/current/scripts/run_static_analysis_queue.sh
 UMask=0027
 
 NoNewPrivileges=yes
@@ -43,7 +46,7 @@ CapabilityBoundingSet=
 AmbientCapabilities=
 IPAddressDeny=link-local
 
-TimeoutStartSec=20min
+TimeoutStartSec=55min
 KillMode=control-group
 KillSignal=SIGTERM
 SendSIGKILL=yes

@@ -2,8 +2,8 @@
 Description=Daily MCP Observatory incremental registry refresh
 
 [Timer]
-OnCalendar=*-*-* 03:17:00 UTC
-RandomizedDelaySec=30min
+OnCalendar=*-*-* 06:00:00 Asia/Jerusalem
+RandomizedDelaySec=10min
 AccuracySec=1min
 Persistent=yes
 Unit=mcp-observatory-refresh.service

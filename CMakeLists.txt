@@ -98,4 +98,20 @@ if(MCPO_BUILD_TESTS)
         COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_runtime_discovery.py
     )
+    add_test(
+        NAME mcpo_bulk_static_analysis_tests
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_bulk_static_analysis.py
+    )
+    add_test(
+        NAME mcpo_static_analysis_installer_syntax
+        COMMAND bash -n
+            ${CMAKE_CURRENT_SOURCE_DIR}/scripts/install_static_analysis_scheduler.sh
+    )
+    add_test(
+        NAME mcpo_static_analysis_installer_help
+        COMMAND bash
+            ${CMAKE_CURRENT_SOURCE_DIR}/scripts/install_static_analysis_scheduler.sh
+            --help
+    )
 endif()
