@@ -98,4 +98,9 @@ if(MCPO_BUILD_TESTS)
         COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_runtime_discovery.py
     )
+    add_test(
+        NAME mcpo_bulk_static_analysis_tests
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_bulk_static_analysis.py
+    )
 endif()
