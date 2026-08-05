@@ -85,18 +85,21 @@ process. New package records discovered after a later refresh receive a newer
 maintenance timer continues draining the historical backlog after the newly
 published records are handled.
 
-Create the dedicated service account before installing the example unit:
+The example runs analysis as `mcp-refresh`, the existing catalog writer. This
+preserves the deployed `0640 mcp-refresh:mcp-catalog` database boundary: the
+public portal remains group-read-only while the writer account can append analysis
+records. The writer account must also be able to invoke the Docker daemon and own
+the evidence directory:
 
 ```bash
-sudo useradd --system --home /nonexistent --shell /usr/sbin/nologin mcp-analysis
-sudo usermod --append --groups mcp-catalog,docker mcp-analysis
-sudo install -d -o mcp-analysis -g mcp-catalog -m 0750 \
+sudo usermod --append --groups docker mcp-refresh
+sudo install -d -o mcp-refresh -g mcp-catalog -m 0750 \
   /var/lib/mcp-observatory/evidence
 ```
 
-The catalog directory and database must remain group-writable by the analysis
-service while the public portal keeps read-only group access. Verify the deployed
-ownership and modes rather than applying the example commands blindly.
+Group membership changes require a service restart or a new login/session. Verify
+the deployed ownership and modes rather than applying the example commands
+blindly.
 
 Install the example units using paths appropriate for the deployment, then run:
 
@@ -109,10 +112,10 @@ A successful registry refresh also requests the analysis service immediately. If
 that service is already active, systemd does not start a duplicate instance; the
 next candidate selection sees the newly published catalog records.
 
-The example uses a dedicated `mcp-analysis` service account and grants it the
-`mcp-catalog` and `docker` supplementary groups. Docker daemon access is a major
-privilege boundary and should be reviewed carefully. A rootless Docker daemon or
-a dedicated analysis host is preferable for a hardened public deployment.
+Docker daemon access is a major privilege boundary. A rootless Docker daemon or a
+dedicated analysis host is preferable for a hardened public deployment. Until
+then, the public portal must remain a separate unprivileged account with no Docker
+or catalog-write access.
 
 ## Backfill duration
 
