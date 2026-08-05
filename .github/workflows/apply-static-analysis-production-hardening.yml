@@ -43,17 +43,11 @@ jobs:
           '''
           if 'def replace_first(' not in text:
               text = text.replace(helper_marker, helper + helper_marker, 1)
-          target = '''    replace_once(
-                  "tests/test_bulk_static_analysis.py",
-                  "    (row[0], row[1], %r),\\n",
-          '''
-          replacement = '''    replace_first(
-                  "tests/test_bulk_static_analysis.py",
-                  "    (row[0], row[1], %r),\\n",
-          '''
-          if target not in text:
-              raise SystemExit('ambiguous replacement call not found')
-          path.write_text(text.replace(target, replacement, 1), encoding='utf-8')
+          start = text.index('def patch_bulk_tests() -> None:')
+          end = text.index('def patch_analyze_cli_test() -> None:')
+          block = text[start:end].replace('    replace_once(\n', '    replace_first(\n')
+          text = text[:start] + block + text[end:]
+          path.write_text(text, encoding='utf-8')
           PY
 
       - name: Apply reviewed patch
