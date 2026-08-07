@@ -1,8 +1,25 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+usage() {
+  cat <<'EOF'
+Usage: run_storage_v2_runtime_observation.sh <server-identifier> <server-version> <package-identifier>
+
+Runs one bounded existing runtime-discovery observation against the isolated
+Storage v2 history database, then publishes/verifies the compact hot catalog.
+No MCP tool is invoked by this wrapper.
+
+Important override for side-branch testing:
+  MCPO_NATIVE_GUARD_BINARY=/opt/mcp-storage-v2-test/mcp-native-guard/build/release/mcp-native-guard
+EOF
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
 if [[ $# -ne 3 ]]; then
-  echo "usage: $0 <server-identifier> <server-version> <package-identifier>" >&2
+  usage >&2
   exit 2
 fi
 
@@ -34,6 +51,8 @@ sudo -u mcp-refresh python3 "$project_dir/tools/runtime_discovery.py" observe \
   --timeout "$timeout"
 
 sudo -u mcp-refresh python3 "$project_dir/tools/storage_v2_mvp.py" publish \
+  --history "$history_db" --hot "$hot_db"
+sudo -u mcp-refresh python3 "$project_dir/tools/storage_v2_mvp.py" verify \
   --history "$history_db" --hot "$hot_db"
 
 echo "runtime observation published to Storage v2 hot catalog"
