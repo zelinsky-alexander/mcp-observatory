@@ -119,6 +119,11 @@ if(MCPO_BUILD_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_storage_v2_registry_sync.py
     )
     add_test(
+        NAME mcpo_storage_v2_reconcile_tests
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_storage_v2_reconcile.py
+    )
+    add_test(
         NAME mcpo_storage_v2_prepare_script_syntax
         COMMAND bash -n
             ${CMAKE_CURRENT_SOURCE_DIR}/scripts/prepare_storage_v2_sidecar.sh
