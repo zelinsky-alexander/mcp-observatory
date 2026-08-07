@@ -42,6 +42,10 @@ echo "[storage-v2-refresh] synchronizing analysis schedule without executing art
 sudo -u mcp-refresh python3 "$project_dir/tools/storage_v2_sync_schedule.py" \
   --database "$history_db" --rules "$rules"
 
+echo "[storage-v2-refresh] reconciling canonical coverage"
+sudo -u mcp-refresh python3 "$project_dir/tools/storage_v2_reconcile.py" \
+  --database "$history_db"
+
 echo "[storage-v2-refresh] publishing updated summaries"
 sudo -u mcp-refresh python3 "$project_dir/tools/storage_v2_mvp.py" publish \
   --history "$history_db" --hot "$hot_db"
