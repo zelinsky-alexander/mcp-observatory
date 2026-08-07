@@ -55,6 +55,7 @@ def main() -> int:
     here = Path(__file__).resolve().parent
     scheduler = here / "bulk_static_analysis.py"
     foundation = here / "storage_v2_foundation.py"
+    reconcile = here / "storage_v2_reconcile.py"
     mvp = here / "storage_v2_mvp.py"
     if args.batch_size < 1 or args.batch_size > 1000:
         raise ValueError("batch size must be between 1 and 1000")
@@ -117,6 +118,19 @@ def main() -> int:
         sys.stderr.write(materialize.stderr)
         return materialize.returncode
 
+    # The schedule is package-oriented and can map multiple package records to
+    # one reused canonical analysis run. Reconcile global finding/review counts
+    # once per distinct run before publishing the portal read model.
+    reconciled = run_checked([
+        sys.executable,
+        str(reconcile),
+        "--database",
+        str(args.history_database),
+    ])
+    if reconciled.returncode != 0:
+        sys.stderr.write(reconciled.stderr)
+        return reconciled.returncode
+
     bundle_result = None
     if args.bundle_limit:
         if args.bundle_root is None:
@@ -139,8 +153,8 @@ def main() -> int:
             return bundled.returncode
         bundle_result = json.loads(bundled.stdout)
 
-    # Publish after bundling so evidence manifests and all materialized counters
-    # reach the compact hot database in the same visible generation.
+    # Publish after reconciliation/bundling so the hot catalog sees one coherent
+    # visible generation of summary counters and evidence manifest references.
     publish = run_checked([
         sys.executable,
         str(mvp),
@@ -157,6 +171,7 @@ def main() -> int:
     result = {
         "scheduler": json.loads(child.stdout),
         "materialize": materialize.stdout.strip(),
+        "reconciled": json.loads(reconciled.stdout),
         "published": json.loads(publish.stdout),
         "bundles": bundle_result,
     }
