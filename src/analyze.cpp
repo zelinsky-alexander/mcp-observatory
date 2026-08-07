@@ -2760,6 +2760,60 @@ AnalyzeError resolve_exact_package(
     return AnalyzeError::none;
 }
 
+AnalyzeError resolve_package_by_id(
+    const std::filesystem::path& database_path,
+    std::int64_t package_id,
+    ResolvedPackage& resolved,
+    std::string& error) {
+    if (package_id <= 0) {
+        error = "package id must be positive";
+        return AnalyzeError::invalid_arguments;
+    }
+    Database database;
+    if (!database.open(
+            database_path, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, error))
+        return AnalyzeError::database;
+    Statement query;
+    if (!query.prepare(
+            database,
+            "SELECT p.id,p.server_version_id,sv.server_identifier,"
+            "sv.server_version,p.registry_type,p.identifier,p.version,"
+            "p.transport FROM packages p JOIN server_versions sv "
+            "ON sv.id=p.server_version_id WHERE p.id=?1;",
+            error) ||
+        !query.bind_int64(1, package_id, error))
+        return AnalyzeError::database;
+    const int selected = query.step();
+    if (selected == SQLITE_DONE) {
+        error = "exact package record not found for package id";
+        return AnalyzeError::package_not_found;
+    }
+    if (selected != SQLITE_ROW) {
+        error = sqlite_message(database.get(), "resolve package id");
+        return AnalyzeError::database;
+    }
+    ResolvedPackage row;
+    row.package_id = query.integer(0);
+    row.server_version_id = query.integer(1);
+    row.server_identifier = query.text(2);
+    row.server_version = query.text(3);
+    row.registry_type = query.text(4);
+    row.package_identifier = query.text(5);
+    if (!query.is_null(6)) row.package_version = query.text(6);
+    row.transport = query.text(7);
+    if (row.registry_type != "npm" && row.registry_type != "pypi") {
+        error = "unsupported registry type for package analysis v1: " +
+            row.registry_type;
+        return AnalyzeError::unsupported_registry;
+    }
+    if (!row.package_version || row.package_version->empty()) {
+        error = "exact package version is required; refusing to select latest";
+        return AnalyzeError::missing_version;
+    }
+    resolved = std::move(row);
+    return AnalyzeError::none;
+}
+
 int analyze_worker_main(
     std::string_view registry_type,
     const std::filesystem::path& tarball,
@@ -3310,21 +3364,34 @@ AnalyzePackageResult analyze_package(
     const AnalyzePackageOptions& options,
     AnalyzeDownloadTransport download,
     AnalyzeWorkerRunner worker) {
-    if (options.database.empty() || options.server_identifier.empty() ||
-        options.server_version.empty() || options.package_identifier.empty())
+    const bool have_triplet =
+        !options.server_identifier.empty() &&
+        !options.server_version.empty() &&
+        !options.package_identifier.empty();
+    const bool have_any_triplet =
+        !options.server_identifier.empty() ||
+        !options.server_version.empty() ||
+        !options.package_identifier.empty();
+    if (options.database.empty() ||
+        (options.package_id.has_value() && have_any_triplet) ||
+        (!options.package_id.has_value() && !have_triplet))
         return failure_result(
             AnalyzeError::invalid_arguments,
-            "analyze package requires --database --server --version --package");
+            "analyze package requires --database and exactly one selector: "
+            "--package-id or --server/--version/--package");
 
     ResolvedPackage package;
     std::string error;
-    const AnalyzeError resolved = resolve_exact_package(
-        options.database,
-        options.server_identifier,
-        options.server_version,
-        options.package_identifier,
-        package,
-        error);
+    const AnalyzeError resolved = options.package_id.has_value()
+        ? resolve_package_by_id(
+              options.database, *options.package_id, package, error)
+        : resolve_exact_package(
+              options.database,
+              options.server_identifier,
+              options.server_version,
+              options.package_identifier,
+              package,
+              error);
     if (resolved != AnalyzeError::none) return failure_result(resolved, error);
 
     AnalysisRules rules;
