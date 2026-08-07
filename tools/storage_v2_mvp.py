@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Build and operate a side-by-side Storage v2 MVP.
 
-The live v1 catalog is never modified by this tool.  It can:
+The live v1 catalog is never modified by this tool. It can:
 
 * clone a source catalog into an authoritative history/control database;
 * install/backfill the additive Storage v2 summary schema there;
 * derive a compact hot catalog by removing bulky v1 detail rows and VACUUMing;
 * publish newly completed analysis/runtime summary rows from history to hot;
-* create deterministic compressed evidence bundles without artifact.tgz or
-  duplicated analysis-rules.json;
+* create deterministic content-addressed evidence bundles without artifact.tgz
+  or duplicated analysis-rules.json and register their locators;
 * verify summary equivalence between history and hot catalogs.
 
 Only Python's standard library and SQLite are used.
@@ -25,7 +25,6 @@ import importlib.util
 import json
 import os
 from pathlib import Path
-import shutil
 import sqlite3
 import tarfile
 import tempfile
@@ -33,10 +32,6 @@ from typing import Any, Iterator
 
 MAX_BUNDLE_FILE_BYTES = 16 * 1024 * 1024
 DEFAULT_EXCLUDED = {"artifact.tgz", "analysis-rules.json"}
-
-
-def canonical(value: Any) -> bytes:
-    return (json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
 
 
 def sha256_file(path: Path) -> str:
@@ -218,13 +213,9 @@ def verify(history: Path, hot: Path) -> dict[str, Any]:
     try:
         metrics: dict[str, Any] = {}
         for table in (
-            "snapshots",
-            "server_versions",
-            "packages",
-            "analysis_runs",
-            "analysis_v2_run_summaries",
-            "analysis_v2_rule_definitions",
-            "analysis_v2_rule_summaries",
+            "snapshots", "server_versions", "packages", "analysis_runs",
+            "analysis_v2_run_summaries", "analysis_v2_rule_definitions",
+            "analysis_v2_rule_summaries", "analysis_v2_evidence_manifests",
             "runtime_observation_runs",
         ):
             if _table_exists(h, table) and _table_exists(p, table):
@@ -239,6 +230,15 @@ def verify(history: Path, hot: Path) -> dict[str, Any]:
                 "SELECT * FROM analysis_v2_coverage_summary ORDER BY profile_key"
             )]
             metrics["coverage_equal"] = left == right
+        metrics["hot_detail_rows"] = {}
+        for table in (
+            "analysis_files", "analysis_findings", "analysis_dependencies",
+            "analysis_evidence", "analysis_artifacts",
+        ):
+            if _table_exists(p, table):
+                metrics["hot_detail_rows"][table] = int(
+                    p.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                )
         metrics["history_bytes"] = history.stat().st_size
         metrics["hot_bytes"] = hot.stat().st_size
         metrics["size_ratio"] = round(metrics["hot_bytes"] / max(1, metrics["history_bytes"]), 4)
@@ -286,7 +286,65 @@ def deterministic_bundle(source_dir: Path, destination: Path) -> dict[str, Any]:
     }
 
 
-def bundle_evidence(source_root: Path, destination_root: Path, limit: int) -> list[dict[str, Any]]:
+def content_address_bundle(source_dir: Path, destination_root: Path) -> dict[str, Any]:
+    destination_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="mcpo-v2-bundle-", dir=destination_root) as temporary:
+        candidate = Path(temporary) / "evidence.tar.gz"
+        result = deterministic_bundle(source_dir, candidate)
+        digest = result["bundle_sha256"]
+        final = destination_root / "sha256" / digest[:2] / f"{digest}.tar.gz"
+        final.parent.mkdir(parents=True, exist_ok=True)
+        if final.exists():
+            if sha256_file(final) != digest:
+                raise RuntimeError(f"existing content-addressed bundle has wrong digest: {final}")
+        else:
+            os.replace(candidate, final)
+        result["bundle"] = str(final)
+        result["bundle_bytes"] = final.stat().st_size
+        return result
+
+
+def _register_bundle_for_artifact(
+    database: Path, artifact_sha256: str, result: dict[str, Any], destination_root: Path,
+    inventory_sha256: str | None,
+) -> int:
+    with writer_lock(database):
+        db = connect(database)
+        try:
+            if not _table_exists(db, "analysis_v2_evidence_manifests"):
+                raise RuntimeError("Storage v2 foundation is not installed")
+            runs = db.execute(
+                """SELECT id FROM analysis_runs
+                   WHERE status='completed' AND artifact_sha256=?
+                   ORDER BY id""",
+                (artifact_sha256,),
+            ).fetchall()
+            locator = Path(result["bundle"]).resolve().relative_to(destination_root.resolve()).as_posix()
+            with db:
+                for row in runs:
+                    db.execute(
+                        """INSERT INTO analysis_v2_evidence_manifests(
+                             analysis_run_id,storage_kind,locator,bundle_sha256,
+                             inventory_sha256,retained_artifact)
+                           VALUES(?,'bundle',?,?,?,0)
+                           ON CONFLICT(analysis_run_id) DO UPDATE SET
+                             storage_kind='bundle',locator=excluded.locator,
+                             bundle_sha256=excluded.bundle_sha256,
+                             inventory_sha256=excluded.inventory_sha256,
+                             retained_artifact=0,updated_at=CURRENT_TIMESTAMP""",
+                        (int(row["id"]), locator, result["bundle_sha256"], inventory_sha256),
+                    )
+            return len(runs)
+        finally:
+            db.close()
+
+
+def bundle_evidence(
+    source_root: Path,
+    destination_root: Path,
+    limit: int,
+    history_database: Path | None = None,
+) -> list[dict[str, Any]]:
     sha_root = source_root / "artifacts" / "sha256"
     if not sha_root.is_dir():
         raise RuntimeError(f"artifact evidence root not found: {sha_root}")
@@ -297,10 +355,16 @@ def bundle_evidence(source_root: Path, destination_root: Path, limit: int) -> li
         for artifact in sorted(prefix.iterdir()):
             if not artifact.is_dir() or len(artifact.name) != 64:
                 continue
-            destination = destination_root / "sha256" / artifact.name[:2] / f"{artifact.name}.tar.gz"
-            if destination.exists():
-                continue
-            results.append(deterministic_bundle(artifact, destination))
+            result = content_address_bundle(artifact, destination_root)
+            inventory = artifact / "archive-inventory.json"
+            inventory_sha = sha256_file(inventory) if inventory.is_file() else None
+            result["artifact_sha256"] = artifact.name
+            result["registered_runs"] = 0
+            if history_database is not None:
+                result["registered_runs"] = _register_bundle_for_artifact(
+                    history_database, artifact.name, result, destination_root, inventory_sha
+                )
+            results.append(result)
             if limit and len(results) >= limit:
                 return results
     return results
@@ -315,12 +379,9 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
     sizes = compact_hot_catalog(history, hot)
     published = publish_summaries(history, hot)
     return {
-        "history": str(history),
-        "hot": str(hot),
-        "backfilled_runs": backfilled,
-        "hot_compaction": sizes,
-        "published": published,
-        "verification": verify(history, hot),
+        "history": str(history), "hot": str(hot),
+        "backfilled_runs": backfilled, "hot_compaction": sizes,
+        "published": published, "verification": verify(history, hot),
     }
 
 
@@ -345,6 +406,7 @@ def parse_args() -> argparse.Namespace:
     p = sub.add_parser("bundle-evidence", help="build deterministic compact evidence bundles")
     p.add_argument("--source-root", required=True, type=Path)
     p.add_argument("--destination-root", required=True, type=Path)
+    p.add_argument("--history-database", type=Path)
     p.add_argument("--limit", type=int, default=100)
 
     return parser.parse_args()
@@ -363,7 +425,10 @@ def main() -> int:
     elif args.command == "verify":
         result = verify(args.history.resolve(), args.hot.resolve())
     else:
-        result = bundle_evidence(args.source_root.resolve(), args.destination_root.resolve(), args.limit)
+        result = bundle_evidence(
+            args.source_root.resolve(), args.destination_root.resolve(), args.limit,
+            args.history_database.resolve() if args.history_database else None,
+        )
     print(json.dumps(result, sort_keys=True, separators=(",", ":")))
     return 0
 
