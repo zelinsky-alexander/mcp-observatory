@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Run bounded static analysis against the v2 history store and publish summaries.
 
-This is the side-by-side MVP writer path.  The existing analyzer writes detailed
+This is the side-by-side MVP writer path. The existing analyzer writes detailed
 v1 evidence only to the history/control database and the dedicated v2 evidence
-root.  Compact summaries are then materialized and copied to the hot catalog.
-The hot catalog never receives analysis_files/findings/dependencies/evidence rows.
+root. Compact summaries and content-addressed evidence-manifest references are
+then copied to the hot catalog. The hot catalog never receives v1 detail rows.
 """
 
 from __future__ import annotations
@@ -17,7 +17,13 @@ import sys
 
 
 def run_checked(argv: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(argv, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    return subprocess.run(
+        argv,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -34,8 +40,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--retry-failed-after-seconds", type=int, default=86400)
     parser.add_argument("--npm-registry-url")
     parser.add_argument("--pypi-registry-url")
-    parser.add_argument("--bundle-limit", type=int, default=0,
-                        help="optionally bundle up to N newly available legacy evidence directories")
+    parser.add_argument(
+        "--bundle-limit",
+        type=int,
+        default=0,
+        help="optionally bundle up to N evidence directories",
+    )
     parser.add_argument("--bundle-root", type=Path)
     return parser.parse_args()
 
@@ -49,9 +59,11 @@ def main() -> int:
     if args.batch_size < 1 or args.batch_size > 1000:
         raise ValueError("batch size must be between 1 and 1000")
 
-    # Ensure triggers exist before the analyzer writes new rows.
     init = run_checked([
-        sys.executable, str(foundation), "--database", str(args.history_database),
+        sys.executable,
+        str(foundation),
+        "--database",
+        str(args.history_database),
         "--refresh-coverage",
     ])
     if init.returncode != 0:
@@ -59,17 +71,28 @@ def main() -> int:
         return init.returncode
 
     argv = [
-        sys.executable, str(scheduler),
-        "--database", str(args.history_database),
-        "--observatory-binary", str(args.observatory_binary),
-        "--rules", str(args.rules),
-        "--evidence-root", str(args.evidence_root),
-        "--batch-size", str(args.batch_size),
-        "--maximum-run-seconds", str(args.maximum_run_seconds),
-        "--child-timeout-seconds", str(args.child_timeout_seconds),
-        "--maximum-attempts", str(args.maximum_attempts),
-        "--retry-failed-after-seconds", str(args.retry_failed_after_seconds),
-        "--format", "json",
+        sys.executable,
+        str(scheduler),
+        "--database",
+        str(args.history_database),
+        "--observatory-binary",
+        str(args.observatory_binary),
+        "--rules",
+        str(args.rules),
+        "--evidence-root",
+        str(args.evidence_root),
+        "--batch-size",
+        str(args.batch_size),
+        "--maximum-run-seconds",
+        str(args.maximum_run_seconds),
+        "--child-timeout-seconds",
+        str(args.child_timeout_seconds),
+        "--maximum-attempts",
+        str(args.maximum_attempts),
+        "--retry-failed-after-seconds",
+        str(args.retry_failed_after_seconds),
+        "--format",
+        "json",
     ]
     if args.npm_registry_url:
         argv += ["--npm-registry-url", args.npm_registry_url]
@@ -81,39 +104,55 @@ def main() -> int:
         sys.stderr.write(child.stderr)
         return child.returncode
 
-    # Backfill is normally zero here because triggers dual-write new runs, but
-    # bounded backfill also repairs results produced before the foundation was installed.
     materialize = run_checked([
-        sys.executable, str(foundation), "--database", str(args.history_database),
-        "--backfill-batch-size", str(max(100, args.batch_size * 4)),
+        sys.executable,
+        str(foundation),
+        "--database",
+        str(args.history_database),
+        "--backfill-batch-size",
+        str(max(100, args.batch_size * 4)),
         "--refresh-coverage",
     ])
     if materialize.returncode != 0:
         sys.stderr.write(materialize.stderr)
         return materialize.returncode
 
-    publish = run_checked([
-        sys.executable, str(mvp), "publish",
-        "--history", str(args.history_database), "--hot", str(args.hot_database),
-    ])
-    if publish.returncode != 0:
-        sys.stderr.write(publish.stderr)
-        return publish.returncode
-
     bundle_result = None
     if args.bundle_limit:
         if args.bundle_root is None:
             raise ValueError("--bundle-root is required when --bundle-limit is non-zero")
         bundled = run_checked([
-            sys.executable, str(mvp), "bundle-evidence",
-            "--source-root", str(args.evidence_root),
-            "--destination-root", str(args.bundle_root),
-            "--limit", str(args.bundle_limit),
+            sys.executable,
+            str(mvp),
+            "bundle-evidence",
+            "--source-root",
+            str(args.evidence_root),
+            "--destination-root",
+            str(args.bundle_root),
+            "--history-database",
+            str(args.history_database),
+            "--limit",
+            str(args.bundle_limit),
         ])
         if bundled.returncode != 0:
             sys.stderr.write(bundled.stderr)
             return bundled.returncode
         bundle_result = json.loads(bundled.stdout)
+
+    # Publish after bundling so evidence manifests and all materialized counters
+    # reach the compact hot database in the same visible generation.
+    publish = run_checked([
+        sys.executable,
+        str(mvp),
+        "publish",
+        "--history",
+        str(args.history_database),
+        "--hot",
+        str(args.hot_database),
+    ])
+    if publish.returncode != 0:
+        sys.stderr.write(publish.stderr)
+        return publish.returncode
 
     result = {
         "scheduler": json.loads(child.stdout),
