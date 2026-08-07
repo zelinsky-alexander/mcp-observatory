@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Additive Storage v2 foundation for static-analysis results.
 
-This module intentionally leaves the v1 analysis tables authoritative.  It adds
-compact read-model tables plus SQLite triggers so existing writers dual-write
-v1 detail and v2 summaries without changing the analyzer yet.
+The v1 detail tables remain authoritative in the history/control database. This
+module adds compact read-model tables and triggers so existing writers dual-write
+summaries without changing the analyzer. The hot portal catalog can then keep
+only these summaries while detailed rows remain in history.
 
 No third-party dependencies are used.
 """
@@ -18,7 +19,7 @@ from pathlib import Path
 import sqlite3
 from typing import Iterator
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 DDL = r"""
 CREATE TABLE IF NOT EXISTS storage_v2_info(
@@ -60,6 +61,8 @@ CREATE TABLE IF NOT EXISTS analysis_v2_run_summaries(
     generated_count INTEGER NOT NULL DEFAULT 0 CHECK(generated_count >= 0),
     minified_count INTEGER NOT NULL DEFAULT 0 CHECK(minified_count >= 0),
     unreviewed_count INTEGER NOT NULL DEFAULT 0 CHECK(unreviewed_count >= 0),
+    unreviewed_high_count INTEGER NOT NULL DEFAULT 0 CHECK(unreviewed_high_count >= 0),
+    unreviewed_critical_count INTEGER NOT NULL DEFAULT 0 CHECK(unreviewed_critical_count >= 0),
     suspicious_count INTEGER NOT NULL DEFAULT 0 CHECK(suspicious_count >= 0),
     confirmed_risk_count INTEGER NOT NULL DEFAULT 0 CHECK(confirmed_risk_count >= 0),
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -94,6 +97,7 @@ CREATE TABLE IF NOT EXISTS analysis_v2_coverage_summary(
     unsupported_package_records INTEGER NOT NULL DEFAULT 0,
     unresolvable_package_records INTEGER NOT NULL DEFAULT 0,
     never_attempted_package_records INTEGER NOT NULL DEFAULT 0,
+    running_package_records INTEGER NOT NULL DEFAULT 0,
     unique_artifacts_analyzed INTEGER NOT NULL DEFAULT 0,
     info_findings INTEGER NOT NULL DEFAULT 0,
     low_findings INTEGER NOT NULL DEFAULT 0,
@@ -101,12 +105,22 @@ CREATE TABLE IF NOT EXISTS analysis_v2_coverage_summary(
     high_findings INTEGER NOT NULL DEFAULT 0,
     critical_findings INTEGER NOT NULL DEFAULT 0,
     unreviewed_findings INTEGER NOT NULL DEFAULT 0,
+    unreviewed_high_or_critical_findings INTEGER NOT NULL DEFAULT 0,
     suspicious_findings INTEGER NOT NULL DEFAULT 0,
     confirmed_risk_findings INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+"""
 
-CREATE TRIGGER IF NOT EXISTS analysis_v2_runs_insert
+TRIGGERS = r"""
+DROP TRIGGER IF EXISTS analysis_v2_runs_insert;
+DROP TRIGGER IF EXISTS analysis_v2_runs_update;
+DROP TRIGGER IF EXISTS analysis_v2_files_insert;
+DROP TRIGGER IF EXISTS analysis_v2_dependencies_insert;
+DROP TRIGGER IF EXISTS analysis_v2_findings_insert;
+DROP TRIGGER IF EXISTS analysis_v2_findings_disposition_update;
+
+CREATE TRIGGER analysis_v2_runs_insert
 AFTER INSERT ON analysis_runs
 BEGIN
   INSERT INTO analysis_v2_run_summaries(
@@ -121,7 +135,7 @@ BEGIN
       updated_at=CURRENT_TIMESTAMP;
 END;
 
-CREATE TRIGGER IF NOT EXISTS analysis_v2_runs_update
+CREATE TRIGGER analysis_v2_runs_update
 AFTER UPDATE OF status,artifact_sha256,analyzer_name,analyzer_version,ruleset_version ON analysis_runs
 BEGIN
   UPDATE analysis_v2_run_summaries SET
@@ -134,7 +148,7 @@ BEGIN
   WHERE analysis_run_id=NEW.id;
 END;
 
-CREATE TRIGGER IF NOT EXISTS analysis_v2_files_insert
+CREATE TRIGGER analysis_v2_files_insert
 AFTER INSERT ON analysis_files
 BEGIN
   UPDATE analysis_v2_run_summaries SET
@@ -148,7 +162,7 @@ BEGIN
   WHERE analysis_run_id=NEW.analysis_run_id;
 END;
 
-CREATE TRIGGER IF NOT EXISTS analysis_v2_dependencies_insert
+CREATE TRIGGER analysis_v2_dependencies_insert
 AFTER INSERT ON analysis_dependencies
 BEGIN
   UPDATE analysis_v2_run_summaries SET
@@ -157,7 +171,7 @@ BEGIN
   WHERE analysis_run_id=NEW.analysis_run_id;
 END;
 
-CREATE TRIGGER IF NOT EXISTS analysis_v2_findings_insert
+CREATE TRIGGER analysis_v2_findings_insert
 AFTER INSERT ON analysis_findings
 BEGIN
   INSERT OR IGNORE INTO analysis_v2_rule_definitions(
@@ -191,18 +205,28 @@ BEGIN
       high_count=high_count+(NEW.severity='high'),
       critical_count=critical_count+(NEW.severity='critical'),
       unreviewed_count=unreviewed_count+(NEW.disposition='unreviewed'),
+      unreviewed_high_count=unreviewed_high_count+
+          (NEW.disposition='unreviewed' AND NEW.severity='high'),
+      unreviewed_critical_count=unreviewed_critical_count+
+          (NEW.disposition='unreviewed' AND NEW.severity='critical'),
       suspicious_count=suspicious_count+(NEW.disposition='suspicious'),
       confirmed_risk_count=confirmed_risk_count+(NEW.disposition='confirmed-risk'),
       updated_at=CURRENT_TIMESTAMP
   WHERE analysis_run_id=NEW.analysis_run_id;
 END;
 
-CREATE TRIGGER IF NOT EXISTS analysis_v2_findings_disposition_update
+CREATE TRIGGER analysis_v2_findings_disposition_update
 AFTER UPDATE OF disposition ON analysis_findings
 WHEN OLD.disposition<>NEW.disposition
 BEGIN
   UPDATE analysis_v2_run_summaries SET
       unreviewed_count=unreviewed_count-(OLD.disposition='unreviewed')+(NEW.disposition='unreviewed'),
+      unreviewed_high_count=unreviewed_high_count-
+          (OLD.disposition='unreviewed' AND OLD.severity='high')+
+          (NEW.disposition='unreviewed' AND NEW.severity='high'),
+      unreviewed_critical_count=unreviewed_critical_count-
+          (OLD.disposition='unreviewed' AND OLD.severity='critical')+
+          (NEW.disposition='unreviewed' AND NEW.severity='critical'),
       suspicious_count=suspicious_count-(OLD.disposition='suspicious')+(NEW.disposition='suspicious'),
       confirmed_risk_count=confirmed_risk_count-(OLD.disposition='confirmed-risk')+(NEW.disposition='confirmed-risk'),
       updated_at=CURRENT_TIMESTAMP
@@ -235,6 +259,10 @@ def connect(database: Path) -> sqlite3.Connection:
     return db
 
 
+def table_columns(db: sqlite3.Connection, name: str) -> set[str]:
+    return {str(row["name"]) for row in db.execute(f"PRAGMA table_info({name})")}
+
+
 def require_v1(db: sqlite3.Connection) -> None:
     required = {"analysis_runs", "analysis_files", "analysis_dependencies", "analysis_findings"}
     existing = {
@@ -246,9 +274,32 @@ def require_v1(db: sqlite3.Connection) -> None:
         raise RuntimeError("missing v1 analysis tables: " + ", ".join(missing))
 
 
+def ensure_column(db: sqlite3.Connection, table: str, name: str, declaration: str) -> None:
+    if name not in table_columns(db, table):
+        db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+
+
 def install(db: sqlite3.Connection) -> None:
     require_v1(db)
     db.executescript(DDL)
+    # Additive migration for databases that received the initial foundation.
+    ensure_column(
+        db, "analysis_v2_run_summaries", "unreviewed_high_count",
+        "INTEGER NOT NULL DEFAULT 0 CHECK(unreviewed_high_count >= 0)",
+    )
+    ensure_column(
+        db, "analysis_v2_run_summaries", "unreviewed_critical_count",
+        "INTEGER NOT NULL DEFAULT 0 CHECK(unreviewed_critical_count >= 0)",
+    )
+    ensure_column(
+        db, "analysis_v2_coverage_summary", "running_package_records",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    ensure_column(
+        db, "analysis_v2_coverage_summary", "unreviewed_high_or_critical_findings",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    db.executescript(TRIGGERS)
     db.execute(
         """INSERT INTO storage_v2_info(singleton,schema_version)
            VALUES(1,?)
@@ -262,8 +313,7 @@ def backfill(db: sqlite3.Connection, batch_size: int) -> int:
     if batch_size < 1 or batch_size > 10_000:
         raise ValueError("batch size must be between 1 and 10000")
     rows = db.execute(
-        """SELECT r.id,r.artifact_sha256,r.analyzer_name,r.analyzer_version,
-                  r.ruleset_version,r.status
+        """SELECT r.id
            FROM analysis_runs r
            LEFT JOIN analysis_v2_run_summaries s ON s.analysis_run_id=r.id
            WHERE s.analysis_run_id IS NULL
@@ -278,7 +328,8 @@ def backfill(db: sqlite3.Connection, batch_size: int) -> int:
                  ruleset_version,status,file_count,total_file_bytes,dependency_count,
                  finding_count,info_count,low_count,medium_count,high_count,critical_count,
                  executable_count,native_binary_count,generated_count,minified_count,
-                 unreviewed_count,suspicious_count,confirmed_risk_count)
+                 unreviewed_count,unreviewed_high_count,unreviewed_critical_count,
+                 suspicious_count,confirmed_risk_count)
                SELECT r.id,r.artifact_sha256,r.analyzer_name,r.analyzer_version,
                       r.ruleset_version,r.status,
                       (SELECT COUNT(*) FROM analysis_files f WHERE f.analysis_run_id=r.id),
@@ -295,6 +346,8 @@ def backfill(db: sqlite3.Connection, batch_size: int) -> int:
                       (SELECT COUNT(*) FROM analysis_files f WHERE f.analysis_run_id=r.id AND generated=1),
                       (SELECT COUNT(*) FROM analysis_files f WHERE f.analysis_run_id=r.id AND minified=1),
                       (SELECT COUNT(*) FROM analysis_findings f WHERE f.analysis_run_id=r.id AND disposition='unreviewed'),
+                      (SELECT COUNT(*) FROM analysis_findings f WHERE f.analysis_run_id=r.id AND disposition='unreviewed' AND severity='high'),
+                      (SELECT COUNT(*) FROM analysis_findings f WHERE f.analysis_run_id=r.id AND disposition='unreviewed' AND severity='critical'),
                       (SELECT COUNT(*) FROM analysis_findings f WHERE f.analysis_run_id=r.id AND disposition='suspicious'),
                       (SELECT COUNT(*) FROM analysis_findings f WHERE f.analysis_run_id=r.id AND disposition='confirmed-risk')
                FROM analysis_runs r WHERE r.id=?""",
@@ -336,6 +389,21 @@ def backfill(db: sqlite3.Connection, batch_size: int) -> int:
     return len(rows)
 
 
+def refresh_existing_summary_intersections(db: sqlite3.Connection) -> None:
+    """Repair new v2 columns for summaries created under schema version 1."""
+    db.execute(
+        """UPDATE analysis_v2_run_summaries AS s SET
+             unreviewed_high_count=(SELECT COUNT(*) FROM analysis_findings f
+               WHERE f.analysis_run_id=s.analysis_run_id AND f.disposition='unreviewed' AND f.severity='high'),
+             unreviewed_critical_count=(SELECT COUNT(*) FROM analysis_findings f
+               WHERE f.analysis_run_id=s.analysis_run_id AND f.disposition='unreviewed' AND f.severity='critical')
+           WHERE (unreviewed_high_count=0 AND unreviewed_critical_count=0)
+             AND EXISTS(SELECT 1 FROM analysis_findings f
+               WHERE f.analysis_run_id=s.analysis_run_id AND f.disposition='unreviewed'
+                 AND f.severity IN('high','critical'))"""
+    )
+
+
 def refresh_coverage(db: sqlite3.Connection) -> int:
     required = {"static_analysis_schedule_current", "static_analysis_schedule_state"}
     existing = {
@@ -350,26 +418,35 @@ def refresh_coverage(db: sqlite3.Connection) -> int:
     if profile is None:
         return 0
     key = str(profile[0])
+    refresh_existing_summary_intersections(db)
     db.execute(
         """INSERT INTO analysis_v2_coverage_summary(
              profile_key,eligible_package_records,completed_package_records,
              failed_package_records,unsupported_package_records,
              unresolvable_package_records,never_attempted_package_records,
-             unique_artifacts_analyzed,info_findings,low_findings,medium_findings,
-             high_findings,critical_findings,unreviewed_findings,suspicious_findings,
-             confirmed_risk_findings)
-           SELECT ?,COUNT(*),
-             SUM(state='completed'),SUM(state='failed'),SUM(state='unsupported'),
-             SUM(state='unresolvable'),SUM(state='eligible' AND attempt_count=0),
-             COUNT(DISTINCT CASE WHEN state='completed' THEN artifact_sha256 END),
-             COALESCE(SUM(CASE WHEN state='completed' THEN s.info_count END),0),
-             COALESCE(SUM(CASE WHEN state='completed' THEN s.low_count END),0),
-             COALESCE(SUM(CASE WHEN state='completed' THEN s.medium_count END),0),
-             COALESCE(SUM(CASE WHEN state='completed' THEN s.high_count END),0),
-             COALESCE(SUM(CASE WHEN state='completed' THEN s.critical_count END),0),
-             COALESCE(SUM(CASE WHEN state='completed' THEN s.unreviewed_count END),0),
-             COALESCE(SUM(CASE WHEN state='completed' THEN s.suspicious_count END),0),
-             COALESCE(SUM(CASE WHEN state='completed' THEN s.confirmed_risk_count END),0)
+             running_package_records,unique_artifacts_analyzed,
+             info_findings,low_findings,medium_findings,high_findings,critical_findings,
+             unreviewed_findings,unreviewed_high_or_critical_findings,
+             suspicious_findings,confirmed_risk_findings)
+           SELECT ?,
+             COALESCE(SUM(q.state IN('eligible','running','completed','failed')),0),
+             COALESCE(SUM(q.state='completed'),0),
+             COALESCE(SUM(q.state='failed'),0),
+             COALESCE(SUM(q.state='unsupported'),0),
+             COALESCE(SUM(q.state='unresolvable'),0),
+             COALESCE(SUM(q.state='eligible' AND q.attempt_count=0),0),
+             COALESCE(SUM(q.state='running'),0),
+             COUNT(DISTINCT CASE WHEN q.state='completed' THEN q.artifact_sha256 END),
+             COALESCE(SUM(CASE WHEN q.state='completed' THEN s.info_count ELSE 0 END),0),
+             COALESCE(SUM(CASE WHEN q.state='completed' THEN s.low_count ELSE 0 END),0),
+             COALESCE(SUM(CASE WHEN q.state='completed' THEN s.medium_count ELSE 0 END),0),
+             COALESCE(SUM(CASE WHEN q.state='completed' THEN s.high_count ELSE 0 END),0),
+             COALESCE(SUM(CASE WHEN q.state='completed' THEN s.critical_count ELSE 0 END),0),
+             COALESCE(SUM(CASE WHEN q.state='completed' THEN s.unreviewed_count ELSE 0 END),0),
+             COALESCE(SUM(CASE WHEN q.state='completed'
+               THEN s.unreviewed_high_count+s.unreviewed_critical_count ELSE 0 END),0),
+             COALESCE(SUM(CASE WHEN q.state='completed' THEN s.suspicious_count ELSE 0 END),0),
+             COALESCE(SUM(CASE WHEN q.state='completed' THEN s.confirmed_risk_count ELSE 0 END),0)
            FROM static_analysis_schedule_state q
            LEFT JOIN analysis_v2_run_summaries s ON s.analysis_run_id=q.analysis_run_id
            WHERE q.profile_key=?
@@ -380,11 +457,13 @@ def refresh_coverage(db: sqlite3.Connection) -> int:
              unsupported_package_records=excluded.unsupported_package_records,
              unresolvable_package_records=excluded.unresolvable_package_records,
              never_attempted_package_records=excluded.never_attempted_package_records,
+             running_package_records=excluded.running_package_records,
              unique_artifacts_analyzed=excluded.unique_artifacts_analyzed,
              info_findings=excluded.info_findings,low_findings=excluded.low_findings,
              medium_findings=excluded.medium_findings,high_findings=excluded.high_findings,
              critical_findings=excluded.critical_findings,
              unreviewed_findings=excluded.unreviewed_findings,
+             unreviewed_high_or_critical_findings=excluded.unreviewed_high_or_critical_findings,
              suspicious_findings=excluded.suspicious_findings,
              confirmed_risk_findings=excluded.confirmed_risk_findings,
              updated_at=CURRENT_TIMESTAMP""",
