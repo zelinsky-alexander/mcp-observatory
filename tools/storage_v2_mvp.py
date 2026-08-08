@@ -345,28 +345,55 @@ def bundle_evidence(
     limit: int,
     history_database: Path | None = None,
 ) -> list[dict[str, Any]]:
+    """Bundle available per-artifact evidence.
+
+    A fresh Storage v2 state may legitimately contain no artifact evidence
+    directory yet. This happens when no newly processed artifact has emitted
+    evidence, or when a bounded scheduler run performs no successful analysis.
+
+    Absence of the evidence tree therefore means "nothing to bundle", not an
+    invalid Storage v2 state.
+    """
     sha_root = source_root / "artifacts" / "sha256"
     if not sha_root.is_dir():
-        raise RuntimeError(f"artifact evidence root not found: {sha_root}")
+        return []
+
     results: list[dict[str, Any]] = []
+
     for prefix in sorted(sha_root.iterdir()):
         if not prefix.is_dir():
             continue
+
         for artifact in sorted(prefix.iterdir()):
             if not artifact.is_dir() or len(artifact.name) != 64:
                 continue
+
             result = content_address_bundle(artifact, destination_root)
+
             inventory = artifact / "archive-inventory.json"
-            inventory_sha = sha256_file(inventory) if inventory.is_file() else None
+            inventory_sha = (
+                sha256_file(inventory)
+                if inventory.is_file()
+                else None
+            )
+
             result["artifact_sha256"] = artifact.name
             result["registered_runs"] = 0
+
             if history_database is not None:
                 result["registered_runs"] = _register_bundle_for_artifact(
-                    history_database, artifact.name, result, destination_root, inventory_sha
+                    history_database,
+                    artifact.name,
+                    result,
+                    destination_root,
+                    inventory_sha,
                 )
+
             results.append(result)
+
             if limit and len(results) >= limit:
                 return results
+
     return results
 
 
