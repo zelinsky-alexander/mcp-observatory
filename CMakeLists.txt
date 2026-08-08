@@ -104,6 +104,51 @@ if(MCPO_BUILD_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_bulk_static_analysis.py
     )
     add_test(
+        NAME mcpo_storage_v2_foundation_tests
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_storage_v2_foundation.py
+    )
+    add_test(
+        NAME mcpo_storage_v2_mvp_tests
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_storage_v2_mvp.py
+    )
+    add_test(
+        NAME mcpo_storage_v2_registry_sync_tests
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_storage_v2_registry_sync.py
+    )
+    add_test(
+        NAME mcpo_storage_v2_reconcile_tests
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_storage_v2_reconcile.py
+    )
+    add_test(
+        NAME mcpo_storage_v2_prepare_script_syntax
+        COMMAND bash -n
+            ${CMAKE_CURRENT_SOURCE_DIR}/scripts/prepare_storage_v2_sidecar.sh
+    )
+    add_test(
+        NAME mcpo_storage_v2_static_script_syntax
+        COMMAND bash -n
+            ${CMAKE_CURRENT_SOURCE_DIR}/scripts/run_storage_v2_static_batch.sh
+    )
+    add_test(
+        NAME mcpo_storage_v2_refresh_script_syntax
+        COMMAND bash -n
+            ${CMAKE_CURRENT_SOURCE_DIR}/scripts/run_storage_v2_registry_refresh.sh
+    )
+    add_test(
+        NAME mcpo_storage_v2_runtime_script_syntax
+        COMMAND bash -n
+            ${CMAKE_CURRENT_SOURCE_DIR}/scripts/run_storage_v2_runtime_observation.sh
+    )
+    add_test(
+        NAME mcpo_storage_v2_verify_script_syntax
+        COMMAND bash -n
+            ${CMAKE_CURRENT_SOURCE_DIR}/scripts/verify_storage_v2_sidecar.sh
+    )
+    add_test(
         NAME mcpo_static_analysis_installer_syntax
         COMMAND bash -n
             ${CMAKE_CURRENT_SOURCE_DIR}/scripts/install_static_analysis_scheduler.sh
