@@ -17,7 +17,7 @@ for file in "$history_db" "$hot_db" "$binary" "$rules"; do
   [[ -f "$file" ]] || { echo "required file missing: $file" >&2; exit 2; }
 done
 
-exec sudo -u mcp-refresh python3 "$project_dir/tools/bulk_static_analysis_v2.py" \
+exec python3 "$project_dir/tools/bulk_static_analysis_v2.py" \
   --history-database "$history_db" \
   --hot-database "$hot_db" \
   --observatory-binary "$binary" \
