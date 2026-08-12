@@ -1836,6 +1836,113 @@ bool parse_npm_version_metadata(
     return true;
 }
 
+
+namespace {
+
+struct PypiVersionIdentity {
+    std::vector<unsigned long long> release;
+    std::optional<std::pair<unsigned, unsigned long long>> prerelease;
+};
+
+bool parse_pypi_version_number(
+    std::string_view value,
+    std::size_t& position,
+    unsigned long long& number) {
+    const std::size_t start = position;
+    while (position < value.size() &&
+           std::isdigit(static_cast<unsigned char>(value[position])))
+        ++position;
+    if (position == start) return false;
+    const auto parsed = std::from_chars(
+        value.data() + start, value.data() + position, number);
+    return parsed.ec == std::errc{} && parsed.ptr == value.data() + position;
+}
+
+bool pypi_version_separator(char character) {
+    return character == '.' || character == '-' || character == '_';
+}
+
+bool parse_pypi_version_identity(
+    std::string_view value,
+    PypiVersionIdentity& identity) {
+    identity = {};
+    if (value.empty() || value.size() > 512U) return false;
+
+    std::size_t position = 0U;
+    if (value[position] == 'v' || value[position] == 'V') {
+        ++position;
+        if (position == value.size()) return false;
+    }
+
+    while (true) {
+        unsigned long long component{};
+        if (!parse_pypi_version_number(value, position, component)) return false;
+        identity.release.push_back(component);
+        if (position >= value.size() || value[position] != '.') break;
+        if (position + 1U >= value.size() ||
+            !std::isdigit(static_cast<unsigned char>(value[position + 1U])))
+            break;
+        ++position;
+    }
+    while (identity.release.size() > 1U && identity.release.back() == 0U)
+        identity.release.pop_back();
+
+    if (position == value.size()) return true;
+    if (pypi_version_separator(value[position])) ++position;
+    if (position == value.size()) return false;
+
+    const std::size_t label_start = position;
+    while (position < value.size() &&
+           std::isalpha(static_cast<unsigned char>(value[position])))
+        ++position;
+    if (position == label_start) return false;
+
+    std::string label;
+    label.reserve(position - label_start);
+    for (std::size_t index = label_start; index < position; ++index) {
+        const unsigned char character =
+            static_cast<unsigned char>(value[index]);
+        label.push_back(static_cast<char>(std::tolower(character)));
+    }
+
+    unsigned kind{};
+    if (label == "a" || label == "alpha")
+        kind = 0U;
+    else if (label == "b" || label == "beta")
+        kind = 1U;
+    else if (label == "rc" || label == "c" || label == "pre" ||
+             label == "preview")
+        kind = 2U;
+    else
+        return false;
+
+    if (position < value.size() && pypi_version_separator(value[position]))
+        ++position;
+
+    unsigned long long prerelease_number{};
+    if (position < value.size()) {
+        if (!parse_pypi_version_number(value, position, prerelease_number))
+            return false;
+    }
+    if (position != value.size()) return false;
+    identity.prerelease = std::pair{kind, prerelease_number};
+    return true;
+}
+
+bool pypi_versions_equivalent(
+    std::string_view left,
+    std::string_view right) {
+    if (left == right) return true;
+    PypiVersionIdentity left_identity;
+    PypiVersionIdentity right_identity;
+    return parse_pypi_version_identity(left, left_identity) &&
+        parse_pypi_version_identity(right, right_identity) &&
+        left_identity.release == right_identity.release &&
+        left_identity.prerelease == right_identity.prerelease;
+}
+
+}  // namespace
+
 bool parse_pypi_release_metadata(
     std::string_view json_text,
     std::string_view expected_name,
@@ -1879,7 +1986,8 @@ bool parse_pypi_release_metadata(
         !normalize_pypi_project_name(expected_name, normalized_expected, error)) {
         return false;
     }
-    if (normalized_name != normalized_expected || version != expected_version) {
+    if (normalized_name != normalized_expected ||
+        !pypi_versions_equivalent(version, expected_version)) {
         error = "PyPI release metadata identity mismatch";
         return false;
     }
@@ -3745,7 +3853,9 @@ AnalyzePackageResult analyze_package(
             "analyzer worker ruleset_version does not match host ruleset");
     }
     bool worker_identity_matches =
-        worker_result.package_version == version;
+        package.registry_type == "pypi"
+            ? pypi_versions_equivalent(worker_result.package_version, version)
+            : worker_result.package_version == version;
     if (package.registry_type == "pypi") {
         std::string expected_name;
         std::string worker_name;

@@ -62,6 +62,11 @@ if(MCPO_BUILD_TESTS)
     target_compile_features(mcpo_acquisition_tests PRIVATE cxx_std_20)
     add_test(NAME mcpo_acquisition_tests COMMAND mcpo_acquisition_tests)
 
+    add_executable(mcpo_pypi_version_identity_tests tests/test_pypi_version_identity.cpp)
+    target_link_libraries(mcpo_pypi_version_identity_tests PRIVATE mcpo_core)
+    target_compile_features(mcpo_pypi_version_identity_tests PRIVATE cxx_std_20)
+    add_test(NAME mcpo_pypi_version_identity_tests COMMAND mcpo_pypi_version_identity_tests)
+
     add_test(
         NAME mcpo_registry_cli_tests
         COMMAND ${Python3_EXECUTABLE}
