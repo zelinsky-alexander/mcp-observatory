@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-project_dir="${MCPO_PROJECT_DIR:-/opt/mcp-observatory/current}"
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+default_project_dir="$(cd -- "$script_dir/.." && pwd)"
+project_dir="${MCPO_PROJECT_DIR:-$default_project_dir}"
 state_dir="${MCPO_V2_STATE_DIR:-/var/lib/mcp-observatory-v2}"
 history_db="${MCPO_V2_HISTORY_DATABASE:-$state_dir/history/assurance-history.sqlite}"
 hot_db="${MCPO_V2_HOT_DATABASE:-$state_dir/catalog/local-registry.sqlite}"
