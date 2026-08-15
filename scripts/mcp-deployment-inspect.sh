@@ -18,18 +18,18 @@ echo "=== Deployed commits ==="
 for d in \
   /opt/mcp-observatory/current \
   /opt/mcp-native-guard/current \
-  /opt/mcp-observatory-guard-portal/current \
-  /opt/mcp-storage-v2-test/mcp-observatory \
-  /opt/mcp-storage-v2-test/mcp-native-guard \
-  /opt/mcp-storage-v2-test/mcp-observatory-guard-portal
+  /opt/mcp-observatory-guard-portal/current
  do
   if sudo test -d "$d/.git"; then
     echo "$d"
-    sudo git -C "$d" status --short --branch
+    sudo git -C "$d" status --short --branch --untracked-files=no
     echo "HEAD: $(sudo git -C "$d" rev-parse HEAD)"
+    if sudo test -r "$d/DEPLOYED_COMMIT"; then
+      printf 'DEPLOYED_COMMIT: '; sudo cat "$d/DEPLOYED_COMMIT"
+    fi
   elif sudo test -r "$d/DEPLOYED_COMMIT"; then
     echo "$d"
-    printf 'HEAD: '; sudo cat "$d/DEPLOYED_COMMIT"
+    printf 'DEPLOYED_COMMIT: '; sudo cat "$d/DEPLOYED_COMMIT"
   fi
 done
 
@@ -56,6 +56,9 @@ sudo ls -lh \
   2>/dev/null || true
 
 echo
-echo "=== Source clones ==="
-find /home/ubuntu -maxdepth 2 -type d -name .git -printf '%h\n' 2>/dev/null | sort || true
-sudo find /opt -maxdepth 4 -type d -name .git -printf '%h\n' 2>/dev/null | sort || true
+echo "=== Git deployments under /opt ==="
+sudo find \
+  /opt/mcp-observatory \
+  /opt/mcp-native-guard \
+  /opt/mcp-observatory-guard-portal \
+  -maxdepth 4 -type d -name .git -printf '%h\n' 2>/dev/null | sort || true
