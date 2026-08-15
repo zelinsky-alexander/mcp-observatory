@@ -16,6 +16,6 @@ echo
 ls -lh "$history_db" "$hot_db"
 echo
 for db in "$history_db" "$hot_db"; do
-  echo "=== $db ==="
-  sqlite3 "file:$db?mode=ro" "PRAGMA quick_check; SELECT COUNT(*) FROM analysis_v2_run_summaries; SELECT COUNT(*) FROM analysis_v2_coverage_summary;"
+  echo "=== FULL INTEGRITY CHECK: $db ==="
+  sqlite3 "file:$db?mode=ro" "PRAGMA integrity_check; SELECT COUNT(*) FROM analysis_v2_run_summaries; SELECT COUNT(*) FROM analysis_v2_coverage_summary;"
 done
