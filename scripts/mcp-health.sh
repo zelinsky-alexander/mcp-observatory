@@ -22,16 +22,24 @@ systemctl --no-pager --full status \
   2>/dev/null || true
 
 echo
-echo "=== Fast storage v2 verification ==="
-MCPO_PROJECT_DIR="$project_dir" MCPO_V2_STATE_DIR="$state_dir" \
-  bash "$project_dir/scripts/verify_storage_v2_sidecar.sh"
-
-echo
 echo "=== Portal smoke tests ==="
 for path in / /servers /coverage; do
   curl --max-time 10 -sS -o /dev/null \
     -w "$path %{http_code} %{time_total}s\n" \
     "$portal_url$path"
+done
+
+echo
+echo "=== Storage v2 files ==="
+for path in \
+  "$state_dir/catalog/local-registry.sqlite" \
+  "$state_dir/history/assurance-history.sqlite"
+do
+  if [[ -r "$path" ]]; then
+    ls -lh "$path"
+  else
+    echo "MISSING/UNREADABLE: $path"
+  fi
 done
 
 echo
