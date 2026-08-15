@@ -35,10 +35,10 @@ for path in \
   "$state_dir/catalog/local-registry.sqlite" \
   "$state_dir/history/assurance-history.sqlite"
 do
-  if [[ -r "$path" ]]; then
-    ls -lh "$path"
+  if [[ -e "$path" ]]; then
+    ls -lh "$path" 2>/dev/null || echo "EXISTS (metadata not readable as current user): $path"
   else
-    echo "MISSING/UNREADABLE: $path"
+    echo "MISSING: $path"
   fi
 done
 
