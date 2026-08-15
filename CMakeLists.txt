@@ -62,6 +62,11 @@ if(MCPO_BUILD_TESTS)
     target_compile_features(mcpo_acquisition_tests PRIVATE cxx_std_20)
     add_test(NAME mcpo_acquisition_tests COMMAND mcpo_acquisition_tests)
 
+    add_executable(mcpo_pypi_version_identity_tests tests/test_pypi_version_identity.cpp)
+    target_link_libraries(mcpo_pypi_version_identity_tests PRIVATE mcpo_core)
+    target_compile_features(mcpo_pypi_version_identity_tests PRIVATE cxx_std_20)
+    add_test(NAME mcpo_pypi_version_identity_tests COMMAND mcpo_pypi_version_identity_tests)
+
     add_test(
         NAME mcpo_registry_cli_tests
         COMMAND ${Python3_EXECUTABLE}
@@ -102,6 +107,51 @@ if(MCPO_BUILD_TESTS)
         NAME mcpo_bulk_static_analysis_tests
         COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_bulk_static_analysis.py
+    )
+    add_test(
+        NAME mcpo_storage_v2_foundation_tests
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_storage_v2_foundation.py
+    )
+    add_test(
+        NAME mcpo_storage_v2_mvp_tests
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_storage_v2_mvp.py
+    )
+    add_test(
+        NAME mcpo_storage_v2_registry_sync_tests
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_storage_v2_registry_sync.py
+    )
+    add_test(
+        NAME mcpo_storage_v2_reconcile_tests
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_storage_v2_reconcile.py
+    )
+    add_test(
+        NAME mcpo_storage_v2_prepare_script_syntax
+        COMMAND bash -n
+            ${CMAKE_CURRENT_SOURCE_DIR}/scripts/prepare_storage_v2_sidecar.sh
+    )
+    add_test(
+        NAME mcpo_storage_v2_static_script_syntax
+        COMMAND bash -n
+            ${CMAKE_CURRENT_SOURCE_DIR}/scripts/run_storage_v2_static_batch.sh
+    )
+    add_test(
+        NAME mcpo_storage_v2_refresh_script_syntax
+        COMMAND bash -n
+            ${CMAKE_CURRENT_SOURCE_DIR}/scripts/run_storage_v2_registry_refresh.sh
+    )
+    add_test(
+        NAME mcpo_storage_v2_runtime_script_syntax
+        COMMAND bash -n
+            ${CMAKE_CURRENT_SOURCE_DIR}/scripts/run_storage_v2_runtime_observation.sh
+    )
+    add_test(
+        NAME mcpo_storage_v2_verify_script_syntax
+        COMMAND bash -n
+            ${CMAKE_CURRENT_SOURCE_DIR}/scripts/verify_storage_v2_sidecar.sh
     )
     add_test(
         NAME mcpo_static_analysis_installer_syntax
