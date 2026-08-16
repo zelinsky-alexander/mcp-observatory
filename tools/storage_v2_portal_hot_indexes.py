@@ -2,7 +2,7 @@
 """Install and verify compact Storage-v2 indexes used by public list routes.
 
 The hot Storage-v2 catalog retains server/version/package/run metadata while
-large finding/file/evidence detail stays in history.  These additive indexes
+large finding/file/evidence detail stays in history. These additive indexes
 support bounded public navigation without changing authoritative records.
 """
 
@@ -61,7 +61,7 @@ LIMIT 50
 
 ALL_SERVERS_SQL = """
 WITH matching AS (
-    SELECT id,server_identifier,server_version,updated_at,published_at,
+    SELECT id,server_identifier,updated_at,published_at,
            ROW_NUMBER() OVER (
                PARTITION BY server_identifier
                ORDER BY COALESCE(updated_at,published_at,'') COLLATE BINARY DESC,
