@@ -33,6 +33,14 @@ class StorageV2PortalHotIndexTests(unittest.TestCase):
                     status TEXT NOT NULL,
                     started_at TEXT NOT NULL
                 );
+                CREATE TABLE static_analysis_schedule_state(
+                    profile_key TEXT NOT NULL,
+                    package_id INTEGER NOT NULL,
+                    state TEXT NOT NULL,
+                    attempt_count INTEGER NOT NULL,
+                    updated_at TEXT,
+                    PRIMARY KEY(profile_key, package_id)
+                );
                 INSERT INTO server_versions VALUES
                     (1,'a','2026-01-01T00:00:00Z','2025-01-01T00:00:00Z'),
                     (2,'a','2026-02-01T00:00:00Z','2025-02-01T00:00:00Z'),
@@ -41,6 +49,12 @@ class StorageV2PortalHotIndexTests(unittest.TestCase):
                     (10,'failed','2026-01-01T00:00:00Z'),
                     (11,'completed','2026-02-01T00:00:00Z'),
                     (12,'completed','2026-03-01T00:00:00Z');
+                INSERT INTO static_analysis_schedule_state VALUES
+                    ('profile',101,'completed',1,'2026-05-01T00:00:00Z'),
+                    ('profile',102,'eligible',0,'2026-05-03T00:00:00Z'),
+                    ('profile',103,'failed',2,'2026-05-02T00:00:00Z'),
+                    ('profile',104,'unsupported',0,'2026-05-04T00:00:00Z'),
+                    ('other',105,'completed',1,'2026-06-01T00:00:00Z');
                 """
             )
             db.commit()
@@ -62,12 +76,18 @@ class StorageV2PortalHotIndexTests(unittest.TestCase):
             records = [row[0] for row in db.execute(MODULE.RECORDS_SQL)]
             analyses = [row[0] for row in db.execute(MODULE.ANALYSES_SQL)]
             servers = [row[0] for row in db.execute(MODULE.ALL_SERVERS_SQL)]
+            completed = [row[0] for row in db.execute(MODULE.COVERAGE_COMPLETED_SQL)]
+            never = [row[0] for row in db.execute(MODULE.COVERAGE_NEVER_SQL)]
+            eligible = [row[0] for row in db.execute(MODULE.COVERAGE_ELIGIBLE_SQL)]
         finally:
             db.close()
 
         self.assertEqual(records, [3, 2, 1])
         self.assertEqual(analyses, [12, 11])
         self.assertEqual(servers, [3, 2])
+        self.assertEqual(completed, [101])
+        self.assertEqual(never, [102])
+        self.assertEqual(eligible, [102, 103, 101])
 
 
 if __name__ == "__main__":
