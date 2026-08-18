@@ -41,6 +41,33 @@ INDEXES = {
             id DESC
         )
     """,
+    "static_schedule_profile_state_updated": """
+        CREATE INDEX IF NOT EXISTS static_schedule_profile_state_updated
+        ON static_analysis_schedule_state(
+            profile_key,
+            state,
+            updated_at COLLATE BINARY DESC,
+            package_id DESC
+        )
+    """,
+    "static_schedule_profile_attempt_updated": """
+        CREATE INDEX IF NOT EXISTS static_schedule_profile_attempt_updated
+        ON static_analysis_schedule_state(
+            profile_key,
+            state,
+            attempt_count,
+            updated_at COLLATE BINARY DESC,
+            package_id DESC
+        )
+    """,
+    "static_schedule_profile_updated": """
+        CREATE INDEX IF NOT EXISTS static_schedule_profile_updated
+        ON static_analysis_schedule_state(
+            profile_key,
+            updated_at COLLATE BINARY DESC,
+            package_id DESC
+        )
+    """,
 }
 
 RECORDS_SQL = """
@@ -74,6 +101,31 @@ FROM matching
 WHERE rn=1
 ORDER BY COALESCE(updated_at,published_at,'') COLLATE BINARY DESC,
          server_identifier COLLATE BINARY
+LIMIT 50
+"""
+
+COVERAGE_COMPLETED_SQL = """
+SELECT package_id
+FROM static_analysis_schedule_state
+WHERE profile_key='profile' AND state='completed'
+ORDER BY updated_at COLLATE BINARY DESC, package_id DESC
+LIMIT 50
+"""
+
+COVERAGE_NEVER_SQL = """
+SELECT package_id
+FROM static_analysis_schedule_state
+WHERE profile_key='profile' AND state='eligible' AND attempt_count=0
+ORDER BY updated_at COLLATE BINARY DESC, package_id DESC
+LIMIT 50
+"""
+
+COVERAGE_ELIGIBLE_SQL = """
+SELECT package_id
+FROM static_analysis_schedule_state
+WHERE profile_key='profile'
+  AND state IN('eligible','running','completed','failed')
+ORDER BY updated_at COLLATE BINARY DESC, package_id DESC
 LIMIT 50
 """
 
@@ -114,6 +166,13 @@ def require_schema(db: sqlite3.Connection) -> None:
     required = {
         "server_versions": {"id", "server_identifier", "updated_at", "published_at"},
         "analysis_runs": {"id", "status", "started_at"},
+        "static_analysis_schedule_state": {
+            "profile_key",
+            "package_id",
+            "state",
+            "attempt_count",
+            "updated_at",
+        },
     }
     for table, expected in required.items():
         columns = {str(row["name"]) for row in db.execute(f"PRAGMA table_info({table})")}
@@ -143,21 +202,36 @@ def status(database: Path) -> dict[str, object]:
     db = connect(database, readonly=True)
     try:
         require_schema(db)
-        server_indexes = {str(row["name"]) for row in db.execute("PRAGMA index_list('server_versions')")}
-        run_indexes = {str(row["name"]) for row in db.execute("PRAGMA index_list('analysis_runs')")}
-        installed = {
-            name: (name in server_indexes or name in run_indexes)
-            for name in INDEXES
-        }
+        index_names: set[str] = set()
+        for table in ("server_versions", "analysis_runs", "static_analysis_schedule_state"):
+            index_names.update(
+                str(row["name"]) for row in db.execute(f"PRAGMA index_list('{table}')")
+            )
+        installed = {name: name in index_names for name in INDEXES}
         plans = {
             "records": _plan(db, RECORDS_SQL),
             "analyses": _plan(db, ANALYSES_SQL),
             "all_servers": _plan(db, ALL_SERVERS_SQL),
+            "coverage_completed": _plan(db, COVERAGE_COMPLETED_SQL),
+            "coverage_never": _plan(db, COVERAGE_NEVER_SQL),
+            "coverage_eligible": _plan(db, COVERAGE_ELIGIBLE_SQL),
         }
         uses = {
             "records": any("server_versions_recent" in step for step in plans["records"]),
             "analyses": any("analysis_runs_status_started" in step for step in plans["analyses"]),
             "all_servers": any("server_versions_identity_recent" in step for step in plans["all_servers"]),
+            "coverage_completed": any(
+                "static_schedule_profile_state_updated" in step
+                for step in plans["coverage_completed"]
+            ),
+            "coverage_never": any(
+                "static_schedule_profile_attempt_updated" in step
+                for step in plans["coverage_never"]
+            ),
+            "coverage_eligible": any(
+                "static_schedule_profile_updated" in step
+                for step in plans["coverage_eligible"]
+            ),
         }
         return {
             "database": str(database.resolve()),
