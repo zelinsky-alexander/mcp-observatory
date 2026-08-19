@@ -6,7 +6,6 @@ import sqlite3
 import tempfile
 import unittest
 
-
 TOOL_PATH = Path(__file__).resolve().parents[1] / "tools" / "storage_v2_portal_hot_indexes.py"
 SPEC = importlib.util.spec_from_file_location("storage_v2_portal_hot_indexes", TOOL_PATH)
 assert SPEC is not None and SPEC.loader is not None
