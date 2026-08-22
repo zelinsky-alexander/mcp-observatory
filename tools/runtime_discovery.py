@@ -83,6 +83,11 @@ def prepare_writable_directory(path: Path) -> None:
     os.chmod(path, 0o777)
 
 
+def host_user_args() -> list[str]:
+    """Run writable bind-mount stages as the invoking host account."""
+    return ["--user", f"{os.getuid()}:{os.getgid()}"]
+
+
 def run(
     argv: list[str],
     *,
@@ -287,7 +292,8 @@ def docker_base(image: str) -> list[str]:
 
 def populate_cache(image: str, cache: Path, package: str, version: str, timeout: int) -> None:
     argv = [
-        "docker", "run", "--rm", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+        "docker", "run", "--rm", *host_user_args(),
+        "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
         "--pids-limit", "128", "--memory", "512m", "--cpus", "1.0",
         "--mount", f"type=bind,src={cache},dst=/npm-cache",
         image, "npm", "cache", "add", f"{package}@{version}", "--cache", "/npm-cache",
@@ -301,7 +307,8 @@ def populate_cache(image: str, cache: Path, package: str, version: str, timeout:
 def offline_install(image: str, cache: Path, work: Path, package: str, version: str, timeout: int) -> None:
     (work / "package.json").write_text(canonical({"private": True, "dependencies": {package: version}}) + "\n", encoding="utf-8")
     argv = [
-        "docker", "run", "--rm", "--network", "none", "--cap-drop", "ALL",
+        "docker", "run", "--rm", *host_user_args(),
+        "--network", "none", "--cap-drop", "ALL",
         "--security-opt", "no-new-privileges", "--pids-limit", "128", "--memory", "768m",
         "--cpus", "1.0", "--ulimit", "nofile=256:256",
         "--mount", f"type=bind,src={cache},dst=/npm-cache,ro=true",
