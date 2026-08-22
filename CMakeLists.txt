@@ -104,6 +104,11 @@ if(MCPO_BUILD_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_runtime_discovery.py
     )
     add_test(
+        NAME mcpo_bulk_runtime_discovery_tests
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_bulk_runtime_discovery.py
+    )
+    add_test(
         NAME mcpo_bulk_static_analysis_tests
         COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_bulk_static_analysis.py
@@ -129,6 +134,11 @@ if(MCPO_BUILD_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_storage_v2_reconcile.py
     )
     add_test(
+        NAME mcpo_storage_v2_runtime_publish_tests
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_storage_v2_runtime_publish.py
+    )
+    add_test(
         NAME mcpo_storage_v2_prepare_script_syntax
         COMMAND bash -n
             ${CMAKE_CURRENT_SOURCE_DIR}/scripts/prepare_storage_v2_sidecar.sh
@@ -147,6 +157,11 @@ if(MCPO_BUILD_TESTS)
         NAME mcpo_storage_v2_runtime_script_syntax
         COMMAND bash -n
             ${CMAKE_CURRENT_SOURCE_DIR}/scripts/run_storage_v2_runtime_observation.sh
+    )
+    add_test(
+        NAME mcpo_storage_v2_runtime_batch_script_syntax
+        COMMAND bash -n
+            ${CMAKE_CURRENT_SOURCE_DIR}/scripts/run_storage_v2_runtime_batch.sh
     )
     add_test(
         NAME mcpo_storage_v2_verify_script_syntax

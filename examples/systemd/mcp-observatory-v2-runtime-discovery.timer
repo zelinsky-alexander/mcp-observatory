@@ -1,0 +1,13 @@
+[Unit]
+Description=Continue MCP runtime discovery coverage hourly
+
+[Timer]
+OnBootSec=15min
+OnCalendar=hourly
+RandomizedDelaySec=10min
+AccuracySec=1min
+Persistent=yes
+Unit=mcp-observatory-v2-runtime-discovery.service
+
+[Install]
+WantedBy=timers.target
