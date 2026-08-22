@@ -290,22 +290,26 @@ def docker_base(image: str) -> list[str]:
     ]
 
 
-def populate_cache(image: str, cache: Path, package: str, version: str, timeout: int) -> None:
+def populate_cache(image: str, cache: Path, artifact: Path, timeout: int) -> None:
+    """Hydrate npm's cache for the exact verified artifact and its dependencies."""
     argv = [
         "docker", "run", "--rm", *host_user_args(),
         "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
-        "--pids-limit", "128", "--memory", "512m", "--cpus", "1.0",
+        "--pids-limit", "128", "--memory", "768m", "--cpus", "1.0",
         "--mount", f"type=bind,src={cache},dst=/npm-cache",
-        image, "npm", "cache", "add", f"{package}@{version}", "--cache", "/npm-cache",
-        "--no-audit", "--no-fund",
+        "--mount", f"type=bind,src={artifact.resolve()},dst=/artifact.tgz,ro=true",
+        image, "npm", "install", "--prefix", "/tmp/mcpo-cache-prep",
+        "--ignore-scripts", "--omit=dev", "--no-save", "--no-audit", "--no-fund",
+        "--cache", "/npm-cache", "/artifact.tgz",
     ]
     result = run_docker(argv, timeout=timeout, container_id_file=cache.parent / "cache.cid")
     if result.returncode != 0:
         fail("cache population failed: " + result.stderr.decode("utf-8", "replace")[-2000:])
 
 
-def offline_install(image: str, cache: Path, work: Path, package: str, version: str, timeout: int) -> None:
-    (work / "package.json").write_text(canonical({"private": True, "dependencies": {package: version}}) + "\n", encoding="utf-8")
+def offline_install(image: str, cache: Path, work: Path, artifact: Path, timeout: int) -> None:
+    """Install the exact verified artifact with networking disabled."""
+    (work / "package.json").write_text(canonical({"private": True}) + "\n", encoding="utf-8")
     argv = [
         "docker", "run", "--rm", *host_user_args(),
         "--network", "none", "--cap-drop", "ALL",
@@ -313,8 +317,9 @@ def offline_install(image: str, cache: Path, work: Path, package: str, version: 
         "--cpus", "1.0", "--ulimit", "nofile=256:256",
         "--mount", f"type=bind,src={cache},dst=/npm-cache,ro=true",
         "--mount", f"type=bind,src={work},dst=/work", "--workdir", "/work",
+        "--mount", f"type=bind,src={artifact.resolve()},dst=/artifact.tgz,ro=true",
         image, "npm", "install", "--offline", "--ignore-scripts", "--omit=dev",
-        "--no-audit", "--no-fund", "--cache", "/npm-cache",
+        "--no-save", "--no-audit", "--no-fund", "--cache", "/npm-cache", "/artifact.tgz",
     ]
     result = run_docker(argv, timeout=timeout, container_id_file=work.parent / "install.cid")
     if result.returncode != 0:
@@ -441,8 +446,8 @@ def main() -> int:
             "image": args.runtime_image, "guard_sha256": guard_sha256,
         }
         profile_sha = sha256_bytes(canonical(profile).encode())
-        populate_cache(args.runtime_image, cache, row["package_identifier"], row["package_version"], args.timeout)
-        offline_install(args.runtime_image, cache, work, row["package_identifier"], row["package_version"], args.timeout)
+        populate_cache(args.runtime_image, cache, artifact, args.timeout)
+        offline_install(args.runtime_image, cache, work, artifact, args.timeout)
         inventory = inspect_runtime(args.runtime_image, work, guard, row["package_identifier"], bin_entry, args.timeout)
         run_id = persist(
             db, row, artifact_sha, profile_sha, args.runtime_image,

@@ -86,8 +86,8 @@ def test_runtime_work_directories_ignore_umask() -> None:
         os.umask(old_umask)
 
 
-def test_writable_docker_stages_use_host_uid_gid() -> None:
-    expected = f"{os.getuid()}:{os.getgid()}"
+def test_runtime_install_uses_verified_artifact_and_offline_boundary() -> None:
+    expected_user = f"{os.getuid()}:{os.getgid()}"
     captured = []
     original = runtime_discovery.run_docker
 
@@ -101,17 +101,36 @@ def test_writable_docker_stages_use_host_uid_gid() -> None:
             root = pathlib.Path(temporary)
             cache = root / "cache"
             work = root / "work"
+            artifact = root / "artifact.tgz"
             runtime_discovery.prepare_writable_directory(cache)
             runtime_discovery.prepare_writable_directory(work)
-            runtime_discovery.populate_cache("node:test", cache, "pkg", "1.0.0", 5)
-            runtime_discovery.offline_install("node:test", cache, work, "pkg", "1.0.0", 5)
+            artifact.write_bytes(b"artifact")
+            runtime_discovery.populate_cache("node:test", cache, artifact, 5)
+            runtime_discovery.offline_install("node:test", cache, work, artifact, 5)
     finally:
         runtime_discovery.run_docker = original
 
     assert len(captured) == 2
+    cache_argv, install_argv = captured
     for argv in captured:
         user_index = argv.index("--user")
-        assert argv[user_index + 1] == expected
+        assert argv[user_index + 1] == expected_user
+        assert "/artifact.tgz" in argv
+        assert any(
+            item.endswith(",dst=/artifact.tgz,ro=true") for item in argv
+            if item.startswith("type=bind,")
+        )
+        assert "--ignore-scripts" in argv
+
+    assert "install" in cache_argv
+    assert "--network" not in cache_argv
+    assert "--offline" not in cache_argv
+    assert "none" not in cache_argv
+    assert "--network" in install_argv
+    network_index = install_argv.index("--network")
+    assert install_argv[network_index + 1] == "none"
+    assert "--offline" in install_argv
+    assert "--no-save" in install_argv
 
 
 def test_persistence_contract() -> None:
@@ -157,7 +176,7 @@ def main() -> None:
     test_bounded_process()
     test_inventory_validation()
     test_runtime_work_directories_ignore_umask()
-    test_writable_docker_stages_use_host_uid_gid()
+    test_runtime_install_uses_verified_artifact_and_offline_boundary()
     test_persistence_contract()
     print("runtime discovery tests passed")
 
