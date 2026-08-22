@@ -77,6 +77,12 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def prepare_writable_directory(path: Path) -> None:
+    """Create a bind-mount work directory with permissions independent of umask."""
+    path.mkdir()
+    os.chmod(path, 0o777)
+
+
 def run(
     argv: list[str],
     *,
@@ -415,8 +421,8 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="mcpo-runtime-") as temporary:
         root = Path(temporary)
         cache, work = root / "cache", root / "work"
-        cache.mkdir(mode=0o777)
-        work.mkdir(mode=0o777)
+        prepare_writable_directory(cache)
+        prepare_writable_directory(work)
         artifact = root / "artifact.tgz"
         artifact.write_bytes(artifact_bytes)
         bin_entry = package_bin(artifact, row["package_identifier"])
