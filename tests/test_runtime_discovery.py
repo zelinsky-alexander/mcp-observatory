@@ -2,6 +2,7 @@
 """Offline contract tests for runtime discovery v1."""
 
 import importlib.util
+import os
 import pathlib
 import sqlite3
 import subprocess
@@ -70,6 +71,21 @@ def test_inventory_validation() -> None:
     )
 
 
+def test_runtime_work_directories_ignore_umask() -> None:
+    old_umask = os.umask(0o022)
+    try:
+        with tempfile.TemporaryDirectory(prefix="mcpo-runtime-permissions-") as temporary:
+            root = pathlib.Path(temporary)
+            cache = root / "cache"
+            work = root / "work"
+            runtime_discovery.prepare_writable_directory(cache)
+            runtime_discovery.prepare_writable_directory(work)
+            assert cache.stat().st_mode & 0o777 == 0o777
+            assert work.stat().st_mode & 0o777 == 0o777
+    finally:
+        os.umask(old_umask)
+
+
 def test_persistence_contract() -> None:
     with tempfile.TemporaryDirectory(prefix="mcpo-runtime-test-") as temporary:
         root = pathlib.Path(temporary)
@@ -112,6 +128,7 @@ def test_persistence_contract() -> None:
 def main() -> None:
     test_bounded_process()
     test_inventory_validation()
+    test_runtime_work_directories_ignore_umask()
     test_persistence_contract()
     print("runtime discovery tests passed")
 
