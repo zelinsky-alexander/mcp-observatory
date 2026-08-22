@@ -315,7 +315,7 @@ def offline_install(image: str, cache: Path, work: Path, artifact: Path, timeout
         "--network", "none", "--cap-drop", "ALL",
         "--security-opt", "no-new-privileges", "--pids-limit", "128", "--memory", "768m",
         "--cpus", "1.0", "--ulimit", "nofile=256:256",
-        "--mount", f"type=bind,src={cache},dst=/npm-cache,ro=true",
+        "--mount", f"type=bind,src={cache},dst=/npm-cache",
         "--mount", f"type=bind,src={work},dst=/work", "--workdir", "/work",
         "--mount", f"type=bind,src={artifact.resolve()},dst=/artifact.tgz,ro=true",
         image, "npm", "install", "--offline", "--ignore-scripts", "--omit=dev",
