@@ -13,6 +13,7 @@ The installer is idempotent and targets the deployed AWS layout by default:
 - release/current symlink: `/opt/mcp-observatory/current`;
 - catalog database: `/var/lib/mcp-observatory/catalog/local-registry.sqlite`;
 - evidence directory: `/var/lib/mcp-observatory/evidence`;
+- Docker-visible temporary directory: `/var/lib/mcp-observatory/tmp`;
 - catalog writer account: `mcp-refresh`;
 - shared read group: `mcp-catalog`.
 
@@ -33,6 +34,8 @@ The generated service processes at most 1,000 package records and at most 50
 minutes per invocation. The timer starts it hourly. The refresh drop-in starts it
 after each successful daily catalog refresh, so new package/version records are
 handled while the hourly runs continue draining the historical backlog.
+
+The installer sets `TMPDIR` to the state directory rather than `/tmp`. The analyzer stages bind-mounted inputs there, so the host Docker daemon can see the same paths while the service keeps `PrivateTmp=yes`.
 
 ## Security acknowledgement
 
