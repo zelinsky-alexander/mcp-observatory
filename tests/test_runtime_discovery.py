@@ -86,6 +86,34 @@ def test_runtime_work_directories_ignore_umask() -> None:
         os.umask(old_umask)
 
 
+def test_writable_docker_stages_use_host_uid_gid() -> None:
+    expected = f"{os.getuid()}:{os.getgid()}"
+    captured = []
+    original = runtime_discovery.run_docker
+
+    def fake_run_docker(argv, *, timeout, container_id_file):
+        captured.append(list(argv))
+        return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+    runtime_discovery.run_docker = fake_run_docker
+    try:
+        with tempfile.TemporaryDirectory(prefix="mcpo-runtime-user-") as temporary:
+            root = pathlib.Path(temporary)
+            cache = root / "cache"
+            work = root / "work"
+            runtime_discovery.prepare_writable_directory(cache)
+            runtime_discovery.prepare_writable_directory(work)
+            runtime_discovery.populate_cache("node:test", cache, "pkg", "1.0.0", 5)
+            runtime_discovery.offline_install("node:test", cache, work, "pkg", "1.0.0", 5)
+    finally:
+        runtime_discovery.run_docker = original
+
+    assert len(captured) == 2
+    for argv in captured:
+        user_index = argv.index("--user")
+        assert argv[user_index + 1] == expected
+
+
 def test_persistence_contract() -> None:
     with tempfile.TemporaryDirectory(prefix="mcpo-runtime-test-") as temporary:
         root = pathlib.Path(temporary)
@@ -129,6 +157,7 @@ def main() -> None:
     test_bounded_process()
     test_inventory_validation()
     test_runtime_work_directories_ignore_umask()
+    test_writable_docker_stages_use_host_uid_gid()
     test_persistence_contract()
     print("runtime discovery tests passed")
 
