@@ -131,6 +131,14 @@ def test_runtime_install_uses_verified_artifact_and_offline_boundary() -> None:
     assert install_argv[network_index + 1] == "none"
     assert "--offline" in install_argv
     assert "--no-save" in install_argv
+    assert any(
+        item.endswith(",dst=/npm-cache") for item in install_argv
+        if item.startswith("type=bind,")
+    )
+    assert not any(
+        item.endswith(",dst=/npm-cache,ro=true") for item in install_argv
+        if item.startswith("type=bind,")
+    )
 
 
 def test_persistence_contract() -> None:
