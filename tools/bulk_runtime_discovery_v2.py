@@ -46,8 +46,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     here = Path(__file__).resolve().parent
-    scheduler = here / "bulk_runtime_discovery_auto.py"
-    runtime_runner = here / "runtime_discovery_auto.py"
+    scheduler = here / "bulk_runtime_discovery_argument_semantics.py"
+    runtime_runner = here / "runtime_discovery_argument_semantics.py"
     mvp = here / "storage_v2_mvp.py"
     runtime_publish = here / "storage_v2_runtime_publish.py"
 
