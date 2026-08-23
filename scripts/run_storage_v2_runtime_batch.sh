@@ -9,7 +9,7 @@ evidence_root="${MCPO_V2_RUNTIME_EVIDENCE_ROOT:-$state_dir/runtime-evidence}"
 guard_root="${MCPO_NATIVE_GUARD_ROOT:-/opt/mcp-native-guard/current}"
 guard_binary="${MCPO_NATIVE_GUARD_BINARY:-$guard_root/build/release/mcp-native-guard}"
 probe_profile="${MCPO_RUNTIME_PROBE_PROFILE:-$guard_root/profiles/observatory-discovery-v1.json}"
-runtime_image="${MCPO_RUNTIME_IMAGE:-node:22-bookworm-slim}"
+runtime_image="${MCPO_RUNTIME_IMAGE:-auto-node-v1}"
 batch_size="${MCPO_RUNTIME_BATCH_SIZE:-10}"
 maximum_run_seconds="${MCPO_RUNTIME_MAXIMUM_RUN_SECONDS:-3000}"
 phase_timeout_seconds="${MCPO_RUNTIME_PHASE_TIMEOUT_SECONDS:-180}"
@@ -24,6 +24,8 @@ for file in \
   "$guard_binary" \
   "$probe_profile" \
   "$project_dir/tools/bulk_runtime_discovery_v2.py" \
+  "$project_dir/tools/bulk_runtime_discovery_auto.py" \
+  "$project_dir/tools/runtime_discovery_auto.py" \
   "$project_dir/tools/runtime_discovery.py"
 do
   [[ -f "$file" ]] || { echo "required file missing: $file" >&2; exit 2; }
