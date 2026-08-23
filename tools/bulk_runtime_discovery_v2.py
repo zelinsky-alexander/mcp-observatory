@@ -32,7 +32,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--guard-binary", required=True, type=Path)
     parser.add_argument("--probe-profile", required=True, type=Path)
     parser.add_argument("--evidence-root", required=True, type=Path)
-    parser.add_argument("--runtime-image", default="node:22-bookworm-slim")
+    parser.add_argument("--runtime-image", default="auto-node-v1")
     parser.add_argument("--batch-size", type=int, default=10)
     parser.add_argument("--maximum-run-seconds", type=int, default=3000)
     parser.add_argument("--maximum-attempts", type=int, default=3)
@@ -46,8 +46,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     here = Path(__file__).resolve().parent
-    scheduler = here / "bulk_runtime_discovery.py"
-    runtime_runner = here / "runtime_discovery.py"
+    scheduler = here / "bulk_runtime_discovery_auto.py"
+    runtime_runner = here / "runtime_discovery_auto.py"
     mvp = here / "storage_v2_mvp.py"
     runtime_publish = here / "storage_v2_runtime_publish.py"
 
@@ -89,7 +89,6 @@ def main() -> int:
         sys.stderr.write(scheduler_run.stderr)
         return scheduler_run.returncode
 
-    # Preserve the existing Storage v2 publication path for all other summaries.
     published = run_checked(
         [
             sys.executable,
