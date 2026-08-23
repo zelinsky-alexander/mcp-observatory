@@ -37,9 +37,10 @@ def make_db(path: Path) -> sqlite3.Connection:
           run_id INTEGER,name TEXT,definition_json TEXT,definition_sha256 TEXT
         );
         CREATE TABLE runtime_discovery_schedule_state(
-          profile_key TEXT,package_id INTEGER,state TEXT,runtime_observation_run_id INTEGER,
-          previous_compatible_run_id INTEGER,added_tools INTEGER,removed_tools INTEGER,
-          modified_tools INTEGER,unchanged_tools INTEGER,updated_at TEXT
+          profile_key TEXT,package_id INTEGER,state TEXT,reason_code TEXT,reason_message TEXT,
+          runtime_observation_run_id INTEGER,previous_compatible_run_id INTEGER,
+          added_tools INTEGER,removed_tools INTEGER,modified_tools INTEGER,
+          unchanged_tools INTEGER,updated_at TEXT
         );
         INSERT INTO server_versions VALUES(1,'io.example/server','1.0.0','2026-01-01T00:00:00Z');
         INSERT INTO server_versions VALUES(2,'io.example/server','2.0.0','2026-02-01T00:00:00Z');
@@ -118,7 +119,6 @@ class AutomaticSchedulerCompatibilityTests(unittest.TestCase):
             )
             self.assertEqual(previous, 101)
 
-            # Observation order must not reverse chronology: v2 cannot use later-published v3.
             previous_for_v2 = auto_scheduler.previous_compatible_run(
                 db, "p", 102, 2, "io.example/server", "example-mcp"
             )
@@ -136,7 +136,6 @@ class AutomaticSchedulerCompatibilityTests(unittest.TestCase):
                     "INSERT INTO runtime_observation_tools VALUES(?,?,?,?)",
                     (run_id, name, '{"name":"' + name + '"}', "f" * 64),
                 )
-            # Simulate the old completion-order bug: v2 points to later-published v3.
             db.execute(
                 """UPDATE runtime_discovery_schedule_state
                    SET previous_compatible_run_id=202,added_tools=1,removed_tools=1,
@@ -145,55 +144,71 @@ class AutomaticSchedulerCompatibilityTests(unittest.TestCase):
             )
             db.commit()
 
-            # Exercise the repair portion directly; base synchronization needs the full production schema.
-            rows = db.execute(
-                """SELECT s.package_id,s.runtime_observation_run_id,
-                          r.server_version_id,sv.server_identifier,
-                          p.identifier AS package_identifier
-                   FROM runtime_discovery_schedule_state s
-                   JOIN runtime_observation_runs r ON r.id=s.runtime_observation_run_id
-                   JOIN server_versions sv ON sv.id=r.server_version_id
-                   JOIN packages p ON p.id=r.package_id
-                   WHERE s.profile_key='p' AND s.state='completed'"""
-            ).fetchall()
-            for row in rows:
-                run_id = int(row["runtime_observation_run_id"])
-                previous = auto_scheduler.previous_compatible_run(
-                    db,
-                    "p",
-                    run_id,
-                    int(row["server_version_id"]),
-                    str(row["server_identifier"]),
-                    str(row["package_identifier"]),
+            previous = auto_scheduler.previous_compatible_run(
+                db, "p", 203, 2, "io.example/server", "example-mcp"
+            )
+            self.assertEqual(previous, 201)
+            db.close()
+
+    def test_guard_failure_taxonomy(self) -> None:
+        samples = {
+            "FAIL child exited early": "protocol_child_exited_early",
+            "FAIL malformed_json": "protocol_malformed_json",
+            "FAIL initialize timeout": "protocol_initialize_timeout",
+            "FAIL tools/list timeout": "protocol_tools_list_timeout",
+            "FAIL wrong_response_id": "protocol_wrong_response_id",
+            "FAIL unsupported_jsonrpc_version": "protocol_unsupported_jsonrpc",
+            "FAIL oversized message": "protocol_oversized_message",
+            "FAIL unsolicited message": "protocol_unsolicited_message",
+        }
+        for marker, expected in samples.items():
+            stderr = (
+                "runtime discovery failed: mcp-native-guard inspect failed: "
+                + marker
+                + "\ninspect result: failure\n"
+            )
+            state, code, _ = auto_scheduler.classify_child_failure(stderr, 1)
+            self.assertEqual(state, "failed")
+            self.assertEqual(code, expected)
+
+        state, code, _ = auto_scheduler.classify_child_failure(
+            "runtime discovery failed: mcp-native-guard inspect failed: FAIL mystery\n",
+            1,
+        )
+        self.assertEqual((state, code), ("failed", "protocol_failed_other"))
+
+    def test_reclassifies_existing_generic_protocol_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            db = make_db(Path(temporary) / "db.sqlite")
+            db.execute(
+                """INSERT INTO runtime_discovery_schedule_state(
+                     profile_key,package_id,state,reason_code,reason_message,updated_at)
+                   VALUES('p',10,'failed','protocol_failed',?,CURRENT_TIMESTAMP)""",
+                (
+                    "runtime discovery failed: mcp-native-guard inspect failed: "
+                    "FAIL child exited early\ninspect result: failure\n",
+                ),
+            )
+            db.execute(
+                """INSERT INTO runtime_discovery_schedule_state(
+                     profile_key,package_id,state,reason_code,reason_message,updated_at)
+                   VALUES('p',11,'failed','protocol_failed',?,CURRENT_TIMESTAMP)""",
+                (
+                    "runtime discovery failed: mcp-native-guard inspect failed: "
+                    "FAIL malformed_json\ninspect result: failure\n",
+                ),
+            )
+            db.commit()
+            changed = auto_scheduler.refine_persisted_protocol_failures(db, "p")
+            self.assertEqual(changed, 2)
+            rows = {
+                int(row["package_id"]): str(row["reason_code"])
+                for row in db.execute(
+                    "SELECT package_id,reason_code FROM runtime_discovery_schedule_state"
                 )
-                drift = (
-                    auto_scheduler.base.compare_runs(db, previous, run_id)
-                    if previous is not None
-                    else None
-                )
-                counts = {name: None for name in ("added", "removed", "modified", "unchanged")}
-                if drift is not None:
-                    counts = {name: len(drift[name]) for name in counts}
-                db.execute(
-                    """UPDATE runtime_discovery_schedule_state
-                       SET previous_compatible_run_id=?,added_tools=?,removed_tools=?,
-                           modified_tools=?,unchanged_tools=?
-                       WHERE profile_key='p' AND package_id=?""",
-                    (
-                        previous,
-                        counts["added"],
-                        counts["removed"],
-                        counts["modified"],
-                        counts["unchanged"],
-                        int(row["package_id"]),
-                    ),
-                )
-            repaired = db.execute(
-                """SELECT previous_compatible_run_id
-                   FROM runtime_discovery_schedule_state
-                   WHERE profile_key='p' AND package_id=11"""
-            ).fetchone()
-            self.assertEqual(repaired["previous_compatible_run_id"], 201)
+            }
+            self.assertEqual(rows[10], "protocol_child_exited_early")
+            self.assertEqual(rows[11], "protocol_malformed_json")
             db.close()
 
 
