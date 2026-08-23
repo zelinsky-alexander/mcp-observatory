@@ -5,8 +5,9 @@ The base scheduler still owns bounded claiming, retries, persistence, drift coun
 and profile identity. This layer teaches it that the versioned auto-node policy may
 resolve to one of a bounded set of concrete runtime images, that longitudinal
 comparisons are compatible only when both observations used the same resolved image,
-and that drift chronology follows registry publication time rather than scheduler
-completion order.
+that drift chronology follows registry publication time rather than scheduler
+completion order, and that Native Guard inspect failures retain their specific
+protocol failure class instead of collapsing into one generic bucket.
 """
 
 from __future__ import annotations
@@ -31,6 +32,34 @@ AUTO_SPEC = importlib.util.spec_from_file_location(
 assert AUTO_SPEC is not None and AUTO_SPEC.loader is not None
 auto = importlib.util.module_from_spec(AUTO_SPEC)
 AUTO_SPEC.loader.exec_module(auto)
+
+
+GUARD_FAILURE_CODES = (
+    ("fail child exited early", "protocol_child_exited_early"),
+    ("fail malformed_json", "protocol_malformed_json"),
+    ("fail initialize timeout", "protocol_initialize_timeout"),
+    ("fail tools/list timeout", "protocol_tools_list_timeout"),
+    ("fail wrong_response_id", "protocol_wrong_response_id"),
+    ("fail unsupported_jsonrpc_version", "protocol_unsupported_jsonrpc"),
+    ("fail oversized message", "protocol_oversized_message"),
+    ("fail unsolicited message", "protocol_unsolicited_message"),
+    ("fail initialize write", "protocol_initialize_write_failed"),
+    ("fail tools/list write", "protocol_tools_list_write_failed"),
+    ("fail initialize receive", "protocol_initialize_receive_failed"),
+    ("fail tools/list receive", "protocol_tools_list_receive_failed"),
+    ("fail downstream process start", "protocol_process_start_failed"),
+)
+
+
+def classify_child_failure(stderr: str, returncode: int) -> tuple[str, str, str]:
+    """Preserve bounded Native Guard inspect failure classes in scheduler state."""
+    lowered = stderr.lower()
+    if "mcp-native-guard inspect failed" in lowered:
+        for marker, code in GUARD_FAILURE_CODES:
+            if marker in lowered:
+                return "failed", code, stderr
+        return "failed", "protocol_failed_other", stderr
+    return base_classify_child_failure(stderr, returncode)
 
 
 def allowed_images(profile: dict[str, str]) -> set[str]:
@@ -143,6 +172,7 @@ def previous_compatible_run(
     return None if row is None else int(row["id"])
 
 
+base_classify_child_failure = base.classify_child_failure
 _original_synchronize = base.synchronize
 
 
@@ -152,7 +182,7 @@ def synchronize(
     profile: dict[str, str],
     stale_seconds: int,
 ) -> None:
-    """Synchronize scheduler state and repair drift links by publication chronology."""
+    """Repair drift chronology and refine persisted Guard protocol failure classes."""
     _original_synchronize(db, key, profile, stale_seconds)
     columns = {
         str(row["name"])
@@ -162,6 +192,8 @@ def synchronize(
         "profile_key",
         "package_id",
         "state",
+        "reason_code",
+        "reason_message",
         "runtime_observation_run_id",
         "previous_compatible_run_id",
         "added_tools",
@@ -171,6 +203,24 @@ def synchronize(
     }
     if not required.issubset(columns):
         return
+
+    failed_rows = db.execute(
+        """SELECT package_id,reason_message
+           FROM runtime_discovery_schedule_state
+           WHERE profile_key=? AND state='failed' AND reason_code='protocol_failed'
+             AND reason_message IS NOT NULL""",
+        (key,),
+    ).fetchall()
+    for row in failed_rows:
+        _, refined_code, _ = classify_child_failure(str(row["reason_message"]), 1)
+        if refined_code != "protocol_failed_other":
+            db.execute(
+                """UPDATE runtime_discovery_schedule_state
+                   SET reason_code=?
+                   WHERE profile_key=? AND package_id=? AND reason_code='protocol_failed'""",
+                (refined_code, key, int(row["package_id"])),
+            )
+
     rows = db.execute(
         """SELECT s.package_id,s.runtime_observation_run_id,
                   r.server_version_id,sv.server_identifier,
@@ -222,6 +272,7 @@ def synchronize(
 base._completed_state_is_valid = completed_state_is_valid
 base.verify_run = verify_run
 base.previous_compatible_run = previous_compatible_run
+base.classify_child_failure = classify_child_failure
 base.synchronize = synchronize
 
 
