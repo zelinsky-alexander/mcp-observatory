@@ -32,8 +32,6 @@ assert AUTO_SPEC is not None and AUTO_SPEC.loader is not None
 auto = importlib.util.module_from_spec(AUTO_SPEC)
 AUTO_SPEC.loader.exec_module(auto)
 
-# New scheduler states are terminal and non-retrying. They distinguish an artifact
-# that could not be meaningfully exercised from an actual observed protocol failure.
 base.SCHEMA = base.SCHEMA.replace(
     "'eligible','running','completed','failed','unsupported','unresolvable'",
     "'eligible','running','completed','failed','unsupported','unresolvable','blocked','inconclusive'",
@@ -79,6 +77,8 @@ ON runtime_discovery_schedule_state(
 )
 """
 
+# These all require the server to have produced or meaningfully progressed to an
+# MCP response. They are the only ordinary discovery outcomes stored as `failed`.
 PROTOCOL_FAILURE_CODES = {
     "fail malformed_json": "protocol_malformed_json",
     "fail wrong_response_id": "protocol_wrong_response_id",
@@ -90,6 +90,7 @@ PROTOCOL_FAILURE_CODES = {
     "fail tools/list receive": "protocol_tools_list_receive_failed",
 }
 
+# Failures before a meaningful MCP response are not protocol verdicts.
 INCONCLUSIVE_GUARD_CODES = {
     "fail child exited early": "startup_child_exited_early",
     "fail initialize timeout": "startup_initialize_timeout",
@@ -196,6 +197,7 @@ def startup_block_reason(stderr: str) -> str | None:
 
 
 def classify_child_failure(stderr: str, returncode: int) -> tuple[str, str, str]:
+    """Classify server protocol verdicts separately from launch/harness limitations."""
     lowered = stderr.lower()
 
     if "required environment unavailable:" in lowered:
@@ -213,11 +215,22 @@ def classify_child_failure(stderr: str, returncode: int) -> tuple[str, str, str]
         for marker, code in PROTOCOL_FAILURE_CODES.items():
             if marker in lowered:
                 return "failed", code, stderr
-        return "failed", "protocol_failed_other", stderr
+        # Unknown Guard stage is not enough evidence for a protocol verdict.
+        return "inconclusive", "protocol_stage_unknown", stderr
 
     if "http error 404" in lowered or "http error 410" in lowered:
         return "unresolvable", "artifact_unresolvable", stderr
-    return base_classify_child_failure(stderr, returncode)
+    if "no approved node runtime" in lowered:
+        return "unresolvable", "unsupported_runtime", stderr
+
+    state, code, message = base_classify_child_failure(stderr, returncode)
+    if state != "failed":
+        return state, code, message
+    if code == "install_failed" or "cache population failed" in lowered:
+        return "inconclusive", "runtime_install_failed", message
+    # Child timeouts/output bounds/other harness errors are operationally
+    # inconclusive; they are not evidence that the MCP protocol failed.
+    return "inconclusive", "runtime_harness_failed", message
 
 
 def refine_persisted_outcomes(db: sqlite3.Connection, key: str) -> int:
@@ -363,11 +376,28 @@ def previous_compatible_run(
 base_classify_child_failure = base.classify_child_failure
 _original_register_profile = base.register_profile
 _original_synchronize = base.synchronize
+_original_set_result = base.set_result
 
 
 def register_profile(db: sqlite3.Connection, profile: dict[str, str], key: str) -> None:
     ensure_outcome_states(db)
     _original_register_profile(db, profile, key)
+
+
+def set_result(
+    db: sqlite3.Connection,
+    key: str,
+    package_id: int,
+    state: str,
+    code: str | None,
+    message: str | None,
+    **kwargs: Any,
+) -> None:
+    """Keep internal result-verification errors out of the protocol-failure bucket."""
+    if state == "failed" and code == "result_verification_failed":
+        state = "inconclusive"
+        code = "runtime_result_verification_failed"
+    _original_set_result(db, key, package_id, state, code, message, **kwargs)
 
 
 def synchronize(
@@ -454,6 +484,7 @@ base._completed_state_is_valid = completed_state_is_valid
 base.verify_run = verify_run
 base.previous_compatible_run = previous_compatible_run
 base.classify_child_failure = classify_child_failure
+base.set_result = set_result
 base.synchronize = synchronize
 base.summary = summary
 
