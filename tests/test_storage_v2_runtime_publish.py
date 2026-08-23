@@ -25,6 +25,9 @@ publisher = load(
 )
 runtime = load("runtime_discovery", ROOT / "tools" / "runtime_discovery.py")
 scheduler = load("bulk_runtime_discovery", ROOT / "tools" / "bulk_runtime_discovery.py")
+auto_scheduler = load(
+    "bulk_runtime_discovery_auto_test", ROOT / "tools" / "bulk_runtime_discovery_auto.py"
+)
 
 
 def base_schema(db: sqlite3.Connection) -> None:
@@ -33,7 +36,8 @@ def base_schema(db: sqlite3.Connection) -> None:
         CREATE TABLE server_versions(
           id INTEGER PRIMARY KEY,
           server_identifier TEXT NOT NULL,
-          server_version TEXT NOT NULL
+          server_version TEXT NOT NULL,
+          published_at TEXT
         );
         CREATE TABLE packages(
           id INTEGER PRIMARY KEY,
@@ -43,9 +47,31 @@ def base_schema(db: sqlite3.Connection) -> None:
           version TEXT,
           transport TEXT
         );
-        INSERT INTO server_versions VALUES(1,'io.example/server','1.0.0');
+        CREATE TABLE package_arguments(
+          package_id INTEGER,position INTEGER,argument_value TEXT,
+          PRIMARY KEY(package_id,position)
+        );
+        CREATE TABLE package_environment(
+          package_id INTEGER,position INTEGER,name TEXT,required INTEGER,description TEXT,
+          PRIMARY KEY(package_id,position)
+        );
+        INSERT INTO server_versions VALUES(1,'io.example/server','1.0.0','2026-01-01T00:00:00Z');
         INSERT INTO packages VALUES(10,1,'npm','example-mcp','1.0.0','stdio');
         """
+    )
+
+
+def seed_profile(db: sqlite3.Connection) -> None:
+    db.execute(
+        """INSERT INTO runtime_discovery_schedule_profiles(
+             profile_key,scheduler_version,guard_sha256,runtime_image,
+             probe_profile_sha256,runner_sha256)
+           VALUES(?,?,?,?,?,?)""",
+        ("a" * 64, "1.0.0", "b" * 64, "node:test", "c" * 64, "d" * 64),
+    )
+    db.execute(
+        "INSERT INTO runtime_discovery_schedule_current(singleton,profile_key) VALUES(1,?)",
+        ("a" * 64,),
     )
 
 
@@ -60,17 +86,7 @@ def test_first_runtime_publication_installs_hot_schema() -> None:
         base_schema(p)
         h.executescript(runtime.SCHEMA)
         h.executescript(scheduler.SCHEMA)
-        h.execute(
-            """INSERT INTO runtime_discovery_schedule_profiles(
-                 profile_key,scheduler_version,guard_sha256,runtime_image,
-                 probe_profile_sha256,runner_sha256)
-               VALUES(?,?,?,?,?,?)""",
-            ("a" * 64, "1.0.0", "b" * 64, "node:test", "c" * 64, "d" * 64),
-        )
-        h.execute(
-            "INSERT INTO runtime_discovery_schedule_current(singleton,profile_key) VALUES(1,?)",
-            ("a" * 64,),
-        )
+        seed_profile(h)
         h.execute(
             """INSERT INTO runtime_observation_runs(
                  id,server_version_id,package_id,status,artifact_sha256,
@@ -113,8 +129,53 @@ def test_first_runtime_publication_installs_hot_schema() -> None:
         p.close()
 
 
+def test_publication_migrates_hot_state_constraint_for_blocked_outcome() -> None:
+    with tempfile.TemporaryDirectory(prefix="mcpo-runtime-publish-blocked-") as temporary:
+        root = Path(temporary)
+        history = root / "history.sqlite"
+        hot = root / "hot.sqlite"
+        h = sqlite3.connect(history)
+        h.row_factory = sqlite3.Row
+        p = sqlite3.connect(hot)
+        base_schema(h)
+        base_schema(p)
+        h.executescript(runtime.SCHEMA)
+        h.executescript(scheduler.SCHEMA)
+        auto_scheduler.ensure_outcome_states(h)
+        seed_profile(h)
+        h.execute(
+            """INSERT INTO runtime_discovery_schedule_state(
+                 profile_key,package_id,state,reason_code,reason_message)
+               VALUES(?,10,'blocked','blocked_required_environment','GITHUB_TOKEN required')""",
+            ("a" * 64,),
+        )
+        h.commit()
+        h.close()
+
+        # Seed the hot database with the legacy scheduler CHECK constraint to
+        # verify that publisher migration happens before copying blocked rows.
+        p.executescript(runtime.SCHEMA)
+        p.executescript(scheduler.SCHEMA)
+        p.commit()
+        p.close()
+
+        result = publisher.mirror(history, hot)
+        assert result["runtime_discovery_schedule_state"] == 1
+        p = sqlite3.connect(hot)
+        row = p.execute(
+            "SELECT state,reason_code FROM runtime_discovery_schedule_state"
+        ).fetchone()
+        assert row == ("blocked", "blocked_required_environment")
+        definition = p.execute(
+            "SELECT sql FROM sqlite_schema WHERE type='table' AND name='runtime_discovery_schedule_state'"
+        ).fetchone()[0]
+        assert "'blocked'" in definition and "'inconclusive'" in definition
+        p.close()
+
+
 def main() -> None:
     test_first_runtime_publication_installs_hot_schema()
+    test_publication_migrates_hot_state_constraint_for_blocked_outcome()
     print("Storage v2 runtime publish tests passed")
 
 
