@@ -56,7 +56,7 @@ const {spawn} = require('child_process');
 const limit = 4096;
 const target = process.argv[1];
 const args = process.argv.slice(2);
-const fd = fs.openSync('/diagnostics/server.stderr', 'w', 0o600);
+const fd = fs.openSync('/diagnostics/server.stderr', 'w', 0o644);
 let kept = 0;
 let closed = false;
 function closeFile() {
@@ -85,6 +85,12 @@ child.on('exit', (code, signal) => {
   process.exit(code === null ? 1 : code);
 });
 """.strip()
+
+
+def _table_exists(db: sqlite3.Connection, name: str) -> bool:
+    return db.execute(
+        "SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?", (name,)
+    ).fetchone() is not None
 
 
 def package_manifest(artifact: Path) -> dict[str, Any]:
@@ -118,7 +124,7 @@ def launch_declarations(
 ) -> tuple[list[str], list[dict[str, Any]]]:
     """Load the exact Registry-declared argv/environment launch prerequisites."""
     arguments: list[str] = []
-    if base.table_exists(db, "package_arguments"):
+    if _table_exists(db, "package_arguments"):
         for row in db.execute(
             "SELECT position,argument_value FROM package_arguments WHERE package_id=? ORDER BY position",
             (package_id,),
@@ -132,7 +138,7 @@ def launch_declarations(
             arguments.append(text)
 
     environment: list[dict[str, Any]] = []
-    if base.table_exists(db, "package_environment"):
+    if _table_exists(db, "package_environment"):
         for row in db.execute(
             "SELECT position,name,required,description FROM package_environment WHERE package_id=? ORDER BY position",
             (package_id,),
