@@ -17,7 +17,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
-from typing import Iterator
+from typing import Any, Iterator
 
 RUNTIME_TABLES = (
     "runtime_observation_runs",
@@ -35,8 +35,7 @@ INSERT_ORDER = (*RUNTIME_TABLES, *SCHEDULE_TABLES)
 def writer_lock(database: Path) -> Iterator[None]:
     descriptor = os.open(
         Path(str(database) + ".writer.lock"),
-        os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
-        0o600,
+        os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600,
     )
     try:
         while True:
@@ -62,14 +61,18 @@ def connect(path: Path, *, readonly: bool = False) -> sqlite3.Connection:
     return db
 
 
-def load_schema(filename: str, module_name: str) -> str:
+def load_module(filename: str, module_name: str) -> Any:
     path = Path(__file__).with_name(filename)
     spec = importlib.util.spec_from_file_location(module_name, path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"cannot load {filename}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return str(module.SCHEMA)
+    return module
+
+
+def load_schema(filename: str, module_name: str) -> str:
+    return str(load_module(filename, module_name).SCHEMA)
 
 
 def table_exists(db: sqlite3.Connection, name: str) -> bool:
@@ -107,12 +110,19 @@ def mirror(history: Path, hot: Path) -> dict[str, int]:
 
             with target:
                 # The runtime runner and bulk scheduler own these additive schemas.
-                # Installing them in the hot catalog makes first publication work
-                # even when the hot database was created before any runtime run.
                 target.executescript(load_schema("runtime_discovery.py", "runtime_discovery"))
                 target.executescript(
                     load_schema("bulk_runtime_discovery.py", "bulk_runtime_discovery")
                 )
+
+                # Automatic-runtime outcome semantics add terminal blocked and
+                # inconclusive states. Upgrade an older hot scheduler table before
+                # copying source rows so the read model accepts the authoritative
+                # history generation without weakening its CHECK constraint.
+                auto_scheduler = load_module(
+                    "bulk_runtime_discovery_auto.py", "bulk_runtime_discovery_auto_publish"
+                )
+                auto_scheduler.ensure_outcome_states(target)
 
                 for name in RUNTIME_TABLES:
                     if columns(source, name) != columns(target, name):
@@ -150,12 +160,18 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--history", required=True, type=Path)
     parser.add_argument("--hot", required=True, type=Path)
-    return parser.parse_args()
+    args = parser.parse_args()
+    result = mirror(args.history.resolve(), args.hot.resolve())
+    print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+    return 0
 
 
 def main() -> int:
-    args = parse_args()
-    result = mirror(args.history, args.hot)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--history", required=True, type=Path)
+    parser.add_argument("--hot", required=True, type=Path)
+    args = parser.parse_args()
+    result = mirror(args.history.resolve(), args.hot.resolve())
     print(json.dumps(result, sort_keys=True, separators=(",", ":")))
     return 0
 
