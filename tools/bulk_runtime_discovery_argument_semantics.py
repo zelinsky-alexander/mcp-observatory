@@ -222,13 +222,71 @@ def refine_persisted_outcomes(db: sqlite3.Connection, key: str) -> int:
     return changed
 
 
+_base_synchronize = scheduler._original_synchronize
+
+
+def preserve_terminal_outcomes_during_sync(
+    db: sqlite3.Connection,
+    key: str,
+    profile: dict[str, str],
+    stale_seconds: int,
+) -> None:
+    """Keep runtime terminal outcomes when static eligibility remains unchanged."""
+    terminal_rows = db.execute(
+        """SELECT package_id,state,reason_code,reason_message
+           FROM runtime_discovery_schedule_state
+           WHERE profile_key=? AND state IN('blocked','inconclusive')""",
+        (key,),
+    ).fetchall()
+
+    _base_synchronize(db, key, profile, stale_seconds)
+
+    for row in terminal_rows:
+        package_id = int(row["package_id"])
+        current = db.execute(
+            """SELECT state,reason_code
+               FROM runtime_discovery_schedule_state
+               WHERE profile_key=? AND package_id=?""",
+            (key, package_id),
+        ).fetchone()
+        if current is None or current["state"] != "eligible" or current["reason_code"] is not None:
+            continue
+
+        package = db.execute(
+            """SELECT id,registry_type,identifier,version,transport
+               FROM packages WHERE id=?""",
+            (package_id,),
+        ).fetchone()
+        if package is None:
+            continue
+        base_state, _, _ = scheduler.base.classify(package)
+        if base_state != "eligible":
+            continue
+
+        db.execute(
+            """UPDATE runtime_discovery_schedule_state
+               SET state=?,reason_code=?,reason_message=?,updated_at=CURRENT_TIMESTAMP
+               WHERE profile_key=? AND package_id=?""",
+            (
+                row["state"],
+                row["reason_code"],
+                row["reason_message"],
+                key,
+                package_id,
+            ),
+        )
+
+
 scheduler.package_prerequisite = package_prerequisite
 scheduler.classify_child_failure = classify_child_failure
 scheduler.base.classify_child_failure = classify_child_failure
 scheduler.refine_persisted_outcomes = refine_persisted_outcomes
+scheduler._original_synchronize = preserve_terminal_outcomes_during_sync
 
-# bulk_runtime_discovery_auto.synchronize resolves refine_persisted_outcomes through
-# its module globals, so replacing it above also upgrades already-persisted rows.
+# bulk_runtime_discovery_auto.synchronize resolves refine_persisted_outcomes and
+# _original_synchronize through its module globals. Replacing both above upgrades
+# persisted diagnostics and prevents terminal runtime outcomes from being reset to
+# static `eligible` state before refinement.
 
 
 if __name__ == "__main__":
