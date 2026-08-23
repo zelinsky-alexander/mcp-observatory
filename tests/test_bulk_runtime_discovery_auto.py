@@ -5,6 +5,7 @@ import importlib.util
 from pathlib import Path
 import sqlite3
 import tempfile
+import unittest
 
 ROOT = Path(__file__).resolve().parent.parent
 SPEC = importlib.util.spec_from_file_location(
@@ -48,51 +49,49 @@ def profile() -> dict[str, str]:
     }
 
 
-def test_auto_profile_accepts_only_approved_images() -> None:
-    with tempfile.TemporaryDirectory() as temporary:
-        db = make_db(Path(temporary) / "db.sqlite")
-        guard = "sha256:" + "a" * 64
-        db.execute(
-            "INSERT INTO runtime_observation_runs VALUES(101,1,10,'completed',?,?,?,?,NULL,CURRENT_TIMESTAMP)",
-            ("1" * 64, "2" * 64, "node:22-trixie-slim", guard),
-        )
-        db.execute(
-            "INSERT INTO runtime_observation_runs VALUES(102,2,11,'completed',?,?,?,?,NULL,CURRENT_TIMESTAMP)",
-            ("3" * 64, "4" * 64, "node:22-bookworm-slim", guard),
-        )
-        db.commit()
-        assert auto_scheduler.completed_state_is_valid(db, 101, 10, profile())
-        assert not auto_scheduler.completed_state_is_valid(db, 102, 11, profile())
-        db.close()
-
-
-def test_drift_compatibility_requires_same_resolved_image() -> None:
-    with tempfile.TemporaryDirectory() as temporary:
-        db = make_db(Path(temporary) / "db.sqlite")
-        guard = "sha256:" + "a" * 64
-        rows = [
-            (101,1,10,"node:22-trixie-slim"),
-            (102,2,11,"node:24-trixie-slim"),
-            (103,3,12,"node:22-trixie-slim"),
-        ]
-        for run_id, sv_id, pkg_id, image in rows:
+class AutomaticSchedulerCompatibilityTests(unittest.TestCase):
+    def test_auto_profile_accepts_only_approved_images(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            db = make_db(Path(temporary) / "db.sqlite")
+            guard = "sha256:" + "a" * 64
             db.execute(
-                "INSERT INTO runtime_observation_runs VALUES(?,?,?,'completed',?,?,?,?,NULL,CURRENT_TIMESTAMP)",
-                (run_id, sv_id, pkg_id, str(run_id)[-1] * 64, "b" * 64, image, guard),
+                "INSERT INTO runtime_observation_runs VALUES(101,1,10,'completed',?,?,?,?,NULL,CURRENT_TIMESTAMP)",
+                ("1" * 64, "2" * 64, "node:22-trixie-slim", guard),
             )
             db.execute(
-                "INSERT INTO runtime_discovery_schedule_state VALUES('p',?,'completed',?)",
-                (pkg_id, run_id),
+                "INSERT INTO runtime_observation_runs VALUES(102,2,11,'completed',?,?,?,?,NULL,CURRENT_TIMESTAMP)",
+                ("3" * 64, "4" * 64, "node:22-bookworm-slim", guard),
             )
-        db.commit()
-        previous = auto_scheduler.previous_compatible_run(
-            db, "p", 103, 3, "io.example/server", "example-mcp"
-        )
-        assert previous == 101
-        db.close()
+            db.commit()
+            self.assertTrue(auto_scheduler.completed_state_is_valid(db, 101, 10, profile()))
+            self.assertFalse(auto_scheduler.completed_state_is_valid(db, 102, 11, profile()))
+            db.close()
+
+    def test_drift_compatibility_requires_same_resolved_image(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            db = make_db(Path(temporary) / "db.sqlite")
+            guard = "sha256:" + "a" * 64
+            rows = [
+                (101,1,10,"node:22-trixie-slim"),
+                (102,2,11,"node:24-trixie-slim"),
+                (103,3,12,"node:22-trixie-slim"),
+            ]
+            for run_id, sv_id, pkg_id, image in rows:
+                db.execute(
+                    "INSERT INTO runtime_observation_runs VALUES(?,?,?,'completed',?,?,?,?,NULL,CURRENT_TIMESTAMP)",
+                    (run_id, sv_id, pkg_id, str(run_id)[-1] * 64, "b" * 64, image, guard),
+                )
+                db.execute(
+                    "INSERT INTO runtime_discovery_schedule_state VALUES('p',?,'completed',?)",
+                    (pkg_id, run_id),
+                )
+            db.commit()
+            previous = auto_scheduler.previous_compatible_run(
+                db, "p", 103, 3, "io.example/server", "example-mcp"
+            )
+            self.assertEqual(previous, 101)
+            db.close()
 
 
 if __name__ == "__main__":
-    test_auto_profile_accepts_only_approved_images()
-    test_drift_compatibility_requires_same_resolved_image()
-    print("automatic scheduler compatibility tests passed")
+    unittest.main()
