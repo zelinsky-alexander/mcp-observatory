@@ -27,6 +27,13 @@ def make_db(path: Path) -> sqlite3.Connection:
     db.row_factory = sqlite3.Row
     db.executescript(
         """
+        CREATE TABLE server_versions(
+          id INTEGER PRIMARY KEY,server_identifier TEXT,server_version TEXT
+        );
+        CREATE TABLE packages(
+          id INTEGER PRIMARY KEY,server_version_id INTEGER,registry_type TEXT,
+          identifier TEXT,version TEXT,transport TEXT
+        );
         CREATE TABLE package_arguments(
           package_id INTEGER,position INTEGER,argument_value TEXT,
           PRIMARY KEY(package_id,position)
@@ -35,9 +42,50 @@ def make_db(path: Path) -> sqlite3.Connection:
           package_id INTEGER,position INTEGER,name TEXT,required INTEGER,description TEXT,
           PRIMARY KEY(package_id,position)
         );
+        CREATE TABLE runtime_discovery_schedule_state(
+          profile_key TEXT NOT NULL,
+          package_id INTEGER NOT NULL,
+          state TEXT NOT NULL,
+          reason_code TEXT,
+          reason_message TEXT,
+          attempt_count INTEGER NOT NULL DEFAULT 0,
+          runtime_observation_run_id INTEGER,
+          artifact_sha256 TEXT,
+          launch_profile_sha256 TEXT,
+          previous_compatible_run_id INTEGER,
+          added_tools INTEGER,
+          removed_tools INTEGER,
+          modified_tools INTEGER,
+          unchanged_tools INTEGER,
+          discovered_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          last_attempt_at TEXT,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          PRIMARY KEY(profile_key,package_id)
+        );
         """
     )
     return db
+
+
+def seed_runtime_state(
+    db: sqlite3.Connection,
+    state: str,
+    reason_code: str,
+    reason_message: str,
+    *,
+    transport: str = "stdio",
+) -> None:
+    db.execute("INSERT INTO server_versions VALUES(1,'example/server','1.0.0')")
+    db.execute(
+        "INSERT INTO packages VALUES(7,1,'npm','example-mcp','1.0.0',?)",
+        (transport,),
+    )
+    db.execute(
+        """INSERT INTO runtime_discovery_schedule_state(
+             profile_key,package_id,state,reason_code,reason_message,attempt_count)
+           VALUES('profile',7,?,?,?,1)""",
+        (state, reason_code, reason_message),
+    )
 
 
 class RuntimeArgumentSemanticsTests(unittest.TestCase):
@@ -136,6 +184,72 @@ class RuntimeArgumentSemanticsTests(unittest.TestCase):
             message,
             "mcp-native-guard inspect failed: FAIL malformed_json inspect result: failure",
         )
+
+    def test_terminal_runtime_outcomes_survive_synchronize_and_are_not_candidates(self) -> None:
+        cases = (
+            (
+                "blocked",
+                "blocked_startup_network",
+                "mcp-native-guard inspect failed: FAIL child exited early\n"
+                "server stderr: getaddrinfo EAI_AGAIN api.example.com",
+            ),
+            (
+                "inconclusive",
+                "inconclusive_startup_package_error",
+                "mcp-native-guard inspect failed: FAIL child exited early\n"
+                "server stderr: Error [ERR_MODULE_NOT_FOUND]",
+            ),
+        )
+        for state, code, message in cases:
+            with self.subTest(state=state):
+                with tempfile.TemporaryDirectory() as temporary:
+                    db = make_db(Path(temporary) / "db.sqlite")
+                    seed_runtime_state(db, state, code, message)
+
+                    scheduler.preserve_terminal_outcomes_during_sync(
+                        db, "profile", {}, 7200
+                    )
+
+                    row = db.execute(
+                        """SELECT state,reason_code,reason_message
+                           FROM runtime_discovery_schedule_state
+                           WHERE profile_key='profile' AND package_id=7"""
+                    ).fetchone()
+                    self.assertIsNotNone(row)
+                    assert row is not None
+                    self.assertEqual(row["state"], state)
+                    self.assertEqual(row["reason_code"], code)
+                    self.assertEqual(row["reason_message"], message)
+                    self.assertEqual(
+                        scheduler.scheduler.base.candidates(
+                            db, "profile", 10, 3, 0
+                        ),
+                        [],
+                    )
+                    db.close()
+
+    def test_real_eligibility_change_replaces_terminal_runtime_outcome(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            db = make_db(Path(temporary) / "db.sqlite")
+            seed_runtime_state(
+                db,
+                "blocked",
+                "blocked_startup_network",
+                "network prerequisite",
+                transport="streamable-http",
+            )
+
+            scheduler.preserve_terminal_outcomes_during_sync(db, "profile", {}, 7200)
+
+            row = db.execute(
+                """SELECT state,reason_code FROM runtime_discovery_schedule_state
+                   WHERE profile_key='profile' AND package_id=7"""
+            ).fetchone()
+            self.assertIsNotNone(row)
+            assert row is not None
+            self.assertEqual(row["state"], "unsupported")
+            self.assertEqual(row["reason_code"], "unsupported_transport")
+            db.close()
 
 
 if __name__ == "__main__":
