@@ -28,6 +28,14 @@ def make_db(path: Path) -> sqlite3.Connection:
           published_at TEXT
         );
         CREATE TABLE packages(id INTEGER PRIMARY KEY,server_version_id INTEGER,identifier TEXT);
+        CREATE TABLE package_arguments(
+          package_id INTEGER,position INTEGER,argument_value TEXT,
+          PRIMARY KEY(package_id,position)
+        );
+        CREATE TABLE package_environment(
+          package_id INTEGER,position INTEGER,name TEXT,required INTEGER,description TEXT,
+          PRIMARY KEY(package_id,position)
+        );
         CREATE TABLE runtime_observation_runs(
           id INTEGER PRIMARY KEY,server_version_id INTEGER,package_id INTEGER,status TEXT,
           artifact_sha256 TEXT,launch_profile_sha256 TEXT,sandbox_image TEXT,guard_version TEXT,
@@ -38,9 +46,11 @@ def make_db(path: Path) -> sqlite3.Connection:
         );
         CREATE TABLE runtime_discovery_schedule_state(
           profile_key TEXT,package_id INTEGER,state TEXT,reason_code TEXT,reason_message TEXT,
-          runtime_observation_run_id INTEGER,previous_compatible_run_id INTEGER,
+          attempt_count INTEGER DEFAULT 0,runtime_observation_run_id INTEGER,
+          artifact_sha256 TEXT,launch_profile_sha256 TEXT,previous_compatible_run_id INTEGER,
           added_tools INTEGER,removed_tools INTEGER,modified_tools INTEGER,
-          unchanged_tools INTEGER,updated_at TEXT
+          unchanged_tools INTEGER,discovered_at TEXT DEFAULT CURRENT_TIMESTAMP,
+          last_attempt_at TEXT,updated_at TEXT
         );
         INSERT INTO server_versions VALUES(1,'io.example/server','1.0.0','2026-01-01T00:00:00Z');
         INSERT INTO server_versions VALUES(2,'io.example/server','2.0.0','2026-02-01T00:00:00Z');
@@ -150,16 +160,14 @@ class AutomaticSchedulerCompatibilityTests(unittest.TestCase):
             self.assertEqual(previous, 201)
             db.close()
 
-    def test_guard_failure_taxonomy(self) -> None:
+    def test_guard_failure_semantics_reserve_failed_for_protocol_observation(self) -> None:
         samples = {
-            "FAIL child exited early": "protocol_child_exited_early",
-            "FAIL malformed_json": "protocol_malformed_json",
-            "FAIL initialize timeout": "protocol_initialize_timeout",
-            "FAIL tools/list timeout": "protocol_tools_list_timeout",
-            "FAIL wrong_response_id": "protocol_wrong_response_id",
-            "FAIL unsupported_jsonrpc_version": "protocol_unsupported_jsonrpc",
-            "FAIL oversized message": "protocol_oversized_message",
-            "FAIL unsolicited message": "protocol_unsolicited_message",
+            "FAIL child exited early": ("inconclusive", "startup_child_exited_early"),
+            "FAIL initialize timeout": ("inconclusive", "startup_initialize_timeout"),
+            "FAIL malformed_json": ("failed", "protocol_malformed_json"),
+            "FAIL tools/list timeout": ("failed", "protocol_tools_list_timeout"),
+            "FAIL wrong_response_id": ("failed", "protocol_wrong_response_id"),
+            "FAIL unsupported_jsonrpc_version": ("failed", "protocol_unsupported_jsonrpc"),
         }
         for marker, expected in samples.items():
             stderr = (
@@ -168,47 +176,75 @@ class AutomaticSchedulerCompatibilityTests(unittest.TestCase):
                 + "\ninspect result: failure\n"
             )
             state, code, _ = auto_scheduler.classify_child_failure(stderr, 1)
-            self.assertEqual(state, "failed")
-            self.assertEqual(code, expected)
+            self.assertEqual((state, code), expected)
 
-        state, code, _ = auto_scheduler.classify_child_failure(
-            "runtime discovery failed: mcp-native-guard inspect failed: FAIL mystery\n",
-            1,
+    def test_bounded_stderr_can_identify_blocking_prerequisite(self) -> None:
+        stderr = (
+            "runtime discovery failed: mcp-native-guard inspect failed: "
+            "FAIL child exited early\ninspect result: failure\n"
+            "server stderr: Error: API key is required; please set FOO_API_KEY\n"
         )
-        self.assertEqual((state, code), ("failed", "protocol_failed_other"))
+        state, code, _ = auto_scheduler.classify_child_failure(stderr, 1)
+        self.assertEqual((state, code), ("blocked", "blocked_startup_environment"))
 
-    def test_reclassifies_existing_generic_protocol_failures(self) -> None:
+        stderr = (
+            "runtime discovery failed: mcp-native-guard inspect failed: "
+            "FAIL child exited early\nserver stderr: Usage: server --config PATH\n"
+        )
+        state, code, _ = auto_scheduler.classify_child_failure(stderr, 1)
+        self.assertEqual((state, code), ("blocked", "blocked_startup_arguments"))
+
+    def test_declared_required_environment_blocks_without_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            db = make_db(Path(temporary) / "db.sqlite")
+            db.execute(
+                "INSERT INTO package_environment VALUES(10,0,'GITHUB_TOKEN',1,'token')"
+            )
+            outcome = auto_scheduler.package_prerequisite(db, 10)
+            self.assertIsNotNone(outcome)
+            assert outcome is not None
+            self.assertEqual(outcome[:2], ("blocked", "blocked_required_environment"))
+            self.assertIn("GITHUB_TOKEN", outcome[2])
+            db.close()
+
+    def test_missing_declared_argument_blocks_without_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            db = make_db(Path(temporary) / "db.sqlite")
+            db.execute("INSERT INTO package_arguments VALUES(10,0,NULL)")
+            outcome = auto_scheduler.package_prerequisite(db, 10)
+            self.assertIsNotNone(outcome)
+            assert outcome is not None
+            self.assertEqual(outcome[:2], ("blocked", "blocked_required_argument"))
+            db.close()
+
+    def test_http_404_is_artifact_unresolvable(self) -> None:
+        state, code, _ = auto_scheduler.classify_child_failure(
+            "runtime discovery failed: HTTP Error 404: Not Found", 2
+        )
+        self.assertEqual((state, code), ("unresolvable", "artifact_unresolvable"))
+
+    def test_refines_persisted_startup_outcome(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             db = make_db(Path(temporary) / "db.sqlite")
             db.execute(
                 """INSERT INTO runtime_discovery_schedule_state(
                      profile_key,package_id,state,reason_code,reason_message,updated_at)
-                   VALUES('p',10,'failed','protocol_failed',?,CURRENT_TIMESTAMP)""",
+                   VALUES('p',10,'failed','protocol_child_exited_early',?,CURRENT_TIMESTAMP)""",
                 (
                     "runtime discovery failed: mcp-native-guard inspect failed: "
                     "FAIL child exited early\ninspect result: failure\n",
                 ),
             )
-            db.execute(
-                """INSERT INTO runtime_discovery_schedule_state(
-                     profile_key,package_id,state,reason_code,reason_message,updated_at)
-                   VALUES('p',11,'failed','protocol_failed',?,CURRENT_TIMESTAMP)""",
-                (
-                    "runtime discovery failed: mcp-native-guard inspect failed: "
-                    "FAIL malformed_json\ninspect result: failure\n",
-                ),
-            )
             db.commit()
-            changed = auto_scheduler.refine_persisted_protocol_failures(db, "p")
-            self.assertEqual(changed, 2)
-            rows = {
-                int(row["package_id"]): str(row["reason_code"])
-                for row in db.execute(
-                    "SELECT package_id,reason_code FROM runtime_discovery_schedule_state"
-                )
-            }
-            self.assertEqual(rows[10], "protocol_child_exited_early")
-            self.assertEqual(rows[11], "protocol_malformed_json")
+            changed = auto_scheduler.refine_persisted_outcomes(db, "p")
+            self.assertEqual(changed, 1)
+            row = db.execute(
+                "SELECT state,reason_code FROM runtime_discovery_schedule_state WHERE package_id=10"
+            ).fetchone()
+            self.assertEqual(
+                (row["state"], row["reason_code"]),
+                ("inconclusive", "startup_child_exited_early"),
+            )
             db.close()
 
 
