@@ -62,6 +62,33 @@ def classify_child_failure(stderr: str, returncode: int) -> tuple[str, str, str]
     return base_classify_child_failure(stderr, returncode)
 
 
+def refine_persisted_protocol_failures(
+    db: sqlite3.Connection,
+    key: str,
+) -> int:
+    """Reclassify old generic Guard failures without creating a new attempt."""
+    rows = db.execute(
+        """SELECT package_id,reason_message
+           FROM runtime_discovery_schedule_state
+           WHERE profile_key=? AND state='failed' AND reason_code='protocol_failed'
+             AND reason_message IS NOT NULL""",
+        (key,),
+    ).fetchall()
+    changed = 0
+    for row in rows:
+        _, refined_code, _ = classify_child_failure(str(row["reason_message"]), 1)
+        if refined_code == "protocol_failed_other":
+            continue
+        cursor = db.execute(
+            """UPDATE runtime_discovery_schedule_state
+               SET reason_code=?
+               WHERE profile_key=? AND package_id=? AND reason_code='protocol_failed'""",
+            (refined_code, key, int(row["package_id"])),
+        )
+        changed += int(cursor.rowcount or 0)
+    return changed
+
+
 def allowed_images(profile: dict[str, str]) -> set[str]:
     policy = profile["runtime_image"]
     if policy != auto.AUTO_RUNTIME_POLICY:
@@ -204,22 +231,7 @@ def synchronize(
     if not required.issubset(columns):
         return
 
-    failed_rows = db.execute(
-        """SELECT package_id,reason_message
-           FROM runtime_discovery_schedule_state
-           WHERE profile_key=? AND state='failed' AND reason_code='protocol_failed'
-             AND reason_message IS NOT NULL""",
-        (key,),
-    ).fetchall()
-    for row in failed_rows:
-        _, refined_code, _ = classify_child_failure(str(row["reason_message"]), 1)
-        if refined_code != "protocol_failed_other":
-            db.execute(
-                """UPDATE runtime_discovery_schedule_state
-                   SET reason_code=?
-                   WHERE profile_key=? AND package_id=? AND reason_code='protocol_failed'""",
-                (refined_code, key, int(row["package_id"])),
-            )
+    refine_persisted_protocol_failures(db, key)
 
     rows = db.execute(
         """SELECT s.package_id,s.runtime_observation_run_id,
