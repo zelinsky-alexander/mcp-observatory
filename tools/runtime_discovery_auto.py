@@ -79,7 +79,7 @@ child.on('error', error => {
   closeFile();
   process.exit(127);
 });
-child.on('exit', (code, signal) => {
+child.on('close', (code, signal) => {
   closeFile();
   if (signal) { process.kill(process.pid, signal); return; }
   process.exit(code === null ? 1 : code);
