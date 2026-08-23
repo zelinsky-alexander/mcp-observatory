@@ -35,7 +35,8 @@ INSERT_ORDER = (*RUNTIME_TABLES, *SCHEDULE_TABLES)
 def writer_lock(database: Path) -> Iterator[None]:
     descriptor = os.open(
         Path(str(database) + ".writer.lock"),
-        os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600,
+        os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o600,
     )
     try:
         while True:
@@ -160,17 +161,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--history", required=True, type=Path)
     parser.add_argument("--hot", required=True, type=Path)
-    args = parser.parse_args()
-    result = mirror(args.history.resolve(), args.hot.resolve())
-    print(json.dumps(result, sort_keys=True, separators=(",", ":")))
-    return 0
+    return parser.parse_args()
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--history", required=True, type=Path)
-    parser.add_argument("--hot", required=True, type=Path)
-    args = parser.parse_args()
+    args = parse_args()
     result = mirror(args.history.resolve(), args.hot.resolve())
     print(json.dumps(result, sort_keys=True, separators=(",", ":")))
     return 0
