@@ -14,8 +14,13 @@ instead of a Python traceback.
 from __future__ import annotations
 
 import importlib.util
+import os
 from pathlib import Path
+import selectors
+import signal
 import sqlite3
+import subprocess
+import time
 
 HERE = Path(__file__).resolve().parent
 SPEC = importlib.util.spec_from_file_location(
@@ -277,16 +282,92 @@ def preserve_terminal_outcomes_during_sync(
         )
 
 
+def run_child(
+    argv: list[str], timeout: int, output_limit: int
+) -> subprocess.CompletedProcess[bytes]:
+    """Run the runtime worker with a minimal environment plus an explicit TMPDIR."""
+    child_env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "LANG": "C.UTF-8",
+    }
+    tmpdir = os.environ.get("TMPDIR")
+    if tmpdir:
+        child_env["TMPDIR"] = tmpdir
+
+    process = subprocess.Popen(
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        close_fds=True,
+        start_new_session=True,
+        env=child_env,
+    )
+    assert process.stdout is not None and process.stderr is not None
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+    selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+    output = {"stdout": bytearray(), "stderr": bytearray()}
+    deadline = time.monotonic() + timeout
+    failure: str | None = None
+    try:
+        while selector.get_map() or process.poll() is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                failure = f"runtime discovery child exceeded {timeout} seconds"
+                break
+            for selected, _ in selector.select(timeout=min(0.25, remaining)):
+                chunk = os.read(selected.fileobj.fileno(), 8192)
+                if not chunk:
+                    selector.unregister(selected.fileobj)
+                    selected.fileobj.close()
+                    continue
+                target = output[selected.data]
+                if len(target) + len(chunk) > output_limit:
+                    failure = "runtime discovery child output exceeded configured limit"
+                    break
+                target.extend(chunk)
+            if failure:
+                break
+        if failure:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+                process.wait(timeout=3)
+            except (ProcessLookupError, subprocess.TimeoutExpired):
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait(timeout=3)
+            raise RuntimeError(failure)
+        if process.poll() is None:
+            process.wait(timeout=3)
+    finally:
+        selector.close()
+        for stream in (process.stdout, process.stderr):
+            if not stream.closed:
+                stream.close()
+    return subprocess.CompletedProcess(
+        argv,
+        process.returncode,
+        bytes(output["stdout"]),
+        bytes(output["stderr"]),
+    )
+
+
 scheduler.package_prerequisite = package_prerequisite
 scheduler.classify_child_failure = classify_child_failure
 scheduler.base.classify_child_failure = classify_child_failure
 scheduler.refine_persisted_outcomes = refine_persisted_outcomes
 scheduler._original_synchronize = preserve_terminal_outcomes_during_sync
+scheduler.base.run_child = run_child
 
 # bulk_runtime_discovery_auto.synchronize resolves refine_persisted_outcomes and
 # _original_synchronize through its module globals. Replacing both above upgrades
 # persisted diagnostics and prevents terminal runtime outcomes from being reset to
-# static `eligible` state before refinement.
+# static `eligible` state before refinement. The run_child replacement retains the
+# scheduler's minimal child environment while forwarding only an explicitly configured
+# TMPDIR so Docker bind sources can live outside systemd PrivateTmp namespaces.
 
 
 if __name__ == "__main__":
