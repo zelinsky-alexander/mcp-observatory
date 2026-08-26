@@ -2,10 +2,14 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import os
 from pathlib import Path
 import sqlite3
+import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -120,6 +124,31 @@ class RuntimeArgumentSemanticsTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "required environment unavailable: API_KEY"):
                 runtime.launch_declarations(db, 7)
             db.close()
+
+    def test_runtime_child_forwards_only_explicit_tmpdir(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with mock.patch.dict(
+                os.environ,
+                {"TMPDIR": temporary, "MCPO_SHOULD_NOT_LEAK": "secret"},
+                clear=False,
+            ):
+                result = scheduler.run_child(
+                    [
+                        sys.executable,
+                        "-c",
+                        (
+                            "import json,os;"
+                            "print(json.dumps({'tmpdir':os.environ.get('TMPDIR'),"
+                            "'leak':os.environ.get('MCPO_SHOULD_NOT_LEAK')}))"
+                        ),
+                    ],
+                    timeout=10,
+                    output_limit=4096,
+                )
+            self.assertEqual(result.returncode, 0)
+            payload = json.loads(result.stdout.decode("utf-8"))
+            self.assertEqual(payload["tmpdir"], temporary)
+            self.assertIsNone(payload["leak"])
 
     def classify(self, server_stderr: str) -> tuple[str, str, str]:
         wrapped = (
