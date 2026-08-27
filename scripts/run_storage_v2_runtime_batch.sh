@@ -22,6 +22,8 @@ remote_batch_size="${MCPO_REMOTE_RUNTIME_BATCH_SIZE:-5}"
 remote_maximum_run_seconds="${MCPO_REMOTE_RUNTIME_MAXIMUM_RUN_SECONDS:-300}"
 remote_phase_timeout_seconds="${MCPO_REMOTE_RUNTIME_PHASE_TIMEOUT_SECONDS:-15}"
 remote_child_timeout_seconds="${MCPO_REMOTE_RUNTIME_CHILD_TIMEOUT_SECONDS:-45}"
+overall_maximum_run_seconds="${MCPO_RUNTIME_OVERALL_MAXIMUM_RUN_SECONDS:-3150}"
+publication_reserve_seconds="${MCPO_RUNTIME_PUBLICATION_RESERVE_SECONDS:-120}"
 
 for file in \
   "$history_db" \
@@ -59,4 +61,6 @@ exec python3 "$project_dir/tools/bulk_runtime_discovery_v2.py" \
   --remote-batch-size "$remote_batch_size" \
   --remote-maximum-run-seconds "$remote_maximum_run_seconds" \
   --remote-phase-timeout-seconds "$remote_phase_timeout_seconds" \
-  --remote-child-timeout-seconds "$remote_child_timeout_seconds"
+  --remote-child-timeout-seconds "$remote_child_timeout_seconds" \
+  --overall-maximum-run-seconds "$overall_maximum_run_seconds" \
+  --publication-reserve-seconds "$publication_reserve_seconds"
