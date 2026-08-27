@@ -3,7 +3,8 @@
 
 Local package observations remain authoritative in the existing runtime tables.
 Registry-declared remote URLs are probed in a separate bounded schedule during the
-same runtime batch, then both read models are published to the hot catalog.
+same runtime service invocation. One overall deadline reserves time for publishing
+and verification, and remote failures do not discard successful local work.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import time
 
 
 def run_checked(argv: list[str]) -> subprocess.CompletedProcess[str]:
@@ -45,11 +47,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--remote-maximum-run-seconds", type=int, default=300)
     parser.add_argument("--remote-phase-timeout-seconds", type=int, default=15)
     parser.add_argument("--remote-child-timeout-seconds", type=int, default=45)
+    parser.add_argument("--overall-maximum-run-seconds", type=int, default=3150)
+    parser.add_argument("--publication-reserve-seconds", type=int, default=120)
     return parser.parse_args()
+
+
+def _remaining_budget(started: float, overall: int, reserve: int) -> int:
+    elapsed = time.monotonic() - started
+    return max(0, int(overall - reserve - elapsed))
 
 
 def main() -> int:
     args = parse_args()
+    if args.overall_maximum_run_seconds < 300:
+        raise ValueError("overall runtime budget must be at least 300 seconds")
+    if args.publication_reserve_seconds < 30:
+        raise ValueError("publication reserve must be at least 30 seconds")
+    if args.publication_reserve_seconds >= args.overall_maximum_run_seconds:
+        raise ValueError("publication reserve must be smaller than overall runtime budget")
+
     here = Path(__file__).resolve().parent
     scheduler = here / "bulk_runtime_discovery_argument_semantics.py"
     runtime_runner = here / "runtime_discovery_argument_semantics.py"
@@ -57,7 +73,17 @@ def main() -> int:
     remote_runner = here / "remote_runtime_discovery.py"
     mvp = here / "storage_v2_mvp.py"
     runtime_publish = here / "storage_v2_runtime_publish.py"
+    started = time.monotonic()
 
+    # Reserve the configured remote allowance plus publication headroom before
+    # starting local work. If the local queue is slow, the local scheduler stops
+    # at this smaller budget rather than consuming the whole systemd window.
+    local_ceiling = (
+        args.overall_maximum_run_seconds
+        - args.publication_reserve_seconds
+        - args.remote_maximum_run_seconds
+    )
+    local_budget = min(args.maximum_run_seconds, max(1, local_ceiling))
     scheduler_run = run_checked(
         [
             sys.executable,
@@ -77,7 +103,7 @@ def main() -> int:
             "--batch-size",
             str(args.batch_size),
             "--maximum-run-seconds",
-            str(args.maximum_run_seconds),
+            str(local_budget),
             "--maximum-attempts",
             str(args.maximum_attempts),
             "--retry-failed-after-seconds",
@@ -98,34 +124,66 @@ def main() -> int:
 
     remote_result: dict[str, object] = {"enabled": False}
     if args.remote_probe_profile is not None:
-        remote_run = run_checked(
-            [
-                sys.executable,
-                str(remote_scheduler),
-                "--database",
-                str(args.history_database),
-                "--remote-runner",
-                str(remote_runner),
-                "--probe-profile",
-                str(args.remote_probe_profile),
-                "--batch-size",
-                str(args.remote_batch_size),
-                "--maximum-run-seconds",
-                str(args.remote_maximum_run_seconds),
-                "--maximum-attempts",
-                str(args.maximum_attempts),
-                "--retry-failed-after-seconds",
-                str(args.retry_failed_after_seconds),
-                "--phase-timeout-seconds",
-                str(args.remote_phase_timeout_seconds),
-                "--child-timeout-seconds",
-                str(args.remote_child_timeout_seconds),
-            ]
+        remaining = _remaining_budget(
+            started,
+            args.overall_maximum_run_seconds,
+            args.publication_reserve_seconds,
         )
-        if remote_run.returncode != 0:
-            sys.stderr.write(remote_run.stderr)
-            return remote_run.returncode
-        remote_result = {"enabled": True, **json.loads(remote_run.stdout)}
+        remote_budget = min(args.remote_maximum_run_seconds, remaining)
+        if remote_budget <= 0:
+            remote_result = {
+                "enabled": True,
+                "skipped": True,
+                "reason": "shared_runtime_budget_exhausted",
+            }
+        else:
+            remote_run = run_checked(
+                [
+                    sys.executable,
+                    str(remote_scheduler),
+                    "--database",
+                    str(args.history_database),
+                    "--remote-runner",
+                    str(remote_runner),
+                    "--probe-profile",
+                    str(args.remote_probe_profile),
+                    "--batch-size",
+                    str(args.remote_batch_size),
+                    "--maximum-run-seconds",
+                    str(remote_budget),
+                    "--maximum-attempts",
+                    str(args.maximum_attempts),
+                    "--retry-failed-after-seconds",
+                    str(args.retry_failed_after_seconds),
+                    "--stale-running-after-seconds",
+                    str(args.stale_running_after_seconds),
+                    "--phase-timeout-seconds",
+                    str(args.remote_phase_timeout_seconds),
+                    "--child-timeout-seconds",
+                    str(args.remote_child_timeout_seconds),
+                ]
+            )
+            if remote_run.returncode == 0:
+                try:
+                    remote_result = {"enabled": True, **json.loads(remote_run.stdout)}
+                except json.JSONDecodeError as exc:
+                    remote_result = {
+                        "enabled": True,
+                        "error": "remote_scheduler_invalid_output",
+                        "detail": str(exc),
+                    }
+            else:
+                # Remote probing is supplementary. Persisted local observations
+                # must still be published even if the remote scheduler itself
+                # encounters an operational failure.
+                remote_result = {
+                    "enabled": True,
+                    "error": "remote_scheduler_failed",
+                    "returncode": remote_run.returncode,
+                    "detail": remote_run.stderr[-2048:],
+                }
+                if remote_run.stderr:
+                    sys.stderr.write(remote_run.stderr)
 
     published = run_checked(
         [
@@ -179,6 +237,12 @@ def main() -> int:
                 "published": json.loads(published.stdout),
                 "runtime_read_model": json.loads(runtime_model.stdout),
                 "verified": json.loads(verified.stdout),
+                "runtime_service": {
+                    "overall_budget_seconds": args.overall_maximum_run_seconds,
+                    "local_budget_seconds": local_budget,
+                    "publication_reserve_seconds": args.publication_reserve_seconds,
+                    "elapsed_seconds": round(time.monotonic() - started, 3),
+                },
             },
             sort_keys=True,
             separators=(",", ":"),
