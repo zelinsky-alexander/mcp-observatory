@@ -128,42 +128,32 @@ def recover_stale_running(
     db: sqlite3.Connection, key: str, stale_seconds: int
 ) -> None:
     age = f"-{stale_seconds} seconds"
+
+    # Observation rows can outlive the scheduler process even if the schedule row
+    # has already been changed by a child-timeout path. Recover them independently.
+    db.execute(
+        """UPDATE runtime_remote_observation_runs
+           SET status='inconclusive',completed_at=CURRENT_TIMESTAMP,
+               error_stage='interrupted',
+               error_message='remote runtime scheduler was interrupted before completion'
+           WHERE status='running' AND started_at<=datetime('now',?)""",
+        (age,),
+    )
+
     stale = db.execute(
-        """SELECT remote_id,runtime_remote_observation_run_id
-           FROM runtime_remote_schedule_state
+        """SELECT remote_id FROM runtime_remote_schedule_state
            WHERE profile_key=? AND state='running'
              AND last_attempt_at<=datetime('now',?)""",
         (key, age),
     ).fetchall()
     for row in stale:
-        remote_id = int(row["remote_id"])
-        run_id = row["runtime_remote_observation_run_id"]
-        if run_id is not None:
-            db.execute(
-                """UPDATE runtime_remote_observation_runs
-                   SET status='inconclusive',completed_at=CURRENT_TIMESTAMP,
-                       error_stage='interrupted',
-                       error_message='remote runtime scheduler was interrupted before completion'
-                   WHERE id=? AND status='running'""",
-                (int(run_id),),
-            )
-        else:
-            db.execute(
-                """UPDATE runtime_remote_observation_runs
-                   SET status='inconclusive',completed_at=CURRENT_TIMESTAMP,
-                       error_stage='interrupted',
-                       error_message='remote runtime scheduler was interrupted before completion'
-                   WHERE remote_id=? AND status='running'
-                     AND started_at<=datetime('now',?)""",
-                (remote_id, age),
-            )
         db.execute(
             """UPDATE runtime_remote_schedule_state
                SET state='inconclusive',reason_code='remote_interrupted',
                    reason_message='previous remote runtime scheduler did not finish this endpoint',
                    updated_at=CURRENT_TIMESTAMP
                WHERE profile_key=? AND remote_id=? AND state='running'""",
-            (key, remote_id),
+            (key, int(row["remote_id"])),
         )
 
 
@@ -371,7 +361,17 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             inventory_sha = None
             previous = None
             drift = None
-            if child_failure is None and observation is not None:
+
+            if child_failure is not None and observation is not None and observation["status"] == "running":
+                run_id = int(observation["id"])
+                with db:
+                    db.execute(
+                        """UPDATE runtime_remote_observation_runs
+                           SET status='inconclusive',completed_at=CURRENT_TIMESTAMP,
+                               error_stage=?,error_message=? WHERE id=? AND status='running'""",
+                        (child_failure, child_stderr, run_id),
+                    )
+            elif child_failure is None and observation is not None:
                 run_id = int(observation["id"])
                 inventory_sha = observation["inventory_sha256"]
                 observed_state = str(observation["status"])
