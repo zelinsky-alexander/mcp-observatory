@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """Bounded MCP discovery for exact remote URLs declared by the registry.
 
-This runner is intentionally narrow: it probes only an already-declared HTTP(S)
-remote URL, performs initialize -> notifications/initialized -> tools/list, never
-invokes tools, never follows redirects, and rejects loopback/private/link-local/
-reserved destinations after DNS resolution. Results are persisted as an
-observation-first record that can be mirrored into the public hot catalog.
+The runner probes only an already-declared HTTP(S) remote URL, performs
+initialize -> notifications/initialized -> bounded tools/list pagination, never
+invokes tools, never follows redirects, and connects only to a DNS address that
+was already validated as globally routable.
 
 No third-party Python dependency is used; the implementation relies only on the
-Python standard library and the MCP Streamable HTTP request/response shape.
+Python standard library and MCP Streamable HTTP request/response semantics.
 """
 
 from __future__ import annotations
@@ -21,7 +20,6 @@ import json
 import socket
 import sqlite3
 import ssl
-import time
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -57,8 +55,20 @@ CREATE TABLE IF NOT EXISTS runtime_remote_observation_tools(
 """
 
 MAX_BODY_BYTES = 1_048_576
+MAX_TOTAL_BODY_BYTES = 4_194_304
+MAX_TOOL_PAGES = 32
+MAX_TOOLS = 2048
+MAX_CURSOR_BYTES = 4096
 DEFAULT_PROTOCOL_VERSION = "2025-06-18"
 USER_AGENT = "Open-MCP-Longitudinal-Assurance/remote-discovery-v1"
+
+
+class ObservationLimitError(RuntimeError):
+    """The endpoint exceeded a configured observation bound."""
+
+
+class DestinationPolicyError(RuntimeError):
+    """The declared destination violates the remote network policy."""
 
 
 def canonical(value: Any) -> str:
@@ -86,10 +96,14 @@ def _public_addresses(host: str, port: int) -> list[str]:
         value = str(sockaddr[0]).split("%", 1)[0]
         address = ipaddress.ip_address(value)
         if not address.is_global:
-            raise ValueError(f"declared remote resolves to non-public address: {address}")
+            raise DestinationPolicyError(
+                f"declared remote resolves to non-public address: {address}"
+            )
         addresses.append(str(address))
     if not addresses:
-        raise ValueError("declared remote hostname did not resolve to a public IP address")
+        raise DestinationPolicyError(
+            "declared remote hostname did not resolve to a public IP address"
+        )
     return sorted(set(addresses))
 
 
@@ -101,12 +115,56 @@ def validate_url(value: str) -> tuple[str, str, int, str]:
         raise ValueError("declared remote URL must have a hostname and no embedded credentials")
     if parsed.fragment:
         raise ValueError("declared remote URL must not contain a fragment")
-    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    try:
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    except ValueError as exc:
+        raise ValueError("declared remote URL has an invalid port") from exc
     _public_addresses(parsed.hostname, port)
     path = parsed.path or "/"
     if parsed.query:
         path += "?" + parsed.query
     return parsed.scheme, parsed.hostname, port, path
+
+
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, host: str, port: int, address: str, timeout: int):
+        super().__init__(host, port, timeout=timeout)
+        self._validated_address = address
+
+    def connect(self) -> None:
+        self.sock = socket.create_connection(
+            (self._validated_address, self.port), self.timeout, self.source_address
+        )
+        if self._tunnel_host:
+            self._tunnel()
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, host: str, port: int, address: str, timeout: int):
+        super().__init__(host, port, timeout=timeout, context=ssl.create_default_context())
+        self._validated_address = address
+
+    def connect(self) -> None:
+        raw = socket.create_connection(
+            (self._validated_address, self.port), self.timeout, self.source_address
+        )
+        try:
+            if self._tunnel_host:
+                self.sock = raw
+                self._tunnel()
+                raw = self.sock
+            self.sock = self._context.wrap_socket(raw, server_hostname=self.host)
+        except BaseException:
+            raw.close()
+            raise
+
+
+def _connection(
+    scheme: str, host: str, port: int, address: str, timeout: int
+) -> http.client.HTTPConnection:
+    if scheme == "https":
+        return _PinnedHTTPSConnection(host, port, address, timeout)
+    return _PinnedHTTPConnection(host, port, address, timeout)
 
 
 def _decode_response(content_type: str, body: bytes, request_id: int) -> dict[str, Any]:
@@ -146,52 +204,67 @@ def _request(
     session_id: str | None,
     protocol_version: str | None,
     expect_response: bool,
-) -> tuple[dict[str, Any] | None, dict[str, str], int]:
-    # Resolve and validate immediately before each connection to reduce DNS-rebinding risk.
-    _public_addresses(host, port)
-    if scheme == "https":
-        connection: http.client.HTTPConnection = http.client.HTTPSConnection(
-            host, port, timeout=timeout, context=ssl.create_default_context()
-        )
-    else:
-        connection = http.client.HTTPConnection(host, port, timeout=timeout)
+) -> tuple[dict[str, Any] | None, dict[str, str], int, int]:
+    # Resolve once per request and connect to one of those exact validated IPs.
+    # The socket layer never resolves ``host`` again, closing the DNS-rebinding gap.
+    addresses = _public_addresses(host, port)
     payload = canonical(message).encode("utf-8")
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream",
         "User-Agent": USER_AGENT,
         "Connection": "close",
+        "Host": host if port in (80, 443) else f"{host}:{port}",
     }
     if session_id:
         headers["Mcp-Session-Id"] = session_id
     if protocol_version:
         headers["MCP-Protocol-Version"] = protocol_version
-    try:
-        connection.request("POST", path, body=payload, headers=headers)
-        response = connection.getresponse()
-        status = int(response.status)
-        response_headers = {name.lower(): value for name, value in response.getheaders()}
-        if 300 <= status < 400:
-            raise ValueError("declared remote attempted HTTP redirect; redirects are not followed")
-        body = response.read(MAX_BODY_BYTES + 1)
-        if len(body) > MAX_BODY_BYTES:
-            raise ValueError("remote response exceeded configured body limit")
-        if status in (401, 403):
-            raise PermissionError(f"remote endpoint requires authentication (HTTP {status})")
-        if status < 200 or status >= 300:
-            raise ConnectionError(f"remote endpoint returned HTTP {status}")
-        if not expect_response or status == 202 or not body:
-            return None, response_headers, status
-        result = _decode_response(response_headers.get("content-type", ""), body, int(message["id"]))
-        if result.get("jsonrpc") != "2.0" or result.get("id") != message["id"]:
-            raise ValueError("remote returned an invalid JSON-RPC response envelope")
-        if "error" in result:
-            raise ValueError("remote returned JSON-RPC error: " + canonical(result["error"])[:512])
-        if "result" not in result:
-            raise ValueError("remote JSON-RPC response has no result")
-        return result, response_headers, status
-    finally:
-        connection.close()
+
+    last_error: OSError | None = None
+    for address in addresses:
+        connection = _connection(scheme, host, port, address, timeout)
+        try:
+            connection.request("POST", path, body=payload, headers=headers)
+            response = connection.getresponse()
+            status = int(response.status)
+            response_headers = {name.lower(): value for name, value in response.getheaders()}
+            if 300 <= status < 400:
+                raise ValueError(
+                    "declared remote attempted HTTP redirect; redirects are not followed"
+                )
+            body = response.read(MAX_BODY_BYTES + 1)
+            if len(body) > MAX_BODY_BYTES:
+                raise ObservationLimitError(
+                    "remote response exceeded configured per-response body limit"
+                )
+            if status in (401, 403):
+                raise PermissionError(
+                    f"remote endpoint requires authentication (HTTP {status})"
+                )
+            if status < 200 or status >= 300:
+                raise ConnectionError(f"remote endpoint returned HTTP {status}")
+            if not expect_response or status == 202 or not body:
+                return None, response_headers, status, len(body)
+            result = _decode_response(
+                response_headers.get("content-type", ""), body, int(message["id"])
+            )
+            if result.get("jsonrpc") != "2.0" or result.get("id") != message["id"]:
+                raise ValueError("remote returned an invalid JSON-RPC response envelope")
+            if "error" in result:
+                raise ValueError(
+                    "remote returned JSON-RPC error: " + canonical(result["error"])[:512]
+                )
+            if "result" not in result:
+                raise ValueError("remote JSON-RPC response has no result")
+            return result, response_headers, status, len(body)
+        except OSError as exc:
+            last_error = exc
+        finally:
+            connection.close()
+    if last_error is not None:
+        raise last_error
+    raise ConnectionError("no validated public address was available for connection")
 
 
 def inspect(url: str, timeout: int) -> dict[str, Any]:
@@ -206,9 +279,16 @@ def inspect(url: str, timeout: int) -> dict[str, Any]:
             "clientInfo": {"name": "mcp-assurance-remote-observer", "version": "1"},
         },
     }
-    init_response, headers, status = _request(
-        scheme, host, port, path, initialize,
-        timeout=timeout, session_id=None, protocol_version=None, expect_response=True,
+    init_response, headers, status, total_body = _request(
+        scheme,
+        host,
+        port,
+        path,
+        initialize,
+        timeout=timeout,
+        session_id=None,
+        protocol_version=None,
+        expect_response=True,
     )
     assert init_response is not None
     init_result = init_response.get("result")
@@ -218,26 +298,86 @@ def inspect(url: str, timeout: int) -> dict[str, Any]:
     session_id = headers.get("mcp-session-id")
 
     initialized = {"jsonrpc": "2.0", "method": "notifications/initialized"}
-    _request(
-        scheme, host, port, path, initialized,
-        timeout=timeout, session_id=session_id, protocol_version=protocol_version,
+    _, _, _, initialized_body = _request(
+        scheme,
+        host,
+        port,
+        path,
+        initialized,
+        timeout=timeout,
+        session_id=session_id,
+        protocol_version=protocol_version,
         expect_response=False,
     )
-    tools_request = {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
-    tools_response, _, tools_status = _request(
-        scheme, host, port, path, tools_request,
-        timeout=timeout, session_id=session_id, protocol_version=protocol_version,
-        expect_response=True,
-    )
-    assert tools_response is not None
-    result = tools_response.get("result")
-    if not isinstance(result, dict) or not isinstance(result.get("tools"), list):
-        raise ValueError("tools/list result has no tools array")
+    total_body += initialized_body
+
     tools: list[dict[str, Any]] = []
-    for tool in result["tools"]:
-        if not isinstance(tool, dict) or not isinstance(tool.get("name"), str) or not tool["name"]:
-            raise ValueError("tools/list contains an invalid tool definition")
-        tools.append(tool)
+    tool_names: set[str] = set()
+    cursor: str | None = None
+    seen_cursors: set[str] = set()
+    tools_status = status
+    for page_index in range(MAX_TOOL_PAGES):
+        params: dict[str, Any] = {}
+        if cursor is not None:
+            params["cursor"] = cursor
+        request_id = 2 + page_index
+        tools_request = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "tools/list",
+            "params": params,
+        }
+        tools_response, _, tools_status, body_bytes = _request(
+            scheme,
+            host,
+            port,
+            path,
+            tools_request,
+            timeout=timeout,
+            session_id=session_id,
+            protocol_version=protocol_version,
+            expect_response=True,
+        )
+        total_body += body_bytes
+        if total_body > MAX_TOTAL_BODY_BYTES:
+            raise ObservationLimitError(
+                "remote tools/list exceeded configured cumulative response limit"
+            )
+        assert tools_response is not None
+        result = tools_response.get("result")
+        if not isinstance(result, dict) or not isinstance(result.get("tools"), list):
+            raise ValueError("tools/list result has no tools array")
+        for tool in result["tools"]:
+            if (
+                not isinstance(tool, dict)
+                or not isinstance(tool.get("name"), str)
+                or not tool["name"]
+            ):
+                raise ValueError("tools/list contains an invalid tool definition")
+            name = str(tool["name"])
+            if name in tool_names:
+                raise ValueError(f"tools/list contains duplicate tool name: {name}")
+            tool_names.add(name)
+            tools.append(tool)
+            if len(tools) > MAX_TOOLS:
+                raise ObservationLimitError(
+                    "remote tools/list exceeded configured tool-count limit"
+                )
+
+        next_cursor = result.get("nextCursor")
+        if next_cursor in (None, ""):
+            break
+        if not isinstance(next_cursor, str):
+            raise ValueError("tools/list nextCursor is not a string")
+        if len(next_cursor.encode("utf-8")) > MAX_CURSOR_BYTES:
+            raise ObservationLimitError("tools/list nextCursor exceeded configured limit")
+        if next_cursor in seen_cursors:
+            raise ValueError("tools/list repeated pagination cursor")
+        seen_cursors.add(next_cursor)
+        cursor = next_cursor
+    else:
+        raise ObservationLimitError("remote tools/list exceeded configured page limit")
+
     tools.sort(key=lambda item: item["name"])
     inventory = {
         "schema_version": 1,
@@ -249,7 +389,7 @@ def inspect(url: str, timeout: int) -> dict[str, Any]:
     }
     return {
         "inventory": inventory,
-        "http_status": tools_status or status,
+        "http_status": tools_status,
         "session_id_sha256": digest_text(session_id) if session_id else None,
     }
 
@@ -272,7 +412,13 @@ def observe(database: str, remote_id: int, timeout: int, profile_sha256: str) ->
                 """INSERT INTO runtime_remote_observation_runs(
                      server_version_id,remote_id,status,declared_url,transport,probe_profile_sha256)
                    VALUES(?,?,'running',?,?,?)""",
-                (int(remote["server_version_id"]), remote_id, declared_url, transport, profile_sha256),
+                (
+                    int(remote["server_version_id"]),
+                    remote_id,
+                    declared_url,
+                    transport,
+                    profile_sha256,
+                ),
             )
             run_id = int(cursor.lastrowid)
 
@@ -286,6 +432,10 @@ def observe(database: str, remote_id: int, timeout: int, profile_sha256: str) ->
             stage = "completed"
         except PermissionError as exc:
             state, stage, message = "blocked", "authentication", str(exc)
+        except DestinationPolicyError as exc:
+            state, stage, message = "blocked", "destination_policy", str(exc)
+        except ObservationLimitError as exc:
+            state, stage, message = "inconclusive", "observation_limit", str(exc)
         except (socket.timeout, TimeoutError) as exc:
             state, stage, message = "inconclusive", "timeout", str(exc)
         except (OSError, ConnectionError) as exc:
@@ -307,7 +457,9 @@ def observe(database: str, remote_id: int, timeout: int, profile_sha256: str) ->
                         inventory_sha256,
                         inventory_json,
                         inventory.get("protocol_version"),
-                        canonical(inventory.get("server_info")) if inventory.get("server_info") is not None else None,
+                        canonical(inventory.get("server_info"))
+                        if inventory.get("server_info") is not None
+                        else None,
                         result.get("http_status"),
                         result.get("session_id_sha256"),
                         run_id,
@@ -326,7 +478,11 @@ def observe(database: str, remote_id: int, timeout: int, profile_sha256: str) ->
                        SET status=?,completed_at=CURRENT_TIMESTAMP,error_stage=?,error_message=? WHERE id=?""",
                     (state, stage, (message or "")[:2048], run_id),
                 )
-        return {"run_id": run_id, "status": state, "error_stage": None if state == "completed" else stage}
+        return {
+            "run_id": run_id,
+            "status": state,
+            "error_stage": None if state == "completed" else stage,
+        }
     finally:
         db.close()
 
