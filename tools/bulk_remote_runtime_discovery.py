@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Bounded scheduler for registry-declared remote MCP endpoint observations.
 
-The scheduler is separate from local package execution but is intended to run in
-the same runtime-discovery systemd batch. Eligibility is limited to remotes with
-an exact HTTP(S) URL and a supported HTTP-like transport. No URL guessing or
-port scanning occurs.
+The scheduler runs in the same runtime-discovery service batch as local package
+observation. It probes only exact HTTP(S) URLs already present in ``remotes``;
+there is no URL/path guessing, port scanning, or tool invocation.
+
+Completed remote observations are periodically re-probed so live-only interface
+change can be detected even when the Registry package/version record is unchanged.
 """
 
 from __future__ import annotations
@@ -19,7 +21,7 @@ import sys
 import time
 from typing import Any
 
-SCHEDULER_VERSION = "1.0.0"
+SCHEDULER_VERSION = "1.1.0"
 SUPPORTED_TRANSPORTS = {"streamable-http", "streamable_http", "http", "https"}
 
 SCHEMA = """
@@ -120,12 +122,13 @@ def load_profile(args: argparse.Namespace) -> tuple[dict[str, str], str]:
     return identity, key
 
 
-def synchronize(db: sqlite3.Connection, key: str) -> None:
+def synchronize(db: sqlite3.Connection, key: str, reprobe_seconds: int) -> None:
     rows = db.execute("SELECT id,url,transport FROM remotes ORDER BY id").fetchall()
     for row in rows:
         state, code, message = classify(row)
         existing = db.execute(
-            "SELECT state FROM runtime_remote_schedule_state WHERE profile_key=? AND remote_id=?",
+            """SELECT state,last_attempt_at FROM runtime_remote_schedule_state
+               WHERE profile_key=? AND remote_id=?""",
             (key, int(row["id"])),
         ).fetchone()
         if existing is None:
@@ -134,27 +137,41 @@ def synchronize(db: sqlite3.Connection, key: str) -> None:
                      profile_key,remote_id,state,reason_code,reason_message) VALUES(?,?,?,?,?)""",
                 (key, int(row["id"]), state, code, message),
             )
-        elif existing["state"] not in {"completed", "running"} and existing["state"] != state:
+            continue
+        if state != "eligible":
+            if existing["state"] != state:
+                db.execute(
+                    """UPDATE runtime_remote_schedule_state
+                       SET state=?,reason_code=?,reason_message=?,updated_at=CURRENT_TIMESTAMP
+                       WHERE profile_key=? AND remote_id=?""",
+                    (state, code, message, key, int(row["id"])),
+                )
+            continue
+        if existing["state"] == "completed" and reprobe_seconds > 0:
             db.execute(
                 """UPDATE runtime_remote_schedule_state
-                   SET state=?,reason_code=?,reason_message=?,updated_at=CURRENT_TIMESTAMP
+                   SET state='eligible',reason_code='scheduled_reprobe',
+                       reason_message='completed remote observation reached reprobe interval',
+                       attempt_count=0,updated_at=CURRENT_TIMESTAMP
+                   WHERE profile_key=? AND remote_id=? AND state='completed'
+                     AND last_attempt_at<=datetime('now',?)""",
+                (key, int(row["id"]), f"-{reprobe_seconds} seconds"),
+            )
+        elif existing["state"] not in {"running", "completed", "failed", "blocked", "inconclusive", "eligible"}:
+            db.execute(
+                """UPDATE runtime_remote_schedule_state
+                   SET state='eligible',reason_code=NULL,reason_message=NULL,updated_at=CURRENT_TIMESTAMP
                    WHERE profile_key=? AND remote_id=?""",
-                (state, code, message, key, int(row["id"])),
+                (key, int(row["id"])),
             )
 
 
-def previous_run(db: sqlite3.Connection, key: str, current_run: int, server_version_id: int, url: str) -> int | None:
+def previous_run(db: sqlite3.Connection, current_run: int, declared_url: str, probe_sha: str) -> int | None:
     row = db.execute(
-        """SELECT rr.id
-           FROM runtime_remote_schedule_state s
-           JOIN runtime_remote_observation_runs rr ON rr.id=s.runtime_remote_observation_run_id
-           JOIN remotes r ON r.id=rr.remote_id
-           JOIN server_versions sv ON sv.id=rr.server_version_id
-           WHERE s.profile_key=? AND s.state='completed' AND rr.status='completed'
-             AND rr.id<>? AND rr.server_version_id<>? AND r.url=?
-             AND sv.published_at < (SELECT published_at FROM server_versions WHERE id=?)
-           ORDER BY sv.published_at DESC, rr.id DESC LIMIT 1""",
-        (key, current_run, server_version_id, url, server_version_id),
+        """SELECT id FROM runtime_remote_observation_runs
+           WHERE status='completed' AND id<? AND declared_url=? AND probe_profile_sha256=?
+           ORDER BY id DESC LIMIT 1""",
+        (current_run, declared_url, probe_sha),
     ).fetchone()
     return None if row is None else int(row["id"])
 
@@ -177,6 +194,23 @@ def compare_tools(db: sqlite3.Connection, older: int, newer: int) -> dict[str, l
     }
 
 
+def _run_probe(args: argparse.Namespace, database: Path, remote_id: int, probe_sha: str) -> tuple[str, str | None]:
+    try:
+        child = subprocess.run(
+            [
+                sys.executable, str(Path(args.remote_runner).resolve()),
+                "--database", str(database), "--remote-id", str(remote_id),
+                "--timeout", str(args.phase_timeout_seconds),
+                "--probe-profile-sha256", probe_sha,
+            ],
+            stdin=subprocess.DEVNULL, capture_output=True,
+            timeout=args.child_timeout_seconds, check=False,
+        )
+        return child.stderr.decode("utf-8", "replace")[:2048], None
+    except subprocess.TimeoutExpired:
+        return "remote runner exceeded child timeout", "remote_child_timeout"
+
+
 def execute(args: argparse.Namespace) -> dict[str, Any]:
     database = Path(args.database).resolve()
     profile, key = load_profile(args)
@@ -194,7 +228,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                    ON CONFLICT(singleton) DO UPDATE SET profile_key=excluded.profile_key,updated_at=CURRENT_TIMESTAMP""",
                 (key,),
             )
-            synchronize(db, key)
+            synchronize(db, key, args.reprobe_completed_after_seconds)
 
         started = time.monotonic()
         processed = 0
@@ -218,27 +252,21 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                        WHERE profile_key=? AND remote_id=?""",
                     (key, remote_id),
                 )
-            child = subprocess.run(
-                [
-                    sys.executable, str(Path(args.remote_runner).resolve()),
-                    "--database", str(database), "--remote-id", str(remote_id),
-                    "--timeout", str(args.phase_timeout_seconds),
-                    "--probe-profile-sha256", profile["probe_profile_sha256"],
-                ],
-                stdin=subprocess.DEVNULL, capture_output=True,
-                timeout=args.child_timeout_seconds, check=False,
+
+            child_stderr, child_failure = _run_probe(
+                args, database, remote_id, profile["probe_profile_sha256"]
             )
             observation = db.execute(
                 """SELECT id,status,inventory_sha256,error_stage,error_message
                    FROM runtime_remote_observation_runs WHERE remote_id=? ORDER BY id DESC LIMIT 1""",
                 (remote_id,),
             ).fetchone()
-            state, code, message = "inconclusive", "remote_runner_failed", child.stderr.decode("utf-8", "replace")[:2048]
+            state, code, message = "inconclusive", child_failure or "remote_runner_failed", child_stderr
             run_id = None
             inventory_sha = None
             previous = None
             drift = None
-            if observation is not None:
+            if child_failure is None and observation is not None:
                 run_id = int(observation["id"])
                 inventory_sha = observation["inventory_sha256"]
                 observed_state = str(observation["status"])
@@ -246,7 +274,9 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                 code = None if state == "completed" else str(observation["error_stage"] or "remote_probe_failed")
                 message = None if state == "completed" else str(observation["error_message"] or "")
                 if state == "completed":
-                    previous = previous_run(db, key, run_id, int(row["server_version_id"]), str(row["url"]))
+                    previous = previous_run(
+                        db, run_id, str(row["url"]), profile["probe_profile_sha256"]
+                    )
                     if previous is not None:
                         drift = compare_tools(db, previous, run_id)
             counts = {name: None for name in ("added", "removed", "modified", "unchanged")}
@@ -291,6 +321,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--maximum-run-seconds", type=int, default=300)
     parser.add_argument("--maximum-attempts", type=int, default=3)
     parser.add_argument("--retry-failed-after-seconds", type=int, default=86400)
+    parser.add_argument("--reprobe-completed-after-seconds", type=int, default=86400)
     parser.add_argument("--phase-timeout-seconds", type=int, default=15)
     parser.add_argument("--child-timeout-seconds", type=int, default=45)
     return parser.parse_args()
@@ -300,6 +331,8 @@ def main() -> int:
     args = parse_args()
     if args.batch_size < 1 or args.batch_size > 100:
         raise ValueError("batch size must be between 1 and 100")
+    if args.reprobe_completed_after_seconds < 3600:
+        raise ValueError("remote reprobe interval must be at least one hour")
     print(canonical(execute(args)))
     return 0
 
@@ -307,6 +340,6 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except (OSError, sqlite3.Error, ValueError, subprocess.TimeoutExpired) as exc:
+    except (OSError, sqlite3.Error, ValueError) as exc:
         print(f"remote runtime scheduler failed: {exc}", file=sys.stderr)
         raise SystemExit(2)
