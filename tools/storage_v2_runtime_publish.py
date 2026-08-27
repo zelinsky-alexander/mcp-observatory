@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Mirror the bounded runtime-discovery read model from v2 history to hot catalog.
+"""Mirror bounded local and declared-remote runtime read models from history to hot.
 
-The history database remains authoritative. This helper installs the additive
-runtime schemas when necessary and mirrors only runtime observations, canonical
-tool definitions, and scheduler/profile state needed by the public coverage and
-drift pages. Static-analysis detail remains history-only.
+The history database remains authoritative. The hot catalog receives only runtime
+observations, canonical tool definitions, and scheduler/profile state needed by
+public coverage and drift views.
 """
 
 from __future__ import annotations
@@ -28,7 +27,21 @@ SCHEDULE_TABLES = (
     "runtime_discovery_schedule_current",
     "runtime_discovery_schedule_state",
 )
-INSERT_ORDER = (*RUNTIME_TABLES, *SCHEDULE_TABLES)
+REMOTE_RUNTIME_TABLES = (
+    "runtime_remote_observation_runs",
+    "runtime_remote_observation_tools",
+)
+REMOTE_SCHEDULE_TABLES = (
+    "runtime_remote_schedule_profiles",
+    "runtime_remote_schedule_current",
+    "runtime_remote_schedule_state",
+)
+INSERT_ORDER = (
+    *RUNTIME_TABLES,
+    *SCHEDULE_TABLES,
+    *REMOTE_RUNTIME_TABLES,
+    *REMOTE_SCHEDULE_TABLES,
+)
 
 
 @contextmanager
@@ -52,7 +65,9 @@ def writer_lock(database: Path) -> Iterator[None]:
 
 def connect(path: Path, *, readonly: bool = False) -> sqlite3.Connection:
     if readonly:
-        db = sqlite3.connect(f"file:{path.resolve().as_posix()}?mode=ro", uri=True, timeout=30)
+        db = sqlite3.connect(
+            f"file:{path.resolve().as_posix()}?mode=ro", uri=True, timeout=30
+        )
         db.execute("PRAGMA query_only=ON")
     else:
         db = sqlite3.connect(path, timeout=30)
@@ -77,16 +92,21 @@ def load_schema(filename: str, module_name: str) -> str:
 
 
 def table_exists(db: sqlite3.Connection, name: str) -> bool:
-    return db.execute(
-        "SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?", (name,)
-    ).fetchone() is not None
+    return (
+        db.execute(
+            "SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?", (name,)
+        ).fetchone()
+        is not None
+    )
 
 
 def columns(db: sqlite3.Connection, name: str) -> list[str]:
     return [str(row["name"]) for row in db.execute(f"PRAGMA table_info({name})")]
 
 
-def copy_table(source: sqlite3.Connection, target: sqlite3.Connection, name: str) -> int:
+def copy_table(
+    source: sqlite3.Connection, target: sqlite3.Connection, name: str
+) -> int:
     names = columns(source, name)
     if names != columns(target, name):
         raise RuntimeError(f"runtime schema mismatch while publishing {name}")
@@ -101,6 +121,30 @@ def copy_table(source: sqlite3.Connection, target: sqlite3.Connection, name: str
     return len(rows)
 
 
+def _schemas(target: sqlite3.Connection, *, include_remote: bool) -> None:
+    target.executescript(load_schema("runtime_discovery.py", "runtime_discovery"))
+    target.executescript(
+        load_schema("bulk_runtime_discovery.py", "bulk_runtime_discovery")
+    )
+    auto_scheduler = load_module(
+        "bulk_runtime_discovery_auto.py", "bulk_runtime_discovery_auto_publish"
+    )
+    auto_scheduler.ensure_outcome_states(target)
+    if include_remote:
+        if not table_exists(target, "remotes"):
+            raise RuntimeError(
+                "remote runtime publication requires the hot catalog remotes table"
+            )
+        target.executescript(
+            load_schema("remote_runtime_discovery.py", "remote_runtime_discovery")
+        )
+        target.executescript(
+            load_schema(
+                "bulk_remote_runtime_discovery.py", "bulk_remote_runtime_discovery"
+            )
+        )
+
+
 def mirror(history: Path, hot: Path) -> dict[str, int]:
     with writer_lock(hot):
         source = connect(history, readonly=True)
@@ -109,40 +153,62 @@ def mirror(history: Path, hot: Path) -> dict[str, int]:
             if not all(table_exists(source, name) for name in RUNTIME_TABLES):
                 return {name: 0 for name in INSERT_ORDER}
 
-            with target:
-                # The runtime runner and bulk scheduler own these additive schemas.
-                target.executescript(load_schema("runtime_discovery.py", "runtime_discovery"))
-                target.executescript(
-                    load_schema("bulk_runtime_discovery.py", "bulk_runtime_discovery")
-                )
+            schedule_available = all(
+                table_exists(source, name) for name in SCHEDULE_TABLES
+            )
+            remote_runtime_available = all(
+                table_exists(source, name) for name in REMOTE_RUNTIME_TABLES
+            )
+            remote_schedule_available = all(
+                table_exists(source, name) for name in REMOTE_SCHEDULE_TABLES
+            )
+            include_remote = remote_runtime_available or remote_schedule_available
 
-                # Automatic-runtime outcome semantics add terminal blocked and
-                # inconclusive states. Upgrade an older hot scheduler table before
-                # copying source rows so the read model accepts the authoritative
-                # history generation without weakening its CHECK constraint.
-                auto_scheduler = load_module(
-                    "bulk_runtime_discovery_auto.py", "bulk_runtime_discovery_auto_publish"
-                )
-                auto_scheduler.ensure_outcome_states(target)
+            with target:
+                _schemas(target, include_remote=include_remote)
 
                 for name in RUNTIME_TABLES:
                     if columns(source, name) != columns(target, name):
-                        raise RuntimeError(f"runtime schema mismatch while publishing {name}")
-                schedule_available = all(table_exists(source, name) for name in SCHEDULE_TABLES)
+                        raise RuntimeError(
+                            f"runtime schema mismatch while publishing {name}"
+                        )
                 if schedule_available:
                     for name in SCHEDULE_TABLES:
                         if columns(source, name) != columns(target, name):
                             raise RuntimeError(
                                 f"runtime scheduler schema mismatch while publishing {name}"
                             )
+                if remote_runtime_available:
+                    for name in REMOTE_RUNTIME_TABLES:
+                        if columns(source, name) != columns(target, name):
+                            raise RuntimeError(
+                                f"remote runtime schema mismatch while publishing {name}"
+                            )
+                if remote_schedule_available:
+                    for name in REMOTE_SCHEDULE_TABLES:
+                        if columns(source, name) != columns(target, name):
+                            raise RuntimeError(
+                                f"remote runtime scheduler schema mismatch while publishing {name}"
+                            )
 
-                # Rebuild as one coherent read-model generation. Delete children
-                # first so foreign keys remain valid throughout the transaction.
-                target.execute("DELETE FROM runtime_discovery_schedule_state")
-                target.execute("DELETE FROM runtime_discovery_schedule_current")
-                target.execute("DELETE FROM runtime_discovery_schedule_profiles")
-                target.execute("DELETE FROM runtime_observation_tools")
-                target.execute("DELETE FROM runtime_observation_runs")
+                # Children first keeps foreign-key validity during a coherent
+                # generation rebuild. Remote tables are optional for pre-feature
+                # history/hot databases and are touched only when present.
+                delete_order = (
+                    "runtime_remote_schedule_state",
+                    "runtime_remote_schedule_current",
+                    "runtime_remote_schedule_profiles",
+                    "runtime_remote_observation_tools",
+                    "runtime_remote_observation_runs",
+                    "runtime_discovery_schedule_state",
+                    "runtime_discovery_schedule_current",
+                    "runtime_discovery_schedule_profiles",
+                    "runtime_observation_tools",
+                    "runtime_observation_runs",
+                )
+                for name in delete_order:
+                    if table_exists(target, name):
+                        target.execute(f"DELETE FROM {name}")
 
                 counts: dict[str, int] = {}
                 for name in RUNTIME_TABLES:
@@ -150,6 +216,18 @@ def mirror(history: Path, hot: Path) -> dict[str, int]:
                 for name in SCHEDULE_TABLES:
                     counts[name] = (
                         copy_table(source, target, name) if schedule_available else 0
+                    )
+                for name in REMOTE_RUNTIME_TABLES:
+                    counts[name] = (
+                        copy_table(source, target, name)
+                        if remote_runtime_available
+                        else 0
+                    )
+                for name in REMOTE_SCHEDULE_TABLES:
+                    counts[name] = (
+                        copy_table(source, target, name)
+                        if remote_schedule_available
+                        else 0
                     )
             return counts
         finally:
@@ -175,5 +253,8 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except (OSError, sqlite3.Error, RuntimeError) as exc:
-        print(f"runtime read-model publish failed: {exc}", file=__import__("sys").stderr)
+        print(
+            f"runtime read-model publish failed: {exc}",
+            file=__import__("sys").stderr,
+        )
         raise SystemExit(2)
