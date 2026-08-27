@@ -4,9 +4,6 @@
 The scheduler runs in the same runtime-discovery service batch as local package
 observation. It probes only exact HTTP(S) URLs already present in ``remotes``;
 there is no URL/path guessing, port scanning, or tool invocation.
-
-Completed remote observations are periodically re-probed so live-only interface
-change can be detected even when the Registry package/version record is unchanged.
 """
 
 from __future__ import annotations
@@ -14,6 +11,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -21,7 +19,7 @@ import sys
 import time
 from typing import Any
 
-SCHEDULER_VERSION = "1.1.0"
+SCHEDULER_VERSION = "1.2.0"
 SUPPORTED_TRANSPORTS = {"streamable-http", "streamable_http", "http", "https"}
 
 SCHEMA = """
@@ -93,7 +91,11 @@ def classify(row: sqlite3.Row) -> tuple[str, str | None, str | None]:
     if not (url.startswith("https://") or url.startswith("http://")):
         return "unsupported", "unsupported_remote_scheme", "declared remote is not HTTP(S)"
     if transport not in SUPPORTED_TRANSPORTS:
-        return "unsupported", "unsupported_remote_transport", f"transport {transport or '<empty>'} is not Streamable HTTP"
+        return (
+            "unsupported",
+            "unsupported_remote_transport",
+            f"transport {transport or '<empty>'} is not Streamable HTTP",
+        )
     return "eligible", None, None
 
 
@@ -122,7 +124,56 @@ def load_profile(args: argparse.Namespace) -> tuple[dict[str, str], str]:
     return identity, key
 
 
-def synchronize(db: sqlite3.Connection, key: str, reprobe_seconds: int) -> None:
+def recover_stale_running(
+    db: sqlite3.Connection, key: str, stale_seconds: int
+) -> None:
+    age = f"-{stale_seconds} seconds"
+    stale = db.execute(
+        """SELECT remote_id,runtime_remote_observation_run_id
+           FROM runtime_remote_schedule_state
+           WHERE profile_key=? AND state='running'
+             AND last_attempt_at<=datetime('now',?)""",
+        (key, age),
+    ).fetchall()
+    for row in stale:
+        remote_id = int(row["remote_id"])
+        run_id = row["runtime_remote_observation_run_id"]
+        if run_id is not None:
+            db.execute(
+                """UPDATE runtime_remote_observation_runs
+                   SET status='inconclusive',completed_at=CURRENT_TIMESTAMP,
+                       error_stage='interrupted',
+                       error_message='remote runtime scheduler was interrupted before completion'
+                   WHERE id=? AND status='running'""",
+                (int(run_id),),
+            )
+        else:
+            db.execute(
+                """UPDATE runtime_remote_observation_runs
+                   SET status='inconclusive',completed_at=CURRENT_TIMESTAMP,
+                       error_stage='interrupted',
+                       error_message='remote runtime scheduler was interrupted before completion'
+                   WHERE remote_id=? AND status='running'
+                     AND started_at<=datetime('now',?)""",
+                (remote_id, age),
+            )
+        db.execute(
+            """UPDATE runtime_remote_schedule_state
+               SET state='inconclusive',reason_code='remote_interrupted',
+                   reason_message='previous remote runtime scheduler did not finish this endpoint',
+                   updated_at=CURRENT_TIMESTAMP
+               WHERE profile_key=? AND remote_id=? AND state='running'""",
+            (key, remote_id),
+        )
+
+
+def synchronize(
+    db: sqlite3.Connection,
+    key: str,
+    reprobe_seconds: int,
+    stale_running_seconds: int,
+) -> None:
+    recover_stale_running(db, key, stale_running_seconds)
     rows = db.execute("SELECT id,url,transport FROM remotes ORDER BY id").fetchall()
     for row in rows:
         state, code, message = classify(row)
@@ -157,7 +208,14 @@ def synchronize(db: sqlite3.Connection, key: str, reprobe_seconds: int) -> None:
                      AND last_attempt_at<=datetime('now',?)""",
                 (key, int(row["id"]), f"-{reprobe_seconds} seconds"),
             )
-        elif existing["state"] not in {"running", "completed", "failed", "blocked", "inconclusive", "eligible"}:
+        elif existing["state"] not in {
+            "running",
+            "completed",
+            "failed",
+            "blocked",
+            "inconclusive",
+            "eligible",
+        }:
             db.execute(
                 """UPDATE runtime_remote_schedule_state
                    SET state='eligible',reason_code=NULL,reason_message=NULL,updated_at=CURRENT_TIMESTAMP
@@ -166,7 +224,9 @@ def synchronize(db: sqlite3.Connection, key: str, reprobe_seconds: int) -> None:
             )
 
 
-def previous_run(db: sqlite3.Connection, current_run: int, declared_url: str, probe_sha: str) -> int | None:
+def previous_run(
+    db: sqlite3.Connection, current_run: int, declared_url: str, probe_sha: str
+) -> int | None:
     row = db.execute(
         """SELECT id FROM runtime_remote_observation_runs
            WHERE status='completed' AND id<? AND declared_url=? AND probe_profile_sha256=?
@@ -176,7 +236,9 @@ def previous_run(db: sqlite3.Connection, current_run: int, declared_url: str, pr
     return None if row is None else int(row["id"])
 
 
-def compare_tools(db: sqlite3.Connection, older: int, newer: int) -> dict[str, list[str]]:
+def compare_tools(
+    db: sqlite3.Connection, older: int, newer: int
+) -> dict[str, list[str]]:
     def load(run_id: int) -> dict[str, str]:
         return {
             str(row["name"]): str(row["definition_json"])
@@ -185,26 +247,48 @@ def compare_tools(db: sqlite3.Connection, older: int, newer: int) -> dict[str, l
                 (run_id,),
             )
         }
+
     left, right = load(older), load(newer)
     return {
         "added": sorted(right.keys() - left.keys()),
         "removed": sorted(left.keys() - right.keys()),
-        "modified": sorted(name for name in left.keys() & right.keys() if left[name] != right[name]),
-        "unchanged": sorted(name for name in left.keys() & right.keys() if left[name] == right[name]),
+        "modified": sorted(
+            name for name in left.keys() & right.keys() if left[name] != right[name]
+        ),
+        "unchanged": sorted(
+            name for name in left.keys() & right.keys() if left[name] == right[name]
+        ),
     }
 
 
-def _run_probe(args: argparse.Namespace, database: Path, remote_id: int, probe_sha: str) -> tuple[str, str | None]:
+def _run_probe(
+    args: argparse.Namespace, database: Path, remote_id: int, probe_sha: str
+) -> tuple[str, str | None]:
+    child_env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "LANG": "C.UTF-8",
+    }
+    if tmpdir := os.environ.get("TMPDIR"):
+        child_env["TMPDIR"] = tmpdir
     try:
         child = subprocess.run(
             [
-                sys.executable, str(Path(args.remote_runner).resolve()),
-                "--database", str(database), "--remote-id", str(remote_id),
-                "--timeout", str(args.phase_timeout_seconds),
-                "--probe-profile-sha256", probe_sha,
+                sys.executable,
+                str(Path(args.remote_runner).resolve()),
+                "--database",
+                str(database),
+                "--remote-id",
+                str(remote_id),
+                "--timeout",
+                str(args.phase_timeout_seconds),
+                "--probe-profile-sha256",
+                probe_sha,
             ],
-            stdin=subprocess.DEVNULL, capture_output=True,
-            timeout=args.child_timeout_seconds, check=False,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=args.child_timeout_seconds,
+            check=False,
+            env=child_env,
         )
         return child.stderr.decode("utf-8", "replace")[:2048], None
     except subprocess.TimeoutExpired:
@@ -221,18 +305,31 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                 """INSERT INTO runtime_remote_schedule_profiles(
                      profile_key,scheduler_version,probe_profile_sha256,runner_sha256)
                    VALUES(?,?,?,?) ON CONFLICT(profile_key) DO UPDATE SET selected_at=CURRENT_TIMESTAMP""",
-                (key, profile["scheduler_version"], profile["probe_profile_sha256"], profile["runner_sha256"]),
+                (
+                    key,
+                    profile["scheduler_version"],
+                    profile["probe_profile_sha256"],
+                    profile["runner_sha256"],
+                ),
             )
             db.execute(
                 """INSERT INTO runtime_remote_schedule_current(singleton,profile_key) VALUES(1,?)
                    ON CONFLICT(singleton) DO UPDATE SET profile_key=excluded.profile_key,updated_at=CURRENT_TIMESTAMP""",
                 (key,),
             )
-            synchronize(db, key, args.reprobe_completed_after_seconds)
+            synchronize(
+                db,
+                key,
+                args.reprobe_completed_after_seconds,
+                args.stale_running_after_seconds,
+            )
 
         started = time.monotonic()
         processed = 0
-        while processed < args.batch_size and time.monotonic() - started < args.maximum_run_seconds:
+        while (
+            processed < args.batch_size
+            and time.monotonic() - started < args.maximum_run_seconds
+        ):
             row = db.execute(
                 """SELECT s.remote_id,r.server_version_id,r.url
                    FROM runtime_remote_schedule_state s JOIN remotes r ON r.id=s.remote_id
@@ -240,15 +337,21 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                      AND s.attempt_count<?
                      AND (s.last_attempt_at IS NULL OR s.last_attempt_at<=datetime('now',?))
                    ORDER BY s.discovered_at DESC,s.attempt_count,s.remote_id DESC LIMIT 1""",
-                (key, args.maximum_attempts, f"-{args.retry_failed_after_seconds} seconds"),
+                (
+                    key,
+                    args.maximum_attempts,
+                    f"-{args.retry_failed_after_seconds} seconds",
+                ),
             ).fetchone()
             if row is None:
                 break
             remote_id = int(row["remote_id"])
             with db:
                 db.execute(
-                    """UPDATE runtime_remote_schedule_state SET state='running',attempt_count=attempt_count+1,
-                       last_attempt_at=CURRENT_TIMESTAMP,reason_code=NULL,reason_message=NULL,updated_at=CURRENT_TIMESTAMP
+                    """UPDATE runtime_remote_schedule_state
+                       SET state='running',attempt_count=attempt_count+1,
+                           last_attempt_at=CURRENT_TIMESTAMP,reason_code=NULL,reason_message=NULL,
+                           runtime_remote_observation_run_id=NULL,updated_at=CURRENT_TIMESTAMP
                        WHERE profile_key=? AND remote_id=?""",
                     (key, remote_id),
                 )
@@ -261,7 +364,9 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                    FROM runtime_remote_observation_runs WHERE remote_id=? ORDER BY id DESC LIMIT 1""",
                 (remote_id,),
             ).fetchone()
-            state, code, message = "inconclusive", child_failure or "remote_runner_failed", child_stderr
+            state = "inconclusive"
+            code = child_failure or "remote_runner_failed"
+            message: str | None = child_stderr
             run_id = None
             inventory_sha = None
             previous = None
@@ -270,26 +375,57 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                 run_id = int(observation["id"])
                 inventory_sha = observation["inventory_sha256"]
                 observed_state = str(observation["status"])
-                state = observed_state if observed_state in {"completed", "failed", "blocked", "inconclusive"} else "inconclusive"
-                code = None if state == "completed" else str(observation["error_stage"] or "remote_probe_failed")
-                message = None if state == "completed" else str(observation["error_message"] or "")
+                state = (
+                    observed_state
+                    if observed_state in {"completed", "failed", "blocked", "inconclusive"}
+                    else "inconclusive"
+                )
+                code = (
+                    None
+                    if state == "completed"
+                    else str(observation["error_stage"] or "remote_probe_failed")
+                )
+                message = (
+                    None
+                    if state == "completed"
+                    else str(observation["error_message"] or "")
+                )
                 if state == "completed":
                     previous = previous_run(
-                        db, run_id, str(row["url"]), profile["probe_profile_sha256"]
+                        db,
+                        run_id,
+                        str(row["url"]),
+                        profile["probe_profile_sha256"],
                     )
                     if previous is not None:
                         drift = compare_tools(db, previous, run_id)
-            counts = {name: None for name in ("added", "removed", "modified", "unchanged")}
+            counts = {
+                name: None for name in ("added", "removed", "modified", "unchanged")
+            }
             if drift is not None:
                 counts = {name: len(drift[name]) for name in counts}
             with db:
                 db.execute(
-                    """UPDATE runtime_remote_schedule_state SET state=?,reason_code=?,reason_message=?,
-                       runtime_remote_observation_run_id=?,inventory_sha256=?,previous_compatible_run_id=?,
-                       added_tools=?,removed_tools=?,modified_tools=?,unchanged_tools=?,updated_at=CURRENT_TIMESTAMP
+                    """UPDATE runtime_remote_schedule_state
+                       SET state=?,reason_code=?,reason_message=?,
+                           runtime_remote_observation_run_id=?,inventory_sha256=?,
+                           previous_compatible_run_id=?,added_tools=?,removed_tools=?,
+                           modified_tools=?,unchanged_tools=?,updated_at=CURRENT_TIMESTAMP
                        WHERE profile_key=? AND remote_id=?""",
-                    (state, code, message, run_id, inventory_sha, previous, counts["added"], counts["removed"],
-                     counts["modified"], counts["unchanged"], key, remote_id),
+                    (
+                        state,
+                        code,
+                        message,
+                        run_id,
+                        inventory_sha,
+                        previous,
+                        counts["added"],
+                        counts["removed"],
+                        counts["modified"],
+                        counts["unchanged"],
+                        key,
+                        remote_id,
+                    ),
                 )
             processed += 1
 
@@ -306,7 +442,13 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             (key,),
         ).fetchone()
         result = {name: int(summary[name] or 0) for name in summary.keys()}
-        result.update({"profile_key": key, "processed_in_batch": processed})
+        result.update(
+            {
+                "profile_key": key,
+                "processed_in_batch": processed,
+                "run_elapsed_seconds": round(time.monotonic() - started, 3),
+            }
+        )
         return result
     finally:
         db.close()
@@ -322,6 +464,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--maximum-attempts", type=int, default=3)
     parser.add_argument("--retry-failed-after-seconds", type=int, default=86400)
     parser.add_argument("--reprobe-completed-after-seconds", type=int, default=86400)
+    parser.add_argument("--stale-running-after-seconds", type=int, default=7200)
     parser.add_argument("--phase-timeout-seconds", type=int, default=15)
     parser.add_argument("--child-timeout-seconds", type=int, default=45)
     return parser.parse_args()
@@ -331,8 +474,12 @@ def main() -> int:
     args = parse_args()
     if args.batch_size < 1 or args.batch_size > 100:
         raise ValueError("batch size must be between 1 and 100")
+    if args.maximum_run_seconds < 1:
+        raise ValueError("maximum run seconds must be positive")
     if args.reprobe_completed_after_seconds < 3600:
         raise ValueError("remote reprobe interval must be at least one hour")
+    if args.stale_running_after_seconds < 60:
+        raise ValueError("stale running interval must be at least one minute")
     print(canonical(execute(args)))
     return 0
 
