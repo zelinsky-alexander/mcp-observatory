@@ -1,122 +1,237 @@
+#!/usr/bin/env python3
 from __future__ import annotations
 
 import importlib.util
-import json
 from pathlib import Path
 import sqlite3
-import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import tempfile
+import unittest
+from unittest import mock
 
-MODULE_PATH = Path(__file__).resolve().parents[1] / "tools" / "remote_runtime_discovery.py"
-SPEC = importlib.util.spec_from_file_location("remote_runtime_discovery", MODULE_PATH)
+ROOT = Path(__file__).resolve().parent.parent
+SPEC = importlib.util.spec_from_file_location(
+    "remote_runtime_discovery", ROOT / "tools" / "remote_runtime_discovery.py"
+)
 assert SPEC is not None and SPEC.loader is not None
 remote = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(remote)
 
 
-class Handler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
+class FakeSocket:
+    def close(self) -> None:
+        pass
 
-    def do_POST(self):
-        length = int(self.headers.get("Content-Length", "0"))
-        request = json.loads(self.rfile.read(length))
-        method = request.get("method")
-        if method == "notifications/initialized":
-            self.send_response(202)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
-        if method == "initialize":
-            response = {
-                "jsonrpc": "2.0",
-                "id": request["id"],
-                "result": {
-                    "protocolVersion": "2025-06-18",
+
+class RemoteRuntimeDiscoveryTests(unittest.TestCase):
+    def test_private_destination_is_rejected(self) -> None:
+        answer = [(2, 1, 6, "", ("127.0.0.1", 443))]
+        with mock.patch.object(remote.socket, "getaddrinfo", return_value=answer):
+            with self.assertRaisesRegex(remote.DestinationPolicyError, "non-public"):
+                remote.validate_url("https://example.test/mcp")
+
+    def test_http_socket_connects_to_prevalidated_address(self) -> None:
+        connection = remote._PinnedHTTPConnection(
+            "registry.example", 80, "203.0.113.44", 3
+        )
+        sock = FakeSocket()
+        with mock.patch.object(
+            remote.socket, "create_connection", return_value=sock
+        ) as create:
+            connection.connect()
+        self.assertIs(connection.sock, sock)
+        self.assertEqual(create.call_args.args[0], ("203.0.113.44", 80))
+
+    def test_https_keeps_hostname_for_tls_sni(self) -> None:
+        connection = remote._PinnedHTTPSConnection(
+            "registry.example", 443, "203.0.113.45", 3
+        )
+        raw = FakeSocket()
+        wrapped = FakeSocket()
+        context = mock.Mock()
+        context.wrap_socket.return_value = wrapped
+        connection._context = context
+        with mock.patch.object(
+            remote.socket, "create_connection", return_value=raw
+        ) as create:
+            connection.connect()
+        self.assertEqual(create.call_args.args[0], ("203.0.113.45", 443))
+        context.wrap_socket.assert_called_once_with(
+            raw, server_hostname="registry.example"
+        )
+        self.assertIs(connection.sock, wrapped)
+
+    def test_tools_list_pagination_produces_complete_sorted_inventory(self) -> None:
+        responses = [
+            (
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "fixture", "version": "1"},
+                    },
+                },
+                {"mcp-session-id": "session"},
+                200,
+                100,
+            ),
+            (None, {}, 202, 0),
+            (
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "result": {
+                        "tools": [{"name": "zeta", "inputSchema": {"type": "object"}}],
+                        "nextCursor": "page-2",
+                    },
+                },
+                {},
+                200,
+                100,
+            ),
+            (
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "result": {
+                        "tools": [{"name": "alpha", "inputSchema": {"type": "object"}}]
+                    },
+                },
+                {},
+                200,
+                100,
+            ),
+        ]
+        with mock.patch.object(
+            remote, "validate_url", return_value=("https", "example.test", 443, "/mcp")
+        ), mock.patch.object(remote, "_request", side_effect=responses) as request:
+            result = remote.inspect("https://example.test/mcp", 3)
+        self.assertEqual(
+            [tool["name"] for tool in result["inventory"]["tools"]],
+            ["alpha", "zeta"],
+        )
+        calls = request.call_args_list
+        self.assertEqual(calls[2].args[4]["params"], {})
+        self.assertEqual(calls[3].args[4]["params"], {"cursor": "page-2"})
+
+    def test_repeated_pagination_cursor_is_protocol_invalid(self) -> None:
+        responses = [
+            (
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {"protocolVersion": "2025-06-18"},
+                },
+                {},
+                200,
+                10,
+            ),
+            (None, {}, 202, 0),
+            (
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "result": {"tools": [], "nextCursor": "same"},
+                },
+                {},
+                200,
+                10,
+            ),
+            (
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "result": {"tools": [], "nextCursor": "same"},
+                },
+                {},
+                200,
+                10,
+            ),
+        ]
+        with mock.patch.object(
+            remote, "validate_url", return_value=("https", "example.test", 443, "/mcp")
+        ), mock.patch.object(remote, "_request", side_effect=responses):
+            with self.assertRaisesRegex(ValueError, "repeated pagination cursor"):
+                remote.inspect("https://example.test/mcp", 3)
+
+    def test_observation_limit_is_inconclusive(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "catalog.sqlite"
+            db = sqlite3.connect(database)
+            db.executescript(
+                """
+                PRAGMA foreign_keys=ON;
+                CREATE TABLE server_versions(
+                  id INTEGER PRIMARY KEY,server_identifier TEXT,server_version TEXT
+                );
+                CREATE TABLE remotes(
+                  id INTEGER PRIMARY KEY,server_version_id INTEGER REFERENCES server_versions(id),
+                  position INTEGER,url TEXT,scheme TEXT,host TEXT,port INTEGER,transport TEXT
+                );
+                INSERT INTO server_versions VALUES(1,'fixture/server','1.0.0');
+                INSERT INTO remotes VALUES(
+                  10,1,0,'https://example.test/mcp','https','example.test',443,'streamable-http'
+                );
+                """
+            )
+            db.close()
+            with mock.patch.object(
+                remote,
+                "inspect",
+                side_effect=remote.ObservationLimitError("too many tool pages"),
+            ):
+                result = remote.observe(str(database), 10, 3, "a" * 64)
+            self.assertEqual(result["status"], "inconclusive")
+            self.assertEqual(result["error_stage"], "observation_limit")
+
+    def test_observation_persists_tools(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "catalog.sqlite"
+            db = sqlite3.connect(database)
+            db.executescript(
+                """
+                PRAGMA foreign_keys=ON;
+                CREATE TABLE server_versions(
+                  id INTEGER PRIMARY KEY,server_identifier TEXT,server_version TEXT
+                );
+                CREATE TABLE remotes(
+                  id INTEGER PRIMARY KEY,server_version_id INTEGER REFERENCES server_versions(id),
+                  position INTEGER,url TEXT,scheme TEXT,host TEXT,port INTEGER,transport TEXT
+                );
+                INSERT INTO server_versions VALUES(1,'fixture/server','1.0.0');
+                INSERT INTO remotes VALUES(
+                  10,1,0,'https://example.test/mcp','https','example.test',443,'streamable-http'
+                );
+                """
+            )
+            db.close()
+            observation = {
+                "inventory": {
+                    "schema_version": 1,
+                    "transport": "streamable-http",
+                    "protocol_version": "2025-06-18",
+                    "server_info": {"name": "fixture"},
                     "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "fixture", "version": "1"},
-                },
-            }
-            session = "fixture-session"
-        else:
-            response = {
-                "jsonrpc": "2.0",
-                "id": request["id"],
-                "result": {
                     "tools": [
-                        {"name": "zeta", "description": "last", "inputSchema": {"type": "object"}},
-                        {"name": "alpha", "description": "first", "inputSchema": {"type": "object"}},
-                    ]
+                        {"name": "hello", "inputSchema": {"type": "object"}}
+                    ],
                 },
+                "http_status": 200,
+                "session_id_sha256": None,
             }
-            session = None
-        payload = json.dumps(response, separators=(",", ":")).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(payload)))
-        if session:
-            self.send_header("Mcp-Session-Id", session)
-        self.end_headers()
-        self.wfile.write(payload)
-
-    def log_message(self, *_args):
-        return
-
-
-def test_inspect_canonicalizes_declared_remote(monkeypatch):
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    monkeypatch.setattr(remote, "_public_addresses", lambda _host, _port: ["203.0.113.1"])
-    try:
-        result = remote.inspect(f"http://127.0.0.1:{server.server_port}/mcp", 3)
-    finally:
-        server.shutdown()
-        thread.join(timeout=3)
-    assert [tool["name"] for tool in result["inventory"]["tools"]] == ["alpha", "zeta"]
-    assert result["inventory"]["transport"] == "streamable-http"
-    assert result["session_id_sha256"] == remote.digest_text("fixture-session")
+            with mock.patch.object(remote, "inspect", return_value=observation):
+                result = remote.observe(str(database), 10, 3, "a" * 64)
+            self.assertEqual(result["status"], "completed")
+            db = sqlite3.connect(database)
+            self.assertEqual(
+                db.execute(
+                    "SELECT COUNT(*) FROM runtime_remote_observation_tools"
+                ).fetchone()[0],
+                1,
+            )
+            db.close()
 
 
-def test_private_destination_is_rejected():
-    try:
-        remote.validate_url("http://127.0.0.1/mcp")
-    except ValueError as exc:
-        assert "non-public" in str(exc)
-    else:
-        raise AssertionError("loopback destination was accepted")
-
-
-def test_observation_persists_tools(tmp_path, monkeypatch):
-    database = tmp_path / "catalog.sqlite"
-    db = sqlite3.connect(database)
-    db.executescript(
-        """
-        PRAGMA foreign_keys=ON;
-        CREATE TABLE server_versions(id INTEGER PRIMARY KEY,server_identifier TEXT,server_version TEXT);
-        CREATE TABLE remotes(id INTEGER PRIMARY KEY,server_version_id INTEGER REFERENCES server_versions(id),position INTEGER,url TEXT,scheme TEXT,host TEXT,port INTEGER,transport TEXT);
-        INSERT INTO server_versions VALUES(1,'fixture/server','1.0.0');
-        INSERT INTO remotes VALUES(10,1,0,'https://example.test/mcp','https','example.test',443,'streamable-http');
-        """
-    )
-    db.close()
-    monkeypatch.setattr(
-        remote,
-        "inspect",
-        lambda _url, _timeout: {
-            "inventory": {
-                "schema_version": 1,
-                "transport": "streamable-http",
-                "protocol_version": "2025-06-18",
-                "server_info": {"name": "fixture"},
-                "capabilities": {"tools": {}},
-                "tools": [{"name": "hello", "inputSchema": {"type": "object"}}],
-            },
-            "http_status": 200,
-            "session_id_sha256": None,
-        },
-    )
-    result = remote.observe(str(database), 10, 3, "a" * 64)
-    assert result["status"] == "completed"
-    db = sqlite3.connect(database)
-    assert db.execute("SELECT COUNT(*) FROM runtime_remote_observation_tools").fetchone()[0] == 1
-    db.close()
+if __name__ == "__main__":
+    unittest.main()
