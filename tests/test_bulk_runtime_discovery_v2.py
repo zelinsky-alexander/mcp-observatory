@@ -82,7 +82,7 @@ class BulkRuntimeDiscoveryV2Tests(unittest.TestCase):
     def test_remote_budget_is_capped_by_shared_deadline(self) -> None:
         args = self.args()
         calls: list[list[str]] = []
-        times = iter([100.0, 100.0, 2970.0, 2970.0])
+        times = iter([100.0, 3070.0, 3070.0])
 
         def run(argv: list[str]):
             calls.append(argv)
