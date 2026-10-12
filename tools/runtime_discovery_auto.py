@@ -158,7 +158,7 @@ def launch_declarations(
 def _candidate_satisfies(image: str, requirement: str, root: Path, timeout: int) -> bool:
     argv = [
         "docker", "run", "--rm", "--network", "none",
-        "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+        "--cap-drop", "ALL", "--security-opt", "seccomp=builtin", "--security-opt", "no-new-privileges",
         "--pids-limit", "32", "--memory", "128m", "--cpus", "0.5",
         image, "node", "-e", SEMVER_SCRIPT, requirement,
     ]
@@ -174,7 +174,7 @@ def _guard_compatible(image: str, guard: Path, root: Path, timeout: int) -> bool
     argv = [
         "docker", "run", "--rm", "--network", "none", "--read-only",
         "--user", "65532:65532", "--cap-drop", "ALL",
-        "--security-opt", "no-new-privileges", "--pids-limit", "32",
+        "--security-opt", "seccomp=builtin", "--security-opt", "no-new-privileges", "--pids-limit", "32",
         "--memory", "128m", "--cpus", "0.5",
         "--mount", f"type=bind,src={guard.resolve()},dst=/opt/mcp-native-guard,ro=true",
         image, "/opt/mcp-native-guard", "--version",
@@ -236,7 +236,7 @@ def inspect_runtime(
     argv = [
         "docker", "run", "--rm", "--network", "none", "--read-only",
         "--tmpfs", "/tmp:rw,nosuid,nodev,size=67108864", "--user", "65532:65532",
-        "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pids-limit", "64",
+        "--cap-drop", "ALL", "--security-opt", "seccomp=builtin", "--security-opt", "no-new-privileges", "--pids-limit", "64",
         "--memory", "512m", "--cpus", "1.0", "--ulimit", "nofile=128:128",
         "--mount", f"type=bind,src={work},dst=/work,ro=true",
         "--mount", f"type=bind,src={diagnostics},dst=/diagnostics",
