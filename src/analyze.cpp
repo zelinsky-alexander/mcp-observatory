@@ -2998,6 +2998,8 @@ bool docker_worker(
         "--cap-drop",
         "ALL",
         "--security-opt",
+        "seccomp=builtin",
+        "--security-opt",
         "no-new-privileges",
         "--memory",
         "512m",
