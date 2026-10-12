@@ -14,6 +14,12 @@ exact npm stdio package already present in the Observatory catalog.
    under `mcp-native-guard inspect` with no network.
 5. The host validates and persists the deterministic inventory. No tool is invoked.
 
+All Docker runtime-discovery stages explicitly select Docker's built-in default
+seccomp policy (`--security-opt seccomp=builtin`), preserving
+`no-new-privileges` and the existing capability, resource, and network limits.
+This is OS syscall filtering, not syscall telemetry; no `strace` observation is
+enabled automatically.
+
 Child output is drained with a fixed memory bound. A timeout terminates the local
 process group and force-removes the exact Docker container recorded through its
 private cidfile.
