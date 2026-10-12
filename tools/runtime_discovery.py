@@ -284,7 +284,7 @@ def package_bin(artifact: Path, package: str) -> str:
 def docker_base(image: str) -> list[str]:
     return [
         "docker", "run", "--rm", "--cap-drop", "ALL",
-        "--security-opt", "no-new-privileges", "--pids-limit", "128",
+        "--security-opt", "seccomp=builtin", "--security-opt", "no-new-privileges", "--pids-limit", "128",
         "--memory", "512m", "--cpus", "1.0", "--ulimit", "nofile=256:256",
         image,
     ]
@@ -294,7 +294,7 @@ def populate_cache(image: str, cache: Path, artifact: Path, timeout: int) -> Non
     """Hydrate npm's cache for the exact verified artifact and its dependencies."""
     argv = [
         "docker", "run", "--rm", *host_user_args(),
-        "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+        "--cap-drop", "ALL", "--security-opt", "seccomp=builtin", "--security-opt", "no-new-privileges",
         "--pids-limit", "128", "--memory", "768m", "--cpus", "1.0",
         "--mount", f"type=bind,src={cache},dst=/npm-cache",
         "--mount", f"type=bind,src={artifact.resolve()},dst=/artifact.tgz,ro=true",
@@ -313,7 +313,7 @@ def offline_install(image: str, cache: Path, work: Path, artifact: Path, timeout
     argv = [
         "docker", "run", "--rm", *host_user_args(),
         "--network", "none", "--cap-drop", "ALL",
-        "--security-opt", "no-new-privileges", "--pids-limit", "128", "--memory", "768m",
+        "--security-opt", "seccomp=builtin", "--security-opt", "no-new-privileges", "--pids-limit", "128", "--memory", "768m",
         "--cpus", "1.0", "--ulimit", "nofile=256:256",
         "--mount", f"type=bind,src={cache},dst=/npm-cache",
         "--mount", f"type=bind,src={work},dst=/work", "--workdir", "/work",
@@ -332,7 +332,7 @@ def inspect_runtime(image: str, work: Path, guard: Path, package: str, bin_entry
     argv = [
         "docker", "run", "--rm", "--network", "none", "--read-only",
         "--tmpfs", "/tmp:rw,nosuid,nodev,size=67108864", "--user", "65532:65532",
-        "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pids-limit", "64",
+        "--cap-drop", "ALL", "--security-opt", "seccomp=builtin", "--security-opt", "no-new-privileges", "--pids-limit", "64",
         "--memory", "512m", "--cpus", "1.0", "--ulimit", "nofile=128:128",
         "--mount", f"type=bind,src={work},dst=/work,ro=true",
         "--mount", f"type=bind,src={guard.resolve()},dst=/opt/mcp-native-guard,ro=true",
