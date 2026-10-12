@@ -113,6 +113,8 @@ def test_runtime_install_uses_verified_artifact_and_offline_boundary() -> None:
     assert len(captured) == 2
     cache_argv, install_argv = captured
     for argv in captured:
+        assert "--security-opt" in argv
+        assert "seccomp=builtin" in argv
         user_index = argv.index("--user")
         assert argv[user_index + 1] == expected_user
         assert "/artifact.tgz" in argv
