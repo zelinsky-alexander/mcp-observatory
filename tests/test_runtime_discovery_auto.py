@@ -37,6 +37,7 @@ class AutomaticRuntimeResolverTests(unittest.TestCase):
             auto.base.run_docker = original
         self.assertEqual(image, "node:22-trixie-slim")
         self.assertTrue(any("node:22-trixie-slim" in argv for argv in seen))
+        self.assertTrue(all("seccomp=builtin" in argv for argv in seen))
 
     def test_engine_range_selects_highest_satisfying_compatible_runtime(self) -> None:
         original = auto.base.run_docker
